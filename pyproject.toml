@@ -1,6 +1,6 @@
 [project]
 name = "probe"
-version = "0.2.0"
+version = "0.2.1"
 description = "AI runtime probes, pre-run check, and call-ordered behavior logs for Python code."
 readme = "README.md"
 license = { file = "LICENSE" }

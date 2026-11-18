@@ -563,3 +563,121 @@ def test_disabled_context_class_rejection_tty_entry_halt_and_jsonl_hardening(
     assert run is not None and run.status == "halted" and run.halt_call_seq == 1
     assert events == []
     assert store.clean_runs(keep=0) == 1
+
+
+def test_truncation_always_halts_and_strict_api_defaults_true(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    assert TextConfig().max_tokens == 1024
+    assert RuntimeConfig().strict_api is True
+
+    monkeypatch.setenv("PROBES", "1")
+    monkeypatch.setenv("PROBE_NO_PDB", "1")
+
+    # 1. probe.type.text hitting finish_reason='length' logs PROBE_TRUNCATED and halts even with strict_api=False.
+    def trunc_text_handler(request: httpx.Request) -> httpx.Response:
+        if str(request.url).endswith("/chat/completions"):
+            return httpx.Response(
+                200,
+                json={
+                    "choices": [
+                        {
+                            "finish_reason": "length",
+                            "message": {"content": "Check [0] cites Draft 'Hola' which"},
+                        }
+                    ]
+                },
+            )
+        return httpx.Response(200, json={"probabilities": [0.95]})
+
+    cfg_lenient = ProbeConfig(
+        models_decision=ModelEndpointConfig(provider="http_decision", url="http://mock.local/decision", model="dec"),
+        models_text=ModelEndpointConfig(provider="openai_compat", url="http://mock.local/v1", model="qwen3.5:9b"),
+        text=TextConfig(max_tokens=50),
+        check=CheckConfig(require_check=False),
+        runtime=RuntimeConfig(
+            runs_dir=str(tmp_path / ".probes" / "runs_trunc"),
+            lock_path=str(tmp_path / ".probes" / "lock.json"),
+            strict_api=False,
+        ),
+        project_root=tmp_path,
+    )
+    reset_for_testing(config=cfg_lenient, transport=httpx.MockTransport(trunc_text_handler))
+    try:
+        with pytest.raises(ProbeHaltError, match="increase \\[text\\]\\.max_tokens"):
+            probe.here("Grounded draft", id="trunc.text", kind=probe.type.text, draft="Hola")
+    finally:
+        rt1 = probe.flush_for_testing()
+        reset_for_testing()
+
+    assert rt1 is not None
+    s1 = ProbeStore(cfg_lenient.resolve_runs_dir(), create=False)
+    try:
+        ev1 = s1.list_events(rt1.run_id)[0]
+    finally:
+        s1.close()
+    assert ev1.verdict == "error"
+    assert ev1.error_code == "PROBE_TRUNCATED"
+    assert "Check [0] cites Draft" in (ev1.text_analysis or "")
+
+    # 2. probe.type.decision failure whose explain_failure hits max_tokens preserves partial note instead of None.
+    def trunc_explain_handler(request: httpx.Request) -> httpx.Response:
+        if str(request.url).endswith("/decision"):
+            return httpx.Response(200, json={"probabilities": [0.10]})
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "finish_reason": "length",
+                        "message": {"content": "Output leaked answer 'Quiero"},
+                    }
+                ]
+            },
+        )
+
+    cfg_explain = _make_config(tmp_path)
+    cfg_explain.text.max_tokens = 123
+    reset_for_testing(config=cfg_explain, transport=httpx.MockTransport(trunc_explain_handler))
+    try:
+        with pytest.raises(ProbeHaltError):
+            probe.here("No spoilers", id="trunc.explain", kind=probe.type.decision, reply="Quiero café")
+    finally:
+        rt2 = probe.flush_for_testing()
+        reset_for_testing()
+
+    assert rt2 is not None
+    s2 = ProbeStore(cfg_explain.resolve_runs_dir(), create=False)
+    try:
+        ev2 = s2.list_events(rt2.run_id)[0]
+    finally:
+        s2.close()
+    assert ev2.verdict == "fail"
+    assert "Output leaked answer" in (ev2.text_analysis or "")
+    assert "truncated at max_tokens=123" in (ev2.text_analysis or "")
+
+    # 3. BACKEND_ERROR halts under default strict_api=True; when strict_api=False prints [PROBE ERROR] to stderr.
+    def err500_handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(500, text="upstream down")
+
+    cfg_strict = _make_config(tmp_path)
+    cfg_strict.runtime.runs_dir = str(tmp_path / ".probes" / "runs_strict")
+    reset_for_testing(config=cfg_strict, transport=httpx.MockTransport(err500_handler))
+    try:
+        with pytest.raises(ProbeHaltError, match="HTTP 500"):
+            probe.here("Check rule", id="err.strict", x="val")
+    finally:
+        probe.flush_for_testing()
+        reset_for_testing()
+
+    capsys.readouterr()
+    cfg_lenient.runtime.runs_dir = str(tmp_path / ".probes" / "runs_err_warn")
+    reset_for_testing(config=cfg_lenient, transport=httpx.MockTransport(err500_handler))
+    try:
+        probe.here("Check rule", id="err.lenient", x="val")
+    finally:
+        probe.flush_for_testing()
+        reset_for_testing()
+    captured = capsys.readouterr()
+    assert "[PROBE ERROR]" in captured.err
+    assert "err.lenient" in captured.err

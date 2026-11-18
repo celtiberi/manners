@@ -43,6 +43,14 @@ class BackendError(RuntimeError):
     """Raised when a configured decision or text model backend fails or returns invalid data."""
 
 
+class ModelTruncatedError(BackendError):
+    """Raised when a text model hits max_tokens (finish_reason='length') before completing."""
+
+    def __init__(self, message: str, *, partial_text: str = "") -> None:
+        super().__init__(message)
+        self.partial_text = partial_text
+
+
 @dataclass(slots=True, frozen=True)
 class CheckScore:
     """Calibrated binary verdict for a single discrete check."""
@@ -872,7 +880,15 @@ def _extract_chat_content(data: dict[str, Any]) -> str:
     if isinstance(msg, dict) and msg.get("refusal"):
         raise BackendError(f"Text model refused request: {msg['refusal']}")
     if choice0.get("finish_reason") == "length":
-        raise BackendError("Text model response truncated (finish_reason='length')")
+        raw_partial = (
+            msg["content"]
+            if isinstance(msg, dict) and isinstance(msg.get("content"), str)
+            else (choice0["text"] if isinstance(choice0.get("text"), str) else "")
+        )
+        raise ModelTruncatedError(
+            "Text model response truncated (finish_reason='length'); increase [text].max_tokens",
+            partial_text=strip_thinking(raw_partial),
+        )
     if isinstance(msg, dict) and isinstance(msg.get("content"), str):
         return msg["content"]
     text = choice0.get("text")

@@ -288,7 +288,7 @@ class TextConfig:
     """Settings controlling text-model analysis, failure explanations, and pre-run audits."""
 
     detail: str = "standard"  # "concise" | "standard" | "detailed"
-    max_tokens: int = 400
+    max_tokens: int = 1024
     explain_decision_failures: bool = True
     system_prompt: str = ""
 
@@ -325,7 +325,7 @@ class RuntimeConfig:
 
     runs_dir: str = ".probes/runs"
     lock_path: str = ".probes/lock.json"
-    strict_api: bool = False
+    strict_api: bool = True
     max_depth: int = 4
     max_items: int = 25
     max_str_bytes: int = 4096
