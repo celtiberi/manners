@@ -23,6 +23,8 @@ _LAST_RAND = 0
 _DEFAULT_USER_CONFIG_PATH = Path.home() / ".config" / "probe" / "config.toml"
 _EXPORT_PREFIX_RE = re.compile(r"^export\s+")
 _DISABLED_CTX: ContextVar[bool] = ContextVar("probe_disabled", default=False)
+_DISABLED_LOCK = threading.Lock()
+_DISABLED_PROCESS_COUNT = 0
 _TRUSTED_DEFAULT_HOSTS = frozenset(
     {
         "api.typesafe.ai",
@@ -172,11 +174,27 @@ _TRUE_VALUES = frozenset({"1", "true", "yes", "on"})
 _FALSE_VALUES = frozenset({"0", "false", "no", "off"})
 
 
+def enter_process_disabled() -> None:
+    """Increment process-wide probe disable reference count (thread-safe across executors)."""
+    global _DISABLED_PROCESS_COUNT
+    with _DISABLED_LOCK:
+        _DISABLED_PROCESS_COUNT += 1
+
+
+def exit_process_disabled() -> None:
+    """Decrement process-wide probe disable reference count."""
+    global _DISABLED_PROCESS_COUNT
+    with _DISABLED_LOCK:
+        _DISABLED_PROCESS_COUNT = max(0, _DISABLED_PROCESS_COUNT - 1)
+
+
 def reset_config_locks_after_fork() -> None:
     """Reinitialize module locks in a forked child process to prevent deadlocks."""
-    global _ULID_LOCK, _ENV_FLAG_CACHE_LOCK
+    global _ULID_LOCK, _ENV_FLAG_CACHE_LOCK, _DISABLED_LOCK, _DISABLED_PROCESS_COUNT
     _ULID_LOCK = threading.Lock()
     _ENV_FLAG_CACHE_LOCK = threading.Lock()
+    _DISABLED_LOCK = threading.Lock()
+    _DISABLED_PROCESS_COUNT = 0
 
 
 def clear_env_cache() -> None:
@@ -211,8 +229,8 @@ def _read_env_flag(var_name: str, cwd: Path | None = None) -> str:
 
 
 def is_probes_enabled(cwd: Path | None = None) -> bool:
-    """Return True when PROBES is enabled in os.environ or project .env (unless disabled in context)."""
-    if _DISABLED_CTX.get():
+    """Return True when PROBES is enabled in os.environ or project .env (unless disabled)."""
+    if _DISABLED_PROCESS_COUNT > 0 or _DISABLED_CTX.get():
         return False
     return _read_env_flag("PROBES", cwd).lower() in _TRUE_VALUES
 
@@ -225,6 +243,11 @@ def is_skip_lock(cwd: Path | None = None) -> bool:
 def is_no_pdb(cwd: Path | None = None) -> bool:
     """Return True when PROBE_NO_PDB=1 disables interactive pdb halts."""
     return _read_env_flag("PROBE_NO_PDB", cwd).lower() in _TRUE_VALUES
+
+
+def is_no_halt(cwd: Path | None = None) -> bool:
+    """Return True when PROBE_NO_HALT=1 keeps execution running after fail/error events."""
+    return _read_env_flag("PROBE_NO_HALT", cwd).lower() in _TRUE_VALUES
 
 
 @dataclass(slots=True)
@@ -309,6 +332,7 @@ class CheckConfig:
     max_checks: int = 5
     max_check_chars: int = 200
     require_check: bool = True
+    max_workers: int = 4
 
 
 @dataclass(slots=True)
@@ -321,11 +345,12 @@ class RedactConfig:
 
 @dataclass(slots=True)
 class RuntimeConfig:
-    """Storage paths, snapshot caps, and strict API handling."""
+    """Storage paths, snapshot caps, and strict API / halt handling."""
 
     runs_dir: str = ".probes/runs"
     lock_path: str = ".probes/lock.json"
     strict_api: bool = True
+    halt_on_fail: bool = True
     max_depth: int = 4
     max_items: int = 25
     max_str_bytes: int = 4096
@@ -634,8 +659,10 @@ def load_config(cwd: Path | None = None, config_path: Path | None = None) -> Pro
         raise ValueError(
             f"[rate_limit].max_calls_per_run must be >= -1, got {cfg.rate_limit.max_calls_per_run!r}"
         )
-    if cfg.check.max_checks < 1 or cfg.check.max_check_chars < 1:
-        raise ValueError("Invalid [check] bounds: max_checks >= 1 and max_check_chars >= 1 required")
+    if cfg.check.max_checks < 1 or cfg.check.max_check_chars < 1 or cfg.check.max_workers < 1:
+        raise ValueError(
+            "Invalid [check] bounds: max_checks >= 1, max_check_chars >= 1, and max_workers >= 1 required"
+        )
     if cfg.runtime.max_depth < 1 or cfg.runtime.max_items < 1 or cfg.runtime.max_str_bytes < 64:
         raise ValueError("Invalid [runtime] bounds: max_depth >= 1, max_items >= 1, max_str_bytes >= 64 required")
 

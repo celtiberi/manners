@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import concurrent.futures
 import hashlib
 import json
 import os
@@ -583,7 +584,8 @@ class _ModuleProbeVisitor(ast.NodeVisitor):
         sig = _format_signature(node)
         full_source = ast.get_source_segment(self.source, node) or ast.unparse(node)
         body_excerpt = full_source[:1500]
-        s_hash = _sha256_text(f"{sig}\n{full_source}")
+        doc = ast.get_docstring(node, clean=True) or ""
+        s_hash = _sha256_text(f"{sig}\n{doc}")
         is_class_body = bool(self.scope and not self.scope[-1][1])
         param_names, required_params = _extract_param_names(node, is_class_body=is_class_body)
 
@@ -789,7 +791,7 @@ class _ModuleProbeVisitor(ast.NodeVisitor):
             end_idx = min(len(self.lines), call.end_lineno + 3 if call.end_lineno else call.lineno + 3)
             excerpt = "\n".join(self.lines[start_idx:end_idx])
             c_hash = compute_checks_hash(kind, checks)
-            s_hash = _sha256_text(f"{sig}\n{excerpt}")
+            s_hash = _sha256_text(f"{sig}\n{','.join(watched_keys)}")
             combined = _sha256_text(f"{c_hash}:{s_hash}")
             self.discovered.append(
                 DiscoveredProbe(
@@ -1056,6 +1058,240 @@ def _validate_gate3_snapshot(snapshot_json: str, *, item: DiscoveredProbe, label
     return snapshot_json
 
 
+def _evaluate_uncached_probe(
+    item: DiscoveredProbe,
+    *,
+    effective_combined_hash: str,
+    fixture: tuple[str, str] | None,
+    cfg: ProbeConfig,
+    decision_backend: DecisionBackend,
+    text_backend: TextBackend,
+    redactor: SecretRedactor,
+) -> tuple[ProbeCheckResult, dict[str, Any] | None]:
+    """Run Gates 2-3 for one uncached probe and return (result, lock_entry_or_none)."""
+    # Gate 2: Factual analysis via [models.text] + noul approval via [models.decision].
+    try:
+        gate2_analysis = text_backend.analyze_checks_gate2(
+            probe_id=item.probe_id,
+            site=item.site,
+            checks=item.checks,
+            signature=item.signature,
+            source_excerpt=item.source_excerpt,
+            watched_keys=item.watched_keys,
+        )
+        gate2_state = json.dumps(
+            {
+                "site": item.site,
+                "signature": item.signature,
+                "watched_keys": list(item.watched_keys),
+                "checks": list(item.checks),
+            },
+            ensure_ascii=False,
+        )
+        gate2_scores = decision_backend.evaluate_checks(
+            probe_id=f"{item.probe_id}#gate2",
+            checks=get_nouls("check_gate2_nouls"),
+            snapshot_json=gate2_state,
+            analysis=gate2_analysis,
+        )
+    except BackendError as exc:
+        return (
+            ProbeCheckResult(
+                probe_id=item.probe_id,
+                file_line=item.file_line,
+                site=item.site,
+                probe_type=item.probe_type.value,
+                status="failed",
+                gate="gate2",
+                reason=redactor.scrub_text(str(exc)),
+                checks=item.checks,
+            ),
+            None,
+        )
+
+    approved = bool(gate2_scores) and all(s.probability > 0.50 for s in gate2_scores)
+    if not approved:
+        failed_nouls = [s.check for s in gate2_scores if s.probability <= 0.50]
+        audit_reason = (
+            f"{gate2_analysis} (failed: {'; '.join(failed_nouls)})".strip()
+            if gate2_analysis
+            else "; ".join(failed_nouls)
+        )
+        return (
+            ProbeCheckResult(
+                probe_id=item.probe_id,
+                file_line=item.file_line,
+                site=item.site,
+                probe_type=item.probe_type.value,
+                status="failed",
+                gate="gate2",
+                reason=redactor.scrub_text(audit_reason or "Rejected by Gate 2 check audit"),
+                checks=item.checks,
+            ),
+            None,
+        )
+    audit_reason = "Passed Gate 2 check audit"
+
+    # Gate 3: Dry-run calibration against manual fixture or synthesized samples (1x synthetic retry).
+    fixture_source = "fixture" if fixture is not None else "synthetic"
+    max_attempts = 1 if fixture is not None else 2
+    retry_feedback = ""
+    pass_scores: list[CheckScore] = []
+    fail_scores: list[CheckScore] = []
+    pass_ok = False
+    fail_ok = False
+    gate3_error: str | None = None
+
+    for attempt in range(1, max_attempts + 1):
+        try:
+            if fixture is not None:
+                pass_snap, fail_snap = fixture
+            else:
+                pass_snap, fail_snap = text_backend.generate_calibration_fixtures_gate3(
+                    probe_id=item.probe_id,
+                    site=item.site,
+                    checks=item.checks,
+                    signature=item.signature,
+                    source_excerpt=item.source_excerpt,
+                    watched_keys=item.watched_keys,
+                    temperature=0.0 if attempt == 1 else 0.3,
+                    retry_feedback=retry_feedback,
+                )
+        except BackendError as exc:
+            err_msg = str(exc)
+            is_shape_err = (
+                "Gate 3 synthesis missing" in err_msg or "Expected JSON object" in err_msg
+            )
+            if fixture is None and attempt == 1 and is_shape_err:
+                retry_feedback = err_msg
+                continue
+            gate3_error = err_msg
+            break
+
+        try:
+            pass_snap = _validate_gate3_snapshot(pass_snap, item=item, label="passing_snapshot")
+            fail_snap = _validate_gate3_snapshot(fail_snap, item=item, label="failing_snapshot")
+        except BackendError as exc:
+            if fixture is None and attempt == 1:
+                retry_feedback = str(exc)
+                continue
+            gate3_error = str(exc)
+            break
+
+        try:
+            pass_scores = _evaluate_sample(
+                item=item,
+                snapshot_json=pass_snap,
+                decision_backend=decision_backend,
+                text_backend=text_backend,
+            )
+            fail_scores = _evaluate_sample(
+                item=item,
+                snapshot_json=fail_snap,
+                decision_backend=decision_backend,
+                text_backend=text_backend,
+            )
+        except BackendError as exc:
+            gate3_error = str(exc)
+            break
+
+        pass_ok = bool(pass_scores) and all(s.passed for s in pass_scores)
+        fail_ok = bool(fail_scores) and any(not s.passed for s in fail_scores)
+        if pass_ok and fail_ok:
+            break
+        if fixture is None and attempt == 1:
+            fb_parts: list[str] = []
+            if not pass_ok:
+                failed_pass = [
+                    f"{s.check!r} (p={s.probability:.2f})"
+                    for s in pass_scores
+                    if not s.passed
+                ]
+                fb_parts.append(
+                    f"passing_snapshot failed checks: {', '.join(failed_pass) or 'empty scores'}"
+                )
+            if not fail_ok:
+                fb_parts.append("failing_snapshot did not fail any check")
+            retry_feedback = "; ".join(fb_parts)
+            continue
+
+    if gate3_error is not None:
+        return (
+            ProbeCheckResult(
+                probe_id=item.probe_id,
+                file_line=item.file_line,
+                site=item.site,
+                probe_type=item.probe_type.value,
+                status="failed",
+                gate="gate3",
+                reason=redactor.scrub_text(gate3_error),
+                checks=item.checks,
+            ),
+            None,
+        )
+
+    pass_dicts = [
+        {"check": s.check, "probability": s.probability, "passed": s.passed}
+        for s in pass_scores
+    ]
+    fail_dicts = [
+        {"check": s.check, "probability": s.probability, "passed": s.passed}
+        for s in fail_scores
+    ]
+
+    if not (pass_ok and fail_ok):
+        parts = []
+        if not pass_ok:
+            parts.append("passing fixture did not pass all checks")
+        if not fail_ok:
+            parts.append("failing fixture did not fail any check")
+        return (
+            ProbeCheckResult(
+                probe_id=item.probe_id,
+                file_line=item.file_line,
+                site=item.site,
+                probe_type=item.probe_type.value,
+                status="failed",
+                gate="gate3",
+                reason=f"Calibration failed ({'; '.join(parts)})",
+                checks=item.checks,
+                pass_scores=pass_dicts,
+                fail_scores=fail_dicts,
+            ),
+            None,
+        )
+
+    lock_entry = {
+        "probe_id": item.probe_id,
+        "site": item.site,
+        "kind": item.probe_type.value,
+        "file_line": item.file_line,
+        "checks": list(item.checks),
+        "watched_keys": list(item.watched_keys),
+        "param_names": list(item.param_names),
+        "checks_hash": item.checks_hash,
+        "source_hash": item.source_hash,
+        "combined_hash": effective_combined_hash,
+        "source": fixture_source,
+        "approved_at": utc_now_iso(),
+    }
+    return (
+        ProbeCheckResult(
+            probe_id=item.probe_id,
+            file_line=item.file_line,
+            site=item.site,
+            probe_type=item.probe_type.value,
+            status="passed",
+            gate="done",
+            reason=audit_reason or "Passed Gates 1-3",
+            checks=item.checks,
+            pass_scores=pass_dicts,
+            fail_scores=fail_dicts,
+        ),
+        lock_entry,
+    )
+
+
 def run_probe_check(
     paths: Sequence[Path] = (),
     *,
@@ -1147,7 +1383,10 @@ def run_probe_check(
             transport=transport,
         )
 
-        for item in discovered:
+        discovered_results: list[ProbeCheckResult | None] = [None] * len(discovered)
+        uncached_tasks: list[tuple[int, DiscoveredProbe, str, tuple[str, str] | None]] = []
+
+        for idx, item in enumerate(discovered):
             # Gate 1: Static literals, budgets, duplicate IDs.
             gate1_err: str | None = None
             if item.literal_error:
@@ -1169,17 +1408,15 @@ def run_probe_check(
             if gate1_err:
                 if item.probe_id not in protected_locked_ids and item.probe_id not in unscanned_locked_ids:
                     locked_probes.pop(item.probe_id, None)
-                results.append(
-                    ProbeCheckResult(
-                        probe_id=item.probe_id,
-                        file_line=item.file_line,
-                        site=item.site,
-                        probe_type=item.probe_type.value,
-                        status="failed",
-                        gate="gate1",
-                        reason=redactor.scrub_text(gate1_err),
-                        checks=item.checks,
-                    )
+                discovered_results[idx] = ProbeCheckResult(
+                    probe_id=item.probe_id,
+                    file_line=item.file_line,
+                    site=item.site,
+                    probe_type=item.probe_type.value,
+                    status="failed",
+                    gate="gate1",
+                    reason=redactor.scrub_text(gate1_err),
+                    checks=item.checks,
                 )
                 continue
 
@@ -1191,17 +1428,15 @@ def run_probe_check(
             )
             if fixture_error is not None:
                 locked_probes.pop(item.probe_id, None)
-                results.append(
-                    ProbeCheckResult(
-                        probe_id=item.probe_id,
-                        file_line=item.file_line,
-                        site=item.site,
-                        probe_type=item.probe_type.value,
-                        status="failed",
-                        gate="gate3",
-                        reason=redactor.scrub_text(fixture_error),
-                        checks=item.checks,
-                    )
+                discovered_results[idx] = ProbeCheckResult(
+                    probe_id=item.probe_id,
+                    file_line=item.file_line,
+                    site=item.site,
+                    probe_type=item.probe_type.value,
+                    status="failed",
+                    gate="gate3",
+                    reason=redactor.scrub_text(fixture_error),
+                    checks=item.checks,
                 )
                 continue
 
@@ -1222,244 +1457,65 @@ def run_probe_check(
                 and params_ok
             ):
                 existing["file_line"] = item.file_line
-                results.append(
-                    ProbeCheckResult(
-                        probe_id=item.probe_id,
-                        file_line=item.file_line,
-                        site=item.site,
-                        probe_type=item.probe_type.value,
-                        status="cached",
-                        gate="cache",
-                        reason="Unchanged since last approved lock entry",
-                        checks=item.checks,
-                    )
-                )
-                continue
-
-            # Gate 2: Factual analysis via [models.text] + noul approval via [models.decision].
-            try:
-                gate2_analysis = text_backend.analyze_checks_gate2(
-                    probe_id=item.probe_id,
-                    site=item.site,
-                    checks=item.checks,
-                    signature=item.signature,
-                    source_excerpt=item.source_excerpt,
-                    watched_keys=item.watched_keys,
-                )
-                gate2_state = json.dumps(
-                    {
-                        "site": item.site,
-                        "signature": item.signature,
-                        "watched_keys": list(item.watched_keys),
-                        "checks": list(item.checks),
-                    },
-                    ensure_ascii=False,
-                )
-                gate2_scores = decision_backend.evaluate_checks(
-                    probe_id=f"{item.probe_id}#gate2",
-                    checks=get_nouls("check_gate2_nouls"),
-                    snapshot_json=gate2_state,
-                    analysis=gate2_analysis,
-                )
-            except BackendError as exc:
-                locked_probes.pop(item.probe_id, None)
-                results.append(
-                    ProbeCheckResult(
-                        probe_id=item.probe_id,
-                        file_line=item.file_line,
-                        site=item.site,
-                        probe_type=item.probe_type.value,
-                        status="failed",
-                        gate="gate2",
-                        reason=redactor.scrub_text(str(exc)),
-                        checks=item.checks,
-                    )
-                )
-                continue
-
-            approved = bool(gate2_scores) and all(s.probability > 0.50 for s in gate2_scores)
-            if not approved:
-                failed_nouls = [s.check for s in gate2_scores if s.probability <= 0.50]
-                audit_reason = (
-                    f"{gate2_analysis} (failed: {'; '.join(failed_nouls)})".strip()
-                    if gate2_analysis
-                    else "; ".join(failed_nouls)
-                )
-                locked_probes.pop(item.probe_id, None)
-                results.append(
-                    ProbeCheckResult(
-                        probe_id=item.probe_id,
-                        file_line=item.file_line,
-                        site=item.site,
-                        probe_type=item.probe_type.value,
-                        status="failed",
-                        gate="gate2",
-                        reason=redactor.scrub_text(audit_reason or "Rejected by Gate 2 check audit"),
-                        checks=item.checks,
-                    )
-                )
-                continue
-            audit_reason = "Passed Gate 2 check audit"
-
-            # Gate 3: Dry-run calibration against manual fixture or synthesized samples (1x synthetic retry).
-            fixture_source = "fixture" if fixture is not None else "synthetic"
-            max_attempts = 1 if fixture is not None else 2
-            retry_feedback = ""
-            pass_scores: list[CheckScore] = []
-            fail_scores: list[CheckScore] = []
-            pass_ok = False
-            fail_ok = False
-            gate3_error: str | None = None
-
-            for attempt in range(1, max_attempts + 1):
-                try:
-                    if fixture is not None:
-                        pass_snap, fail_snap = fixture
-                    else:
-                        pass_snap, fail_snap = text_backend.generate_calibration_fixtures_gate3(
-                            probe_id=item.probe_id,
-                            site=item.site,
-                            checks=item.checks,
-                            signature=item.signature,
-                            source_excerpt=item.source_excerpt,
-                            watched_keys=item.watched_keys,
-                            temperature=0.0 if attempt == 1 else 0.3,
-                            retry_feedback=retry_feedback,
-                        )
-                except BackendError as exc:
-                    err_msg = str(exc)
-                    is_shape_err = (
-                        "Gate 3 synthesis missing" in err_msg or "Expected JSON object" in err_msg
-                    )
-                    if fixture is None and attempt == 1 and is_shape_err:
-                        retry_feedback = err_msg
-                        continue
-                    gate3_error = err_msg
-                    break
-
-                try:
-                    pass_snap = _validate_gate3_snapshot(pass_snap, item=item, label="passing_snapshot")
-                    fail_snap = _validate_gate3_snapshot(fail_snap, item=item, label="failing_snapshot")
-                except BackendError as exc:
-                    if fixture is None and attempt == 1:
-                        retry_feedback = str(exc)
-                        continue
-                    gate3_error = str(exc)
-                    break
-
-                try:
-                    pass_scores = _evaluate_sample(
-                        item=item,
-                        snapshot_json=pass_snap,
-                        decision_backend=decision_backend,
-                        text_backend=text_backend,
-                    )
-                    fail_scores = _evaluate_sample(
-                        item=item,
-                        snapshot_json=fail_snap,
-                        decision_backend=decision_backend,
-                        text_backend=text_backend,
-                    )
-                except BackendError as exc:
-                    gate3_error = str(exc)
-                    break
-
-                pass_ok = bool(pass_scores) and all(s.passed for s in pass_scores)
-                fail_ok = bool(fail_scores) and any(not s.passed for s in fail_scores)
-                if pass_ok and fail_ok:
-                    break
-                if fixture is None and attempt == 1:
-                    fb_parts: list[str] = []
-                    if not pass_ok:
-                        failed_pass = [
-                            f"{s.check!r} (p={s.probability:.2f})"
-                            for s in pass_scores
-                            if not s.passed
-                        ]
-                        fb_parts.append(
-                            f"passing_snapshot failed checks: {', '.join(failed_pass) or 'empty scores'}"
-                        )
-                    if not fail_ok:
-                        fb_parts.append("failing_snapshot did not fail any check")
-                    retry_feedback = "; ".join(fb_parts)
-                    continue
-
-            if gate3_error is not None:
-                locked_probes.pop(item.probe_id, None)
-                results.append(
-                    ProbeCheckResult(
-                        probe_id=item.probe_id,
-                        file_line=item.file_line,
-                        site=item.site,
-                        probe_type=item.probe_type.value,
-                        status="failed",
-                        gate="gate3",
-                        reason=redactor.scrub_text(gate3_error),
-                        checks=item.checks,
-                    )
-                )
-                continue
-
-            pass_dicts = [
-                {"check": s.check, "probability": s.probability, "passed": s.passed}
-                for s in pass_scores
-            ]
-            fail_dicts = [
-                {"check": s.check, "probability": s.probability, "passed": s.passed}
-                for s in fail_scores
-            ]
-
-            if not (pass_ok and fail_ok):
-                locked_probes.pop(item.probe_id, None)
-                parts = []
-                if not pass_ok:
-                    parts.append("passing fixture did not pass all checks")
-                if not fail_ok:
-                    parts.append("failing fixture did not fail any check")
-                results.append(
-                    ProbeCheckResult(
-                        probe_id=item.probe_id,
-                        file_line=item.file_line,
-                        site=item.site,
-                        probe_type=item.probe_type.value,
-                        status="failed",
-                        gate="gate3",
-                        reason=f"Calibration failed ({'; '.join(parts)})",
-                        checks=item.checks,
-                        pass_scores=pass_dicts,
-                        fail_scores=fail_dicts,
-                    )
-                )
-                continue
-
-            locked_probes[item.probe_id] = {
-                "probe_id": item.probe_id,
-                "site": item.site,
-                "kind": item.probe_type.value,
-                "file_line": item.file_line,
-                "checks": list(item.checks),
-                "watched_keys": list(item.watched_keys),
-                "param_names": list(item.param_names),
-                "checks_hash": item.checks_hash,
-                "source_hash": item.source_hash,
-                "combined_hash": effective_combined_hash,
-                "source": fixture_source,
-                "approved_at": utc_now_iso(),
-            }
-            results.append(
-                ProbeCheckResult(
+                discovered_results[idx] = ProbeCheckResult(
                     probe_id=item.probe_id,
                     file_line=item.file_line,
                     site=item.site,
                     probe_type=item.probe_type.value,
-                    status="passed",
-                    gate="done",
-                    reason=audit_reason or "Passed Gates 1-3",
+                    status="cached",
+                    gate="cache",
+                    reason="Unchanged since last approved lock entry",
                     checks=item.checks,
-                    pass_scores=pass_dicts,
-                    fail_scores=fail_dicts,
                 )
-            )
+                continue
+
+            uncached_tasks.append((idx, item, effective_combined_hash, fixture))
+
+        if len(uncached_tasks) <= 1 or cfg.check.max_workers <= 1:
+            for idx, item, eff_hash, fixture in uncached_tasks:
+                res, lock_entry = _evaluate_uncached_probe(
+                    item,
+                    effective_combined_hash=eff_hash,
+                    fixture=fixture,
+                    cfg=cfg,
+                    decision_backend=decision_backend,
+                    text_backend=text_backend,
+                    redactor=redactor,
+                )
+                discovered_results[idx] = res
+                if lock_entry is not None:
+                    locked_probes[item.probe_id] = lock_entry
+                else:
+                    locked_probes.pop(item.probe_id, None)
+        else:
+            workers = min(cfg.check.max_workers, len(uncached_tasks))
+            with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+                future_map = [
+                    (
+                        idx,
+                        item,
+                        pool.submit(
+                            _evaluate_uncached_probe,
+                            item,
+                            effective_combined_hash=eff_hash,
+                            fixture=fixture,
+                            cfg=cfg,
+                            decision_backend=decision_backend,
+                            text_backend=text_backend,
+                            redactor=redactor,
+                        ),
+                    )
+                    for idx, item, eff_hash, fixture in uncached_tasks
+                ]
+                for idx, item, fut in future_map:
+                    res, lock_entry = fut.result()
+                    discovered_results[idx] = res
+                    if lock_entry is not None:
+                        locked_probes[item.probe_id] = lock_entry
+                    else:
+                        locked_probes.pop(item.probe_id, None)
+
+        results.extend(r for r in discovered_results if r is not None)
     except BackendError as exc:
         raise BackendError(redactor.scrub_text(str(exc))) from exc
     finally:

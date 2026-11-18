@@ -5,6 +5,19 @@ All notable changes to `probe` will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] - 2026-11-18
+
+### Added
+- Non-halting soak/eval audit mode via `PROBE_NO_HALT=1` or `[runtime].halt_on_fail = false`: records all `fail` and `error` events across multi-turn runs (printing `[PROBE FAIL]` / `[PROBE ERROR]` to `stderr`, tripping per-probe `PROBE_MISUSE` circuit breakers cleanly without spamming duplicate events, and setting run status to `"failed"`).
+- `probe report --check` CLI flag exiting with code `1` when a run recorded any failure/error event (pair with `PROBE_NO_HALT=1`).
+- Bounded parallel execution of uncached probes in `run_probe_check` via `[check].max_workers` (default `4`), preserving deterministic result ordering.
+- `probe.disabled(scope="process" | "context")` option on `probe.disabled()`.
+
+### Changed
+- **Breaking:** Subclassed `ProbeHaltError` from `BaseException` instead of `RuntimeError` so application `except Exception:` retry and fallback wrappers unwind cleanly while `finally:` cleanup still executes.
+- Changed `probe.disabled()` default scope from `ContextVar`-only to a thread-safe process-wide reference count (`scope="process"`) so worker pools such as `ThreadPoolExecutor` honor disabled probes automatically.
+- Changed `source_hash` in `probe check` / `.probes/lock.json` to hash `(signature, docstring)` for `@probe` and `(enclosing_signature, watched_keys)` for `probe.here` instead of full function bodies/context lines, preventing lock invalidation on internal refactors or logging edits.
+
 ## [0.2.1] - 2026-11-18
 
 ### Changed

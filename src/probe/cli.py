@@ -361,6 +361,11 @@ def report_cmd(
     run_id: str | None = typer.Option(None, "--run", help="Specific run ULID (defaults to latest run)."),
     show_all: bool = typer.Option(False, "--all", help="Include passed probe calls in timeline."),
     fmt: str = typer.Option("text", "--format", help="Output format: text | md | json."),
+    check_exit: bool = typer.Option(
+        False,
+        "--check",
+        help="Exit with code 1 if the run recorded any fail/error events (for non-halting soak runs).",
+    ),
 ) -> None:
     """Print call-ordered summary of the latest or specified probe run."""
     try:
@@ -393,6 +398,9 @@ def report_cmd(
         typer.echo(_format_report_text(run, events, show_all=show_all))
     else:
         typer.echo(f"Unsupported format: {fmt!r} (expected text, md, or json)", err=True)
+        raise typer.Exit(code=1)
+
+    if check_exit and (run.fail_count > 0 or run.error_count > 0 or run.status in {"halted", "failed"}):
         raise typer.Exit(code=1)
 
 
