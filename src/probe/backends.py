@@ -22,6 +22,7 @@ from probe.prompts import (
     format_gate2_analysis_prompts,
     format_gate3_fixtures_prompts,
     format_typesafe_state,
+    get_output_schema,
 )
 
 _THINK_BLOCK_RE = re.compile(r"\A\s*<think>.*?</think>\s*", re.DOTALL | re.IGNORECASE)
@@ -164,6 +165,59 @@ def _apply_reasoning_effort(
         effort = "none"
     if effort:
         payload["reasoning_effort"] = effort
+
+
+def _schema_has_open_object(node: Any) -> bool:
+    """Return True if any JSON Schema object node omits non-empty properties."""
+    if isinstance(node, list):
+        return any(_schema_has_open_object(item) for item in node)
+    if not isinstance(node, dict):
+        return False
+
+    node_type = node.get("type")
+    is_obj = node_type == "object" or (isinstance(node_type, list) and "object" in node_type)
+    props = node.get("properties")
+    if is_obj and (not isinstance(props, dict) or not props):
+        return True
+
+    for key in ("properties", "$defs", "definitions"):
+        sub = node.get(key)
+        if isinstance(sub, dict) and any(_schema_has_open_object(v) for v in sub.values()):
+            return True
+    for key in ("items", "additionalProperties"):
+        if isinstance(node.get(key), (dict, list)) and _schema_has_open_object(node[key]):
+            return True
+    for key in ("anyOf", "oneOf", "allOf"):
+        if isinstance(node.get(key), list) and _schema_has_open_object(node[key]):
+            return True
+    return False
+
+
+def _apply_output_schema(
+    payload: dict[str, Any],
+    system_text: str,
+    output_schema: dict[str, Any] | None,
+    url: str,
+) -> str:
+    """Translate declarative output_schema to the target OpenAI-compat provider format."""
+    if output_schema is None:
+        return system_text
+    name = str(output_schema.get("name") or "response")
+    schema = output_schema["schema"]
+    url_lower = url.lower()
+    use_json_object_fallback = "deepseek." in url_lower or (
+        "generativelanguage.googleapis.com" in url_lower and _schema_has_open_object(schema)
+    )
+    if use_json_object_fallback:
+        payload["response_format"] = {"type": "json_object"}
+        schema_json = json.dumps(schema, ensure_ascii=False)
+        return f"{system_text}\n\nRespond with a JSON object matching this JSON Schema:\n{schema_json}"
+
+    json_schema_spec: dict[str, Any] = {"name": name, "schema": schema}
+    if "api.openai.com" in url_lower and not _schema_has_open_object(schema):
+        json_schema_spec["strict"] = True
+    payload["response_format"] = {"type": "json_schema", "json_schema": json_schema_spec}
+    return system_text
 
 
 def _post_json_with_retry(
@@ -540,7 +594,7 @@ class TextBackend:
         *,
         max_tokens: int | None = None,
         include_user_system: bool = True,
-        response_format: dict[str, Any] | None = None,
+        output_schema: dict[str, Any] | None = None,
     ) -> str:
         url = _chat_completions_url(self.endpoint.url)
         full_system = (
@@ -548,15 +602,14 @@ class TextBackend:
         )
         payload: dict[str, Any] = {
             "model": self.endpoint.model,
-            "messages": [
-                {"role": "system", "content": full_system},
-                {"role": "user", "content": user},
-            ],
             "temperature": 0.0,
             "max_tokens": max_tokens if max_tokens is not None else self.text_cfg.max_tokens,
         }
-        if response_format is not None:
-            payload["response_format"] = response_format
+        full_system = _apply_output_schema(payload, full_system, output_schema, url)
+        payload["messages"] = [
+            {"role": "system", "content": full_system},
+            {"role": "user", "content": user},
+        ]
         _apply_reasoning_effort(payload, self.endpoint, url)
         data = _post_json_with_retry(
             self._client,
@@ -648,7 +701,7 @@ class TextBackend:
             user,
             max_tokens=max(1200, self.text_cfg.max_tokens),
             include_user_system=False,
-            response_format={"type": "json_object"},
+            output_schema=get_output_schema("check_gate3_fixtures"),
         )
         parsed = extract_json_object(content)
         passing = parsed.get("passing_snapshot")

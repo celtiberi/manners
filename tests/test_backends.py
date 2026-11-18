@@ -15,6 +15,7 @@ from probe.backends import (
     CheckScore,
     DecisionBackend,
     TextBackend,
+    _apply_output_schema,
     _apply_reasoning_effort,
     _clamp_prob,
     _parse_probabilities_payload,
@@ -28,6 +29,7 @@ from probe.prompts import (
     format_gate2_analysis_prompts,
     format_typesafe_state,
     get_nouls,
+    get_output_schema,
     get_prompt,
     load_prompt_catalog,
 )
@@ -234,6 +236,12 @@ def test_prompts_json_catalog_and_formatting() -> None:
     assert len(gate2_nouls) == 3
     assert compose_system_prompt("Base.", "Custom.") == "Custom.\n\nBase."
 
+    gate3_schema = get_output_schema("check_gate3_fixtures")
+    assert gate3_schema is not None
+    assert gate3_schema["name"] == "gate3_calibration_fixtures"
+    assert set(gate3_schema["schema"]["required"]) == {"notes", "passing_snapshot", "failing_snapshot"}
+    assert "Output JSON keys" not in get_prompt("check_gate3_fixtures")
+
 
 def test_load_config_isolates_credentials_and_validates_types_and_bounds(
     tmp_path: Path, monkeypatch
@@ -354,12 +362,59 @@ def test_stage5_prompt_escaping_validation_and_reasoning_effort(tmp_path: Path, 
         assert "USER_CUSTOM_SYSTEM_PROMPT" not in seen_calls[0]["messages"][0]["content"]
         assert "USER_CUSTOM_SYSTEM_PROMPT" not in seen_calls[1]["messages"][0]["content"]
         assert seen_calls[1]["max_tokens"] >= 1200
-        assert seen_calls[1]["response_format"] == {"type": "json_object"}
+        assert seen_calls[1]["response_format"]["type"] == "json_schema"
+        assert seen_calls[1]["response_format"]["json_schema"]["name"] == "gate3_calibration_fixtures"
+        assert "Respond with a JSON object matching this JSON Schema" not in seen_calls[1]["messages"][0]["content"]
         assert "response_format" not in seen_calls[0]
         with pytest.raises(BackendError, match="empty response"):
             tb.analyze_snapshot(probe_id="p", checks=["C"], snapshot_json="{}")
     finally:
         tb.close()
+
+    # Provider-aware output_schema translation.
+    gate3_schema = get_output_schema("check_gate3_fixtures")
+    closed_schema = {
+        "name": "closed_obj",
+        "schema": {
+            "type": "object",
+            "properties": {"answer": {"type": "string"}},
+            "required": ["answer"],
+            "additionalProperties": False,
+        },
+    }
+    p_ollama: dict = {}
+    sys_ollama = _apply_output_schema(p_ollama, "Base.", gate3_schema, "http://127.0.0.1:11434/v1/chat/completions")
+    assert p_ollama["response_format"]["type"] == "json_schema"
+    assert sys_ollama == "Base."
+
+    p_openai_closed: dict = {}
+    _apply_output_schema(p_openai_closed, "Base.", closed_schema, "https://api.openai.com/v1/chat/completions")
+    assert p_openai_closed["response_format"]["json_schema"]["strict"] is True
+
+    p_deepseek: dict = {}
+    sys_deepseek = _apply_output_schema(p_deepseek, "Base.", gate3_schema, "https://api.deepseek.com/v1/chat/completions")
+    assert p_deepseek["response_format"] == {"type": "json_object"}
+    assert "Respond with a JSON object matching this JSON Schema" in sys_deepseek
+
+    p_gemini_open: dict = {}
+    sys_gemini_open = _apply_output_schema(
+        p_gemini_open,
+        "Base.",
+        gate3_schema,
+        "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
+    )
+    assert p_gemini_open["response_format"] == {"type": "json_object"}
+    assert "Respond with a JSON object matching this JSON Schema" in sys_gemini_open
+
+    p_gemini_closed: dict = {}
+    sys_gemini_closed = _apply_output_schema(
+        p_gemini_closed,
+        "Base.",
+        closed_schema,
+        "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
+    )
+    assert p_gemini_closed["response_format"]["type"] == "json_schema"
+    assert sys_gemini_closed == "Base."
 
     # reasoning_effort scoping: qwen3 local yes, remote no; Gemini drops "none".
     p_local: dict = {}

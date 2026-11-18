@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import copy
 import json
 import re
 from collections.abc import Sequence
 from dataclasses import dataclass
 from functools import cache
 from importlib import resources
+from typing import Any
 
 
 @dataclass(slots=True, frozen=True)
@@ -20,6 +22,7 @@ class PromptEntry:
     description: str
     prompt: str = ""
     nouls: tuple[str, ...] = ()
+    output_schema: dict[str, Any] | None = None
 
 
 _DETAIL_KEY_MAP: dict[str, str] = {
@@ -69,6 +72,20 @@ def load_prompt_catalog() -> dict[str, PromptEntry]:
         if role == "models.text" and not prompt_text:
             raise ValueError(f"Text entry {key!r} must define non-empty 'prompt'")
 
+        raw_schema = item.get("output_schema")
+        output_schema: dict[str, Any] | None = None
+        if raw_schema is not None:
+            if (
+                not isinstance(raw_schema, dict)
+                or not isinstance(raw_schema.get("name"), str)
+                or not raw_schema["name"].strip()
+                or not isinstance(raw_schema.get("schema"), dict)
+            ):
+                raise ValueError(
+                    f"Prompt entry {key!r} field 'output_schema' must define non-empty 'name' and dict 'schema'"
+                )
+            output_schema = copy.deepcopy(raw_schema)
+
         catalog[str(key)] = PromptEntry(
             key=str(key),
             role=role,
@@ -76,6 +93,7 @@ def load_prompt_catalog() -> dict[str, PromptEntry]:
             description=description,
             prompt=prompt_text,
             nouls=nouls,
+            output_schema=output_schema,
         )
     return catalog
 
@@ -86,6 +104,12 @@ def get_prompt(key: str) -> str:
     if not entry.prompt:
         raise ValueError(f"Catalog entry {key!r} has no text prompt")
     return entry.prompt
+
+
+def get_output_schema(key: str) -> dict[str, Any] | None:
+    """Return the declarative JSON schema specification for a named entry, if any."""
+    entry = load_prompt_catalog()[key]
+    return copy.deepcopy(entry.output_schema) if entry.output_schema is not None else None
 
 
 def get_nouls(key: str) -> tuple[str, ...]:
@@ -240,6 +264,7 @@ __all__ = [
     "format_gate3_fixtures_prompts",
     "format_typesafe_state",
     "get_nouls",
+    "get_output_schema",
     "get_prompt",
     "load_prompt_catalog",
 ]

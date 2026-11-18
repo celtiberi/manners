@@ -35,9 +35,30 @@
       "- When `Site: here`: each snapshot MUST be `{\"watched\": {<exact Watched keys>}}` (preserving domain rules/constants visible in `<source_excerpt>` when relevant).",
       "Requirements:",
       "1) `passing_snapshot`: write rich, multi-sentence realistic values (never terse 3-word stubs) where `output` (or `watched`) overtly satisfies EVERY clause of EVERY check in `Checks`. Every required action, instruction, request, or grounded fact named in any check must appear explicitly in the text—never left implied—while strictly obeying any negative ('without...' / 'does NOT...') constraint.",
-      "2) `failing_snapshot`: a realistic non-empty near-miss of the same return type and domain (never `\"\"`, `null`, or `'ERROR'`) that looks plausible in format while clearly violating at least one check in `Checks`.",
-      "Output JSON keys: `notes` (map each check `[0]`, `[1]`, ... to the explicit span/field in `passing_snapshot` satisfying every clause and the rule violated in `failing_snapshot`), `passing_snapshot`, and `failing_snapshot`."
-    ]
+      "2) `failing_snapshot`: a realistic non-empty near-miss of the same return type and domain (never `\"\"`, `null`, or `'ERROR'`) that looks plausible in format while clearly violating at least one check in `Checks`."
+    ],
+    "output_schema": {
+      "name": "gate3_calibration_fixtures",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "notes": {
+            "type": "string",
+            "description": "For each check [0], [1], ... state the explicit span or field in passing_snapshot satisfying every clause, and which check failing_snapshot violates."
+          },
+          "passing_snapshot": {
+            "type": "object",
+            "description": "Synthetic runtime snapshot ({inputs, output} for Site: decorator; {watched} for Site: here) that overtly satisfies every check."
+          },
+          "failing_snapshot": {
+            "type": "object",
+            "description": "Realistic non-empty near-miss snapshot of the same shape and domain that clearly violates at least one check."
+          }
+        },
+        "required": ["notes", "passing_snapshot", "failing_snapshot"],
+        "additionalProperties": false
+      }
+    }
   },
   "text_analyze_snapshot": {
     "role": "models.text",
