@@ -19,6 +19,7 @@ from probe.config import (
     RateLimitConfig,
     RuntimeConfig,
     TextConfig,
+    clear_env_cache,
     is_probes_enabled,
 )
 from probe.runtime import ProbeType, compute_checks_hash
@@ -61,36 +62,64 @@ def _make_config(
     )
 
 
-def test_disabled_probes_returns_unwrapped_function_and_noop_here(tmp_path: Path, monkeypatch) -> None:
+def test_disabled_probes_passes_through_and_enables_dynamically(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.delenv("PROBES", raising=False)
     monkeypatch.chdir(tmp_path)
-    reset_for_testing(config=_make_config(tmp_path))
+    cfg = _make_config(tmp_path)
+    reset_for_testing(config=cfg)
 
     def raw_sync(x: int) -> int:
         probe.here("should do nothing", val=x)
         return x + 1
 
     decorated = probe("check output", id="noop.sync")(raw_sync)
-    assert decorated is raw_sync
+    assert decorated.__wrapped__ is raw_sync
     assert decorated(2) == 3
 
     async def raw_async(x: int) -> int:
         return x * 2
 
     decorated_async = probe("check async", id="noop.async")(raw_async)
-    assert decorated_async is raw_async
+    assert decorated_async.__wrapped__ is raw_async
+    assert asyncio.run(decorated_async(3)) == 6
     assert not (tmp_path / ".probes" / "probes.db").exists()
+
+    # Enabling PROBES=1 after module import / decoration activates wrapped probes cleanly.
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"probabilities": [0.95]})
+
+    monkeypatch.setenv("PROBES", "1")
+    reset_for_testing(config=cfg, transport=httpx.MockTransport(handler))
+    try:
+        assert decorated(4) == 5
+    finally:
+        rt = probe.flush_for_testing()
+        reset_for_testing()
+    assert rt is not None
+    store = ProbeStore(cfg.resolve_db_path(), create=False)
+    try:
+        events = store.list_events(rt.run_id)
+    finally:
+        store.close()
+    assert len(events) == 2
+    assert events[0].probe_id == "noop.sync"
+    assert events[0].verdict == "pass"
+    assert events[1].site == "here"
+    assert events[1].verdict == "pass"
 
 
 def test_dotenv_probes_flag_and_env_override(tmp_path: Path, monkeypatch) -> None:
+    clear_env_cache()
     monkeypatch.delenv("PROBES", raising=False)
     (tmp_path / ".env").write_text("PROBES=1\n", encoding="utf-8")
     monkeypatch.chdir(tmp_path)
 
     assert is_probes_enabled(tmp_path) is True
 
-    # Shell env PROBES=0 overrides .env PROBES=1.
+    # Shell env PROBES=0 or empty PROBES="" overrides .env PROBES=1.
     monkeypatch.setenv("PROBES", "0")
+    assert is_probes_enabled(tmp_path) is False
+    monkeypatch.setenv("PROBES", "")
     assert is_probes_enabled(tmp_path) is False
 
 
@@ -163,6 +192,8 @@ def test_nested_inline_call_entry_ordering_and_entry_snapshot(
 def test_inline_halt_non_tty_and_mock_tty_pdb(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setenv("PROBES", "1")
     monkeypatch.setenv("PROBE_NO_PDB", "0")
+    monkeypatch.setattr("sys.stdin.isatty", lambda: False)
+    monkeypatch.setattr("sys.stdout.isatty", lambda: False)
 
     def handler(request: httpx.Request) -> httpx.Response:
         body = json.loads(request.content.decode("utf-8"))
@@ -317,6 +348,8 @@ def test_rate_limit_unlimited_per_run_default_sliding_window_and_lock(
                 "probes": {
                     "needs.lock": {
                         "checks_hash": compute_checks_hash(ProbeType.decision, ("Locked check",)),
+                        "site": "here",
+                        "watched_keys": ["i"],
                     }
                 },
             }
@@ -328,6 +361,97 @@ def test_rate_limit_unlimited_per_run_default_sliding_window_and_lock(
         probe.here("Locked check", id="needs.lock", i=0)
         with pytest.raises(ProbeHaltError):
             probe.here("Edited check not locked yet", id="needs.lock", i=1)
+    finally:
+        probe.flush_for_testing()
+        reset_for_testing()
+
+
+def test_exceptions_descriptors_generators_preexec_guards_and_ro_store(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setenv("PROBES", "1")
+    monkeypatch.setenv("PROBE_NO_PDB", "1")
+    seen_model_calls: list[dict] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen_model_calls.append(json.loads(request.content.decode("utf-8")))
+        return httpx.Response(200, json={"probabilities": [0.95]})
+
+    cfg = _make_config(tmp_path, require_check=False, max_calls=1, window_seconds=10.0)
+    reset_for_testing(config=cfg, transport=httpx.MockTransport(handler))
+
+    # 1. Target Exception propagates unmodified without calling decision model (no vacuous pass).
+    @probe("Output does NOT spoil secret", id="boom.fn")
+    def crasher(x: int) -> str:
+        raise ValueError(f"bad input {x}")
+
+    try:
+        with pytest.raises(ValueError, match="bad input 7"):
+            crasher(7)
+        assert seen_model_calls == []
+
+        # 2. @probe stacked above @classmethod and @staticmethod works under PROBES=1.
+        class Builder:
+            @probe("Builds string", id="builder.cls")
+            @classmethod
+            def from_tag(cls, tag: str) -> str:
+                return f"{cls.__name__}:{tag}"
+
+            @probe("Formats item", id="builder.static")
+            @staticmethod
+            def fmt(item: str) -> str:
+                return item.upper()
+
+        assert Builder.from_tag("ok") == "Builder:ok"
+        assert Builder().fmt("hi") == "HI"
+
+        # 3. Generator / async generator decorated with @probe fails fast at decoration time.
+        with pytest.raises(TypeError, match="generator"):
+            @probe("Stream chunk")
+            def gen():
+                yield 1
+
+        with pytest.raises(TypeError, match="generator"):
+            @probe("Async stream chunk")
+            async def agen():
+                yield 1
+    finally:
+        rt = probe.flush_for_testing()
+        reset_for_testing()
+
+    assert rt is not None
+    ro_db = cfg.resolve_db_path()
+    ro_db.chmod(0o444)
+    ro_db.parent.chmod(0o555)
+    try:
+        store = ProbeStore(ro_db, create=False)
+        try:
+            events = store.list_events(rt.run_id)
+        finally:
+            store.close()
+    finally:
+        ro_db.parent.chmod(0o755)
+        ro_db.chmod(0o644)
+
+    assert events[0].error_code == "TARGET_EXCEPTION"
+    assert events[0].verdict == "error"
+    assert "bad input 7" in (events[0].text_analysis or "")
+    assert [e.probe_id for e in events[1:]] == ["builder.cls", "builder.static"]
+
+    # 4. Pre-execution verify_lock prevents side effects inside fn body.
+    side_effects = {"ran": 0}
+    locked_cfg = _make_config(tmp_path, require_check=True)
+    reset_for_testing(config=locked_cfg, transport=httpx.MockTransport(handler))
+
+    @probe("Locked check", id="unlocked.side_effect")
+    def do_write() -> str:
+        side_effects["ran"] += 1
+        return "wrote"
+
+    try:
+        with pytest.raises(ProbeHaltError, match="lock check"):
+            do_write()
+        assert side_effects["ran"] == 0
     finally:
         probe.flush_for_testing()
         reset_for_testing()

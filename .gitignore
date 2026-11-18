@@ -12,5 +12,6 @@ build/
 .probes/
 .env
 .env.*
+.envrc
 !.env.example
 !.env.sample

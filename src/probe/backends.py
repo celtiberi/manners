@@ -5,9 +5,11 @@ from __future__ import annotations
 import json
 import math
 import re
+import threading
 import time
 from collections.abc import Sequence
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -22,8 +24,8 @@ from probe.prompts import (
     format_typesafe_state,
 )
 
-_THINK_BLOCK_RE = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
-_UNCLOSED_THINK_RE = re.compile(r"<think>.*\Z", re.DOTALL | re.IGNORECASE)
+_THINK_BLOCK_RE = re.compile(r"\A\s*<think>.*?</think>\s*", re.DOTALL | re.IGNORECASE)
+_UNCLOSED_THINK_RE = re.compile(r"\A\s*<think>[\s\S]*\Z", re.DOTALL | re.IGNORECASE)
 _CODE_FENCE_RE = re.compile(r"```(?:json)?\s*(.*?)\s*```", re.DOTALL | re.IGNORECASE)
 
 _DEFAULT_TYPESAFE_URL = "https://api.typesafe.ai/v1/systemone"
@@ -49,19 +51,22 @@ class CheckScore:
 
 
 def strip_thinking(text: str) -> str:
-    """Remove <think>...</think> reasoning blocks emitted by thinking models."""
-    cleaned = _THINK_BLOCK_RE.sub("", text or "")
+    """Remove leading <think>...</think> reasoning blocks emitted by thinking models."""
+    cleaned = text or ""
+    while True:
+        updated = _THINK_BLOCK_RE.sub("", cleaned, count=1)
+        if updated == cleaned:
+            break
+        cleaned = updated
     cleaned = _UNCLOSED_THINK_RE.sub("", cleaned)
     return cleaned.strip()
 
 
 def extract_json_object(text: str) -> dict[str, Any]:
-    """Extract the first JSON object from model text, ignoring <think> tags and fences."""
+    """Extract the first JSON object from model text, ignoring leading <think> tags and fences."""
     cleaned = strip_thinking(text)
-    candidates: list[str] = [cleaned]
-
-    for match in _CODE_FENCE_RE.finditer(cleaned):
-        candidates.insert(0, match.group(1).strip())
+    fenced = [match.group(1).strip() for match in _CODE_FENCE_RE.finditer(cleaned)]
+    candidates: list[str] = [*fenced, cleaned]
 
     for candidate in candidates:
         try:
@@ -71,12 +76,13 @@ def extract_json_object(text: str) -> dict[str, Any]:
         except json.JSONDecodeError:
             pass
 
-        # Fallback: locate balanced outer braces inside prose.
+        # Fallback: locate balanced outer braces inside prose (stop if an outer brace is unclosed).
         start = candidate.find("{")
         while start != -1:
             depth = 0
             in_str = False
             escape = False
+            closed = False
             for idx in range(start, len(candidate)):
                 ch = candidate[idx]
                 if in_str:
@@ -94,6 +100,7 @@ def extract_json_object(text: str) -> dict[str, Any]:
                 elif ch == "}":
                     depth -= 1
                     if depth == 0:
+                        closed = True
                         snippet = candidate[start : idx + 1]
                         try:
                             parsed = json.loads(snippet)
@@ -101,18 +108,24 @@ def extract_json_object(text: str) -> dict[str, Any]:
                                 return parsed
                         except json.JSONDecodeError:
                             break
+            if not closed:
+                break
             start = candidate.find("{", start + 1)
 
     raise BackendError(f"Expected JSON object in model response, got: {cleaned[:200]!r}")
 
 
 def _clamp_prob(value: Any) -> float:
+    if isinstance(value, bool):
+        raise BackendError(f"Probability must be numeric, got bool {value!r}")
     try:
         p = float(value)
     except (TypeError, ValueError) as exc:
         raise BackendError(f"Invalid probability value: {value!r}") from exc
     if not math.isfinite(p):
         raise BackendError(f"Non-finite probability value: {value!r}")
+    if p < -0.05 or p > 1.05:
+        raise BackendError(f"Probability out of [0, 1] bounds: {value!r}")
     return max(0.0, min(1.0, p))
 
 
@@ -133,6 +146,10 @@ def _auth_headers(endpoint: ModelEndpointConfig) -> dict[str, str]:
     return headers
 
 
+def _is_local_ollama_url(url_lower: str) -> bool:
+    return any(tok in url_lower for tok in ("127.0.0.1", "localhost", "[::1]", "::1", ":11434"))
+
+
 def _apply_reasoning_effort(
     payload: dict[str, Any],
     endpoint: ModelEndpointConfig,
@@ -141,10 +158,9 @@ def _apply_reasoning_effort(
     effort = (endpoint.reasoning_effort or "").strip()
     if effort.lower() == "off":
         return
-    if not effort and (
-        "generativelanguage.googleapis.com" in url.lower()
-        or "qwen3" in (endpoint.model or "").lower()
-    ):
+    url_lower = url.lower()
+    model_lower = (endpoint.model or "").lower()
+    if not effort and "qwen3" in model_lower and _is_local_ollama_url(url_lower):
         effort = "none"
     if effort:
         payload["reasoning_effort"] = effort
@@ -162,7 +178,9 @@ def _post_json_with_retry(
     for attempt in range(1, _MAX_HTTP_ATTEMPTS + 1):
         try:
             resp = client.post(url, json=payload, headers=headers)
-        except httpx.TransportError as exc:
+        except httpx.InvalidURL as exc:
+            raise BackendError(f"{role_label} invalid URL ({url}): {exc}") from exc
+        except httpx.HTTPError as exc:
             if attempt < _MAX_HTTP_ATTEMPTS:
                 time.sleep(_RETRY_BACKOFF_S)
                 continue
@@ -207,6 +225,11 @@ class DecisionBackend:
         )
         self._onnx_session: Any = None
         self._onnx_tokenizer: Any = None
+        self._onnx_np: Any = None
+        self._onnx_input_names: set[str] = set()
+        self._onnx_ent_idx: int | None = None
+        self._onnx_con_idx: int | None = None
+        self._onnx_lock = threading.Lock()
 
     def close(self) -> None:
         self._client.close()
@@ -306,6 +329,9 @@ class DecisionBackend:
         snapshot_json: str,
         analysis: str,
     ) -> list[float]:
+        url = (self.endpoint.url or "").strip()
+        if not url:
+            raise BackendError("http_decision provider requires non-empty `url` in [models.decision]")
         payload: dict[str, Any] = {
             "model": self.endpoint.model,
             "probe_id": probe_id,
@@ -315,53 +341,94 @@ class DecisionBackend:
         if analysis:
             payload["analysis"] = analysis
 
-        data = self._post_json(self.endpoint.url, payload)
+        data = self._post_json(url, payload)
         return _parse_probabilities_payload(data, checks)
 
-    def _ensure_onnx_loaded(self) -> tuple[Any, Any]:
-        if self._onnx_session is not None and self._onnx_tokenizer is not None:
-            return self._onnx_session, self._onnx_tokenizer
-        try:
-            import onnxruntime as ort
-            from tokenizers import Tokenizer
-        except ImportError as exc:
-            raise BackendError(
-                "onnx_nli provider requires optional dependencies: install `probe[onnx]`"
-            ) from exc
+    def _ensure_onnx_loaded(self) -> tuple[Any, Any, Any]:
+        if self._onnx_session is not None and self._onnx_tokenizer is not None and self._onnx_np is not None:
+            return self._onnx_session, self._onnx_tokenizer, self._onnx_np
+        with self._onnx_lock:
+            if (
+                self._onnx_session is not None
+                and self._onnx_tokenizer is not None
+                and self._onnx_np is not None
+            ):
+                return self._onnx_session, self._onnx_tokenizer, self._onnx_np
+            try:
+                import numpy as np
+                import onnxruntime as ort
+                from tokenizers import Tokenizer
+            except ImportError as exc:
+                raise BackendError(
+                    "onnx_nli provider requires optional dependencies: install `probe[onnx]`"
+                ) from exc
 
-        if not self.endpoint.onnx_path or not self.endpoint.tokenizer_path:
-            raise BackendError("onnx_nli requires both `onnx_path` and `tokenizer_path` in config")
+            if not self.endpoint.onnx_path or not self.endpoint.tokenizer_path:
+                raise BackendError("onnx_nli requires both `onnx_path` and `tokenizer_path` in config")
 
-        tok = Tokenizer.from_file(self.endpoint.tokenizer_path)
-        tok.enable_truncation(max_length=self.endpoint.max_length)
-        tok.enable_padding(length=self.endpoint.max_length)
-        opts = ort.SessionOptions()
-        opts.intra_op_num_threads = 2
-        sess = ort.InferenceSession(
-            self.endpoint.onnx_path,
-            sess_options=opts,
-            providers=["CPUExecutionProvider"],
-        )
-        self._onnx_session = sess
-        self._onnx_tokenizer = tok
-        return sess, tok
+            try:
+                tok = Tokenizer.from_file(self.endpoint.tokenizer_path)
+                tok.enable_truncation(max_length=self.endpoint.max_length, strategy="only_first")
+                tok.enable_padding(length=self.endpoint.max_length)
+                opts = ort.SessionOptions()
+                opts.intra_op_num_threads = 2
+                sess = ort.InferenceSession(
+                    self.endpoint.onnx_path,
+                    sess_options=opts,
+                    providers=["CPUExecutionProvider"],
+                )
+            except Exception as exc:
+                raise BackendError(f"Failed to load ONNX NLI artifacts: {exc}") from exc
+
+            self._onnx_input_names = {inp.name for inp in sess.get_inputs()}
+            self._onnx_ent_idx, self._onnx_con_idx = _read_onnx_label_indices(self.endpoint.onnx_path)
+            self._onnx_session = sess
+            self._onnx_tokenizer = tok
+            self._onnx_np = np
+            return sess, tok, np
 
     def _eval_onnx_nli(self, checks: list[str], snapshot_json: str, analysis: str) -> list[float]:
-        import numpy as np
+        sess, tok, np = self._ensure_onnx_loaded()
+        premise = _format_onnx_premise(snapshot_json, analysis)
+        try:
+            encs = tok.encode_batch([(premise, check) for check in checks])
+            ids = np.array([e.ids for e in encs], dtype=np.int64)
+            mask = np.array([e.attention_mask for e in encs], dtype=np.int64)
+            feed: dict[str, Any] = {"input_ids": ids, "attention_mask": mask}
+            if "token_type_ids" in self._onnx_input_names:
+                feed["token_type_ids"] = np.array([e.type_ids for e in encs], dtype=np.int64)
+            outputs = sess.run(None, feed)
+        except Exception as exc:
+            raise BackendError(f"ONNX NLI inference failed: {exc}") from exc
 
-        sess, tok = self._ensure_onnx_loaded()
-        premise = f"{analysis}\nSnapshot: {snapshot_json}" if analysis else snapshot_json
-        encs = tok.encode_batch([(premise, check) for check in checks])
-        ids = np.array([e.ids for e in encs], dtype=np.int64)
-        mask = np.array([e.attention_mask for e in encs], dtype=np.int64)
-        outputs = sess.run(None, {"input_ids": ids, "attention_mask": mask})
-        arr = np.asarray(outputs[-1], dtype=np.float64)
+        arr = np.asarray(outputs[0], dtype=np.float64)
         if arr.ndim == 1:
             arr = arr.reshape(1, -1)
+        if arr.ndim != 2 or arr.shape[1] < 1:
+            raise BackendError(f"Unexpected ONNX output shape: {arr.shape}")
 
+        num_classes = int(arr.shape[1])
         probs_out: list[float] = []
-        ent_idx = self.endpoint.entailment_index
-        con_idx = self.endpoint.contradiction_index
+        if num_classes == 1:
+            for row in arr:
+                logit = max(-60.0, min(60.0, float(row[0])))
+                probs_out.append(_clamp_prob(1.0 / (1.0 + math.exp(-logit))))
+            return probs_out
+
+        ent_idx = self._onnx_ent_idx
+        if ent_idx is None:
+            if num_classes >= 3 and self.endpoint.entailment_index == 1 and self.endpoint.contradiction_index == 0:
+                ent_idx = 2
+            else:
+                ent_idx = self.endpoint.entailment_index
+        con_idx = (
+            self._onnx_con_idx if self._onnx_con_idx is not None else self.endpoint.contradiction_index
+        )
+        if not (0 <= ent_idx < num_classes and 0 <= con_idx < num_classes):
+            raise BackendError(
+                f"ONNX label indices ({con_idx}, {ent_idx}) out of range for {num_classes} classes"
+            )
+
         for row in arr:
             # Softmax when raw logits (rows not summing near 1 or negative values present).
             if np.any(row < 0.0) or not math.isclose(float(np.sum(row)), 1.0, abs_tol=0.05):
@@ -378,6 +445,69 @@ class DecisionBackend:
         return probs_out
 
 
+def _read_onnx_label_indices(onnx_path: str) -> tuple[int | None, int | None]:
+    """Read optional adjacent HuggingFace config.json label mapping for NLI heads."""
+    cfg_path = Path(onnx_path).parent / "config.json"
+    if not cfg_path.is_file():
+        return None, None
+    try:
+        raw = json.loads(cfg_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return None, None
+    if not isinstance(raw, dict):
+        return None, None
+
+    ent_idx: int | None = None
+    con_idx: int | None = None
+    label2id = raw.get("label2id")
+    if isinstance(label2id, dict):
+        for label, idx in label2id.items():
+            if not isinstance(idx, int) or isinstance(idx, bool):
+                continue
+            low = str(label).strip().lower()
+            if low == "entailment":
+                ent_idx = idx
+            elif low in {"contradiction", "not_entailment"}:
+                con_idx = idx
+    id2label = raw.get("id2label")
+    if (ent_idx is None or con_idx is None) and isinstance(id2label, dict):
+        for idx_str, label in id2label.items():
+            try:
+                idx = int(idx_str)
+            except (TypeError, ValueError):
+                continue
+            low = str(label).strip().lower()
+            if ent_idx is None and low == "entailment":
+                ent_idx = idx
+            elif con_idx is None and low in {"contradiction", "not_entailment"}:
+                con_idx = idx
+    return ent_idx, con_idx
+
+
+def _format_onnx_premise(snapshot_json: str, analysis: str) -> str:
+    """Place analysis and observed outputs/watched vars first so truncation keeps key evidence."""
+    parts: list[str] = []
+    if analysis:
+        parts.append(f"Analysis: {analysis}")
+    try:
+        parsed = json.loads(snapshot_json)
+    except ValueError:
+        parsed = None
+
+    if isinstance(parsed, dict):
+        ordered: dict[str, Any] = {}
+        for key in ("output", "watched", "exception", "inputs"):
+            if key in parsed:
+                ordered[key] = parsed[key]
+        for key, val in parsed.items():
+            if key not in ordered:
+                ordered[key] = val
+        parts.append(json.dumps(ordered, ensure_ascii=False))
+    else:
+        parts.append(snapshot_json)
+    return "\n".join(parts)
+
+
 class TextBackend:
     """OpenAI-compatible LLM client for text-probe analysis, failure explanations, and pre-run checks."""
 
@@ -388,6 +518,11 @@ class TextBackend:
         *,
         transport: httpx.BaseTransport | None = None,
     ) -> None:
+        provider = (endpoint.provider or "").strip().lower()
+        if provider != "openai_compat":
+            raise BackendError(
+                f"Unsupported text provider {endpoint.provider!r}: expected 'openai_compat'"
+            )
         self.endpoint = endpoint
         self.text_cfg = text_cfg or TextConfig()
         self._client = httpx.Client(
@@ -398,9 +533,18 @@ class TextBackend:
     def close(self) -> None:
         self._client.close()
 
-    def _chat(self, system: str, user: str, *, max_tokens: int | None = None) -> str:
+    def _chat(
+        self,
+        system: str,
+        user: str,
+        *,
+        max_tokens: int | None = None,
+        include_user_system: bool = True,
+    ) -> str:
         url = _chat_completions_url(self.endpoint.url)
-        full_system = compose_system_prompt(system, self.text_cfg.system_prompt)
+        full_system = (
+            compose_system_prompt(system, self.text_cfg.system_prompt) if include_user_system else system
+        )
         payload = {
             "model": self.endpoint.model,
             "messages": [
@@ -418,7 +562,10 @@ class TextBackend:
             self.endpoint,
             role_label="Text LLM",
         )
-        return strip_thinking(_extract_chat_content(data))
+        cleaned = strip_thinking(_extract_chat_content(data))
+        if not cleaned:
+            raise BackendError("Text model returned an empty response")
+        return cleaned
 
     def analyze_snapshot(self, *, probe_id: str, checks: Sequence[str], snapshot_json: str) -> str:
         """Produce factual prose analysis for probe.type.text before decision scoring."""
@@ -467,7 +614,12 @@ class TextBackend:
             source_excerpt=source_excerpt,
             watched_keys=watched_keys,
         )
-        return self._chat(system, user, max_tokens=max(260, self.text_cfg.max_tokens))
+        return self._chat(
+            system,
+            user,
+            max_tokens=max(260, self.text_cfg.max_tokens),
+            include_user_system=False,
+        )
 
     def generate_calibration_fixtures_gate3(
         self,
@@ -488,7 +640,12 @@ class TextBackend:
             source_excerpt=source_excerpt,
             watched_keys=watched_keys,
         )
-        content = self._chat(system, user, max_tokens=max(600, self.text_cfg.max_tokens))
+        content = self._chat(
+            system,
+            user,
+            max_tokens=max(1200, self.text_cfg.max_tokens),
+            include_user_system=False,
+        )
         parsed = extract_json_object(content)
         passing = parsed.get("passing_snapshot")
         failing = parsed.get("failing_snapshot")
@@ -512,6 +669,22 @@ def _extract_chat_content(data: dict[str, Any]) -> str:
     raise BackendError(f"Missing message content in OpenAI response: {data!r}")
 
 
+def _lookup_prob_dict(prob_map: dict[Any, Any], checks: list[str], *, kind: str) -> list[float]:
+    out: list[float] = []
+    for i, c in enumerate(checks):
+        found = False
+        raw_val: Any = None
+        for candidate_key in (c, f"q{i}", f"check_{i}", str(i)):
+            if candidate_key in prob_map:
+                raw_val = prob_map[candidate_key]
+                found = True
+                break
+        if not found:
+            raise BackendError(f"Decision '{kind}' map missing entry for check [{i}] {c!r}")
+        out.append(_clamp_prob(raw_val))
+    return out
+
+
 def _parse_probabilities_payload(data: dict[str, Any], checks: list[str]) -> list[float]:
     n = len(checks)
     if isinstance(data.get("probabilities"), list):
@@ -521,8 +694,7 @@ def _parse_probabilities_payload(data: dict[str, Any], checks: list[str]) -> lis
         return [_clamp_prob(p) for p in raw_probs]
 
     if isinstance(data.get("probabilities"), dict):
-        prob_map = data["probabilities"]
-        return [_clamp_prob(prob_map[c]) for c in checks]
+        return _lookup_prob_dict(data["probabilities"], checks, kind="probabilities")
 
     if isinstance(data.get("scores"), list):
         raw_scores = data["scores"]
@@ -546,11 +718,7 @@ def _parse_probabilities_payload(data: dict[str, Any], checks: list[str]) -> lis
         ]
 
     if isinstance(data.get("noul"), dict):
-        noul = data["noul"]
-        if all(c in noul for c in checks):
-            return [_clamp_prob(noul[c]) for c in checks]
-        if all(f"check_{i}" in noul for i in range(n)):
-            return [_clamp_prob(noul[f"check_{i}"]) for i in range(n)]
+        return _lookup_prob_dict(data["noul"], checks, kind="noul")
 
     if n == 1 and any(k in data for k in ("probability", "score", "p")):
         val = data.get("probability", data.get("score", data.get("p")))

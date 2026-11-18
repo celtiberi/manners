@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Sequence
 from dataclasses import dataclass
 from functools import cache
@@ -109,12 +110,24 @@ def compose_system_prompt(base_system: str, user_system_prompt: str = "") -> str
     return f"{extra}\n\n{base_system}".strip()
 
 
+def _escape_json_closing_tags(snapshot_json: str) -> str:
+    """Escape `</` inside JSON text so string values cannot close XML wrapper tags."""
+    return snapshot_json.replace("</", "<\\/")
+
+
+def _escape_xml_closing_tag(text: str, tag: str) -> str:
+    """Escape closing `</tag>` occurrences in free text/code so wrappers stay balanced."""
+    return re.sub(rf"</({re.escape(tag)})\s*>", r"<\/\1>", text, flags=re.IGNORECASE)
+
+
 def format_typesafe_state(probe_id: str, snapshot_json: str, analysis: str = "") -> str:
     """Format the serialized state string sent to TypeSafe Jev /v1/systemone."""
     parts = [f"Probe: {probe_id}"]
     if analysis:
-        parts.append(f"Analysis:\n{analysis}")
-    parts.append(f"Runtime Snapshot (JSON):\n{snapshot_json}")
+        safe_analysis = _escape_xml_closing_tag(analysis, "analysis")
+        parts.append(f"Analysis:\n<analysis>\n{safe_analysis}\n</analysis>")
+    safe_snapshot = _escape_json_closing_tags(snapshot_json)
+    parts.append(f"Runtime Snapshot (JSON):\n<snapshot>\n{safe_snapshot}\n</snapshot>")
     return "\n\n".join(parts)
 
 
@@ -128,7 +141,8 @@ def format_analyze_snapshot_prompts(
     """Return (system, user) prompts for `probe.type.text` snapshot evidence extraction."""
     numbered = "\n".join(f"- [{i}] {c}" for i, c in enumerate(checks))
     system = f"{get_prompt('text_analyze_snapshot')}\n{detail_instruction(detail)}"
-    user = f"Probe: {probe_id}\nChecks:\n{numbered}\n\n<snapshot>\n{snapshot_json}\n</snapshot>"
+    safe_snapshot = _escape_json_closing_tags(snapshot_json)
+    user = f"Probe: {probe_id}\nChecks:\n{numbered}\n\n<snapshot>\n{safe_snapshot}\n</snapshot>"
     return system, user
 
 
@@ -142,7 +156,8 @@ def format_explain_failure_prompts(
     """Return (system, user) prompts for explaining failed decision checks."""
     joined = "\n".join(failed_lines)
     system = f"{get_prompt('text_explain_failure')}\n{detail_instruction(detail)}"
-    user = f"Probe: {probe_id}\nFailed check(s):\n{joined}\n\n<snapshot>\n{snapshot_json}\n</snapshot>"
+    safe_snapshot = _escape_json_closing_tags(snapshot_json)
+    user = f"Probe: {probe_id}\nFailed check(s):\n{joined}\n\n<snapshot>\n{safe_snapshot}\n</snapshot>"
     return system, user
 
 
@@ -165,7 +180,8 @@ def _format_gate_user_message(
         lines.append(f"Watched keys: {', '.join(watched_keys)}")
     lines.append(f"Checks:\n{numbered}")
     header = "\n".join(lines)
-    return f"{header}\n\n<source_excerpt>\n{source_excerpt}\n</source_excerpt>"
+    safe_excerpt = _escape_xml_closing_tag(source_excerpt, "source_excerpt")
+    return f"{header}\n\n<source_excerpt>\n{safe_excerpt}\n</source_excerpt>"
 
 
 def format_gate2_analysis_prompts(

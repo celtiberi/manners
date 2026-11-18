@@ -109,28 +109,56 @@ class ProbeStore:
 
     def __init__(self, db_path: Path | str, *, create: bool = True) -> None:
         self.db_path = Path(db_path)
+        self._lock = threading.Lock()
         if create:
             _ensure_probes_gitignore(self.db_path)
-        self._lock = threading.Lock()
-        self._conn = sqlite3.connect(
-            str(self.db_path),
-            timeout=30.0,
-            check_same_thread=False,
-        )
+            self._conn = sqlite3.connect(
+                str(self.db_path),
+                timeout=30.0,
+                check_same_thread=False,
+            )
+        else:
+            ro_uri = f"{self.db_path.resolve().as_uri()}?mode=ro"
+            self._conn = sqlite3.connect(
+                ro_uri,
+                uri=True,
+                timeout=30.0,
+                check_same_thread=False,
+            )
+            try:
+                self._conn.execute("SELECT 1 FROM sqlite_master LIMIT 1").fetchone()
+            except sqlite3.OperationalError:
+                self._conn.close()
+                imm_uri = f"{self.db_path.resolve().as_uri()}?mode=ro&immutable=1"
+                self._conn = sqlite3.connect(
+                    imm_uri,
+                    uri=True,
+                    timeout=30.0,
+                    check_same_thread=False,
+                )
         self._conn.row_factory = sqlite3.Row
-        with self._lock:
-            self._conn.execute("PRAGMA journal_mode=WAL")
-            self._conn.execute("PRAGMA synchronous=NORMAL")
-            self._conn.execute("PRAGMA foreign_keys=ON")
-            self._conn.execute("PRAGMA busy_timeout=5000")
-            cols = {
-                str(r["name"])
-                for r in self._conn.execute("PRAGMA table_info(events)").fetchall()
-            }
-            if cols and "when_cond" in cols:
-                self._conn.execute("DROP TABLE events")
-            self._conn.executescript(_SCHEMA_SQL)
-            self._conn.commit()
+        try:
+            with self._lock:
+                if create:
+                    self._conn.execute("PRAGMA busy_timeout=30000")
+                    self._conn.execute("PRAGMA journal_mode=WAL")
+                    self._conn.execute("PRAGMA synchronous=NORMAL")
+                    self._conn.execute("PRAGMA foreign_keys=ON")
+                    cols = {
+                        str(r["name"])
+                        for r in self._conn.execute("PRAGMA table_info(events)").fetchall()
+                    }
+                    if cols and "when_cond" in cols:
+                        self._conn.execute("DROP TABLE events")
+                        try:
+                            self._conn.execute("DELETE FROM runs")
+                        except sqlite3.Error:
+                            pass
+                    self._conn.executescript(_SCHEMA_SQL)
+                    self._conn.commit()
+        except Exception:
+            self._conn.close()
+            raise
 
     def close(self) -> None:
         with self._lock:
@@ -147,16 +175,16 @@ class ProbeStore:
         text_model: str,
     ) -> None:
         with self._lock:
-            self._conn.execute(
-                """
-                INSERT INTO runs (
-                    id, started_at, finished_at, cmd, pid, status,
-                    halt_call_seq, decision_model, text_model
-                ) VALUES (?, ?, NULL, ?, ?, 'running', NULL, ?, ?)
-                """,
-                (run_id, started_at, cmd, pid, decision_model, text_model),
-            )
-            self._conn.commit()
+            with self._conn:
+                self._conn.execute(
+                    """
+                    INSERT INTO runs (
+                        id, started_at, finished_at, cmd, pid, status,
+                        halt_call_seq, decision_model, text_model
+                    ) VALUES (?, ?, NULL, ?, ?, 'running', NULL, ?, ?)
+                    """,
+                    (run_id, started_at, cmd, pid, decision_model, text_model),
+                )
 
     def finish_run(
         self,
@@ -167,17 +195,17 @@ class ProbeStore:
         halt_call_seq: int | None = None,
     ) -> None:
         with self._lock:
-            self._conn.execute(
-                """
-                UPDATE runs
-                SET status = ?,
-                    finished_at = COALESCE(?, finished_at),
-                    halt_call_seq = COALESCE(?, halt_call_seq)
-                WHERE id = ?
-                """,
-                (status, finished_at or utc_now_iso(), halt_call_seq, run_id),
-            )
-            self._conn.commit()
+            with self._conn:
+                self._conn.execute(
+                    """
+                    UPDATE runs
+                    SET status = ?,
+                        finished_at = COALESCE(?, finished_at),
+                        halt_call_seq = COALESCE(halt_call_seq, ?)
+                    WHERE id = ?
+                    """,
+                    (status, finished_at or utc_now_iso(), halt_call_seq, run_id),
+                )
 
     def insert_event(
         self,
@@ -213,36 +241,36 @@ class ProbeStore:
             ensure_ascii=False,
         )
         with self._lock:
-            self._conn.execute(
-                """
-                INSERT INTO events (
-                    run_id, call_seq, elapsed_ms, started_at, probe_id,
-                    site, probe_type, file_line, checks_json,
-                    payload_json, check_scores_json, verdict, error_code,
-                    text_analysis, stack_excerpt, judged_at, latency_ms
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    run_id,
-                    call_seq,
-                    elapsed_ms,
-                    started_at,
-                    probe_id,
-                    site,
-                    probe_type,
-                    file_line,
-                    checks_json,
-                    payload_json,
-                    scores_json,
-                    verdict,
-                    error_code,
-                    text_analysis,
-                    stack_excerpt,
-                    judged_at or utc_now_iso(),
-                    latency_ms,
-                ),
-            )
-            self._conn.commit()
+            with self._conn:
+                self._conn.execute(
+                    """
+                    INSERT INTO events (
+                        run_id, call_seq, elapsed_ms, started_at, probe_id,
+                        site, probe_type, file_line, checks_json,
+                        payload_json, check_scores_json, verdict, error_code,
+                        text_analysis, stack_excerpt, judged_at, latency_ms
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        run_id,
+                        call_seq,
+                        elapsed_ms,
+                        started_at,
+                        probe_id,
+                        site,
+                        probe_type,
+                        file_line,
+                        checks_json,
+                        payload_json,
+                        scores_json,
+                        verdict,
+                        error_code,
+                        text_analysis,
+                        stack_excerpt,
+                        judged_at or utc_now_iso(),
+                        latency_ms,
+                    ),
+                )
 
     def _row_to_run(self, row: sqlite3.Row) -> RunRecord:
         return RunRecord(
@@ -323,16 +351,28 @@ class ProbeStore:
             pid = str(row["probe_id"])
             if patterns and not any(fnmatchcase(pid, pat) for pat in patterns):
                 continue
-            checks = tuple(str(c) for c in json.loads(row["checks_json"]))
-            scores_raw = json.loads(row["check_scores_json"])
-            scores = tuple(
-                CheckScore(
-                    check=str(item["check"]),
-                    probability=float(item["probability"]),
-                    passed=bool(item["passed"]),
+            try:
+                raw_checks = json.loads(row["checks_json"])
+                checks = tuple(str(c) for c in raw_checks) if isinstance(raw_checks, list) else ()
+            except Exception:
+                checks = ()
+            try:
+                scores_raw = json.loads(row["check_scores_json"])
+                scores = (
+                    tuple(
+                        CheckScore(
+                            check=str(item.get("check", "")),
+                            probability=float(item.get("probability", 0.0)),
+                            passed=bool(item.get("passed", False)),
+                        )
+                        for item in scores_raw
+                        if isinstance(item, dict)
+                    )
+                    if isinstance(scores_raw, list)
+                    else ()
                 )
-                for item in scores_raw
-            )
+            except Exception:
+                scores = ()
             events.append(
                 EventRecord(
                     run_id=str(row["run_id"]),
@@ -360,19 +400,28 @@ class ProbeStore:
         """Delete runs older than the most recent `keep` runs and truncate the WAL."""
         keep_n = max(0, keep)
         with self._lock:
-            rows = self._conn.execute("SELECT id FROM runs ORDER BY started_at DESC, id DESC").fetchall()
-            to_delete = [str(r["id"]) for r in rows[keep_n:]]
-            if not to_delete:
-                return 0
-            placeholders = ",".join("?" for _ in to_delete)
-            self._conn.execute(
-                f"DELETE FROM events WHERE run_id IN ({placeholders})",
-                to_delete,
-            )
-            cur = self._conn.execute(
-                f"DELETE FROM runs WHERE id IN ({placeholders})",
-                to_delete,
-            )
-            self._conn.commit()
-            self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-            return int(cur.rowcount or 0)
+            with self._conn:
+                self._conn.execute(
+                    """
+                    DELETE FROM events
+                    WHERE run_id NOT IN (
+                        SELECT id FROM runs ORDER BY started_at DESC, id DESC LIMIT ?
+                    )
+                    """,
+                    (keep_n,),
+                )
+                cur = self._conn.execute(
+                    """
+                    DELETE FROM runs
+                    WHERE id NOT IN (
+                        SELECT id FROM runs ORDER BY started_at DESC, id DESC LIMIT ?
+                    )
+                    """,
+                    (keep_n,),
+                )
+                deleted = int(cur.rowcount or 0)
+            try:
+                self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            except sqlite3.Error:
+                pass
+            return deleted

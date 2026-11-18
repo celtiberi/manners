@@ -83,9 +83,11 @@ probe check
 
 ```sh
 PROBES=1 uvicorn app:app --reload
-# or
-PROBES=1 pytest
+# or in CI / non-interactive test runs:
+PROBES=1 PROBE_NO_PDB=1 pytest
 ```
+
+To skip `.probes/lock.json` enforcement during quick local iteration, set `PROBE_SKIP_LOCK=1`. Setting `PROBES=""` or `PROBES=0` in the shell overrides `PROBES=1` in `.env`.
 
 4. Inspect results in call-entry order (works while a server is running too, via SQLite WAL):
 

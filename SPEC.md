@@ -9,7 +9,7 @@
 
 `probe` puts AI into the debugging loop on running Python code. You attach plain-English checks to functions (`@probe(...)`) or mid-function lines (`probe.here(...)`).
 
-- When `PROBES` is unset or `0` (the default), `@probe` returns the original function unwrapped and `probe.here` does nothing.
+- When `PROBES` is unset, empty, or `0` (the default), `@probe` passes calls straight through to the original function and `probe.here` does nothing.
 - When `PROBES=1` (via shell env or `.env`), `probe` captures runtime inputs, outputs, and watched variables, evaluates checks inline before continuing, writes results in call-entry order, and halts execution on the active frame if a check fails or a probe fires in a tight loop.
 - Two model roles are configured in `~/.config/probe/config.toml`:
   - **`decision` (Jev-type model):** Takes a snapshot and discrete checks and returns calibrated probabilities `p ∈ [0.0, 1.0]` per check, mapping cleanly to `pass` or `fail`.
@@ -116,8 +116,8 @@ When probes are nested (e.g., an outer `@probe` calls an inner `@probe` or `prob
 Before a snapshot is written to `.probes/probes.db` or sent to any model:
 
 1. **Startup secret collection (exact value scrubbing):** When `PROBES=1`, `probe` collects known secret values once at startup (`len >= 8`, skipping plain booleans, integers, ports, and local file paths) from:
-   - `.env*` files in the working directory plus any paths listed in `[redact].env_files`.
-   - `os.environ` keys matching secret-like names (`*KEY*`, `*TOKEN*`, `*SECRET*`, `*PASS*`, `*AUTH*`, `*DSN*`, `*DATABASE_URL*`, `*PRIVATE*`, `*CREDENTIAL*`), plus userinfo passwords parsed out of connection URLs/DSNs.
+   - Secret-named keys (`*KEY*`, `*TOKEN*`, `*SECRET*`, `*PASS*`, `*AUTH*`, `*DSN*`, `*DATABASE_URL*`, `*PRIVATE*`, `*CRED*`, `*BEARER*`, `*SIGNING*`, `*ENCRYPT*`) and connection/webhook URLs in `.env*` files across project root/working directory plus `[redact].env_files`.
+   - Matching secret-named keys and userinfo passwords parsed out of URLs/DSNs in `os.environ`.
 
    Collected values (sorted longest-first) are replaced with `"[REDACTED]"` anywhere they appear inside serialized snapshots.
 2. **Request-field masking:** Values under dynamic user-credential argument or dict keys (`password`, `passwd`, `passphrase`, `authorization`, `cookie`, plus `[redact].extra_keys`) are masked directly as `"[REDACTED]"` to cover per-request secrets that do not live in `.env` or `os.environ`.
@@ -172,7 +172,7 @@ Probes must pass `probe check` before running (and whenever checks, `kind`, or t
 1. **Static AST scan:** Extracts `@probe(...)` and `probe.here(...)` calls, signatures, and bodies without importing project modules.
 2. **Gate 1 — Budgets & structure:** Checks for duplicate `probe_id`s, `len(checks) <= max_checks` (default `5`), and `len(check) <= max_check_chars` (default `200`).
 3. **Gate 2 — Assert vs. prose audit (`[models.text]` + `[models.decision]`):** `[models.text]` describes factually what each check inspects at runtime, and `[models.decision]` scores the Gate 2 `noul` propositions—rejecting checks that belong as regular Python `assert`s or regexes (math, null checks, regex matches, type/length checks), vague unfalsifiable filler, or checks requiring uncaptured external state.
-4. **Gate 3 — Dry-run calibration:** Skipped if `(probe_id, check_hash)` is unchanged in `.probes/lock.json` (unless `--force`). Uses fixtures from `.probes/fixtures/<probe_id>.json` if present, or asks `[models.text]` for one passing and one failing sample matching the signature, then verifies the configured evaluator scores the valid sample `pass` and the broken sample `fail`.
+4. **Gate 3 — Dry-run calibration:** Skipped when `(probe_id, site, kind, watched_keys)` and combined `(checks, source, manual fixture)` hashes are unchanged in `.probes/lock.json` (unless `--force`). Uses fixtures from `.probes/fixtures/<probe_id>.json` if present, or asks `[models.text]` for one passing and one failing sample matching the signature, then verifies the configured evaluator scores the valid sample `pass` and the broken sample `fail`.
 
 ---
 
@@ -252,7 +252,7 @@ url = "http://127.0.0.1:11434/v1"
 model = "qwen3.5:9b"
 ```
 
-*(You can also configure `provider = "onnx_nli"` with local ONNX weights or mix cloud `[models.decision]` `typesafe_jev` with local Ollama `[models.text]` `qwen3.5:9b`.)*
+*(You can also configure `provider = "onnx_nli"` with local ONNX weights — default `max_length = 512`, truncating premise `only_first` — or mix cloud `[models.decision]` `typesafe_jev` with local Ollama `[models.text]` `qwen3.5:9b`.)*
 
 **Shared Settings:**
 
@@ -308,6 +308,7 @@ probe/
 ├── src/
 │   └── probe/
 │       ├── __init__.py          # Public API: @probe, probe.here, probe.type.{decision,text}
+│       ├── py.typed             # PEP 561 typing marker
 │       ├── config.py            # ~/.config/probe/config.toml + pyproject.toml + env/.env resolution
 │       ├── redact.py            # .env / os.environ secret collection + request-key masking
 │       ├── prompts.json         # Internal prompts with role/stage/purpose metadata

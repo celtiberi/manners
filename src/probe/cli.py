@@ -9,6 +9,7 @@ from typing import Any
 
 import typer
 
+from probe.backends import BackendError
 from probe.check import _load_lockfile, discover_probes, run_probe_check
 from probe.config import load_config
 from probe.store import EventRecord, ProbeStore, RunRecord
@@ -21,11 +22,11 @@ app = typer.Typer(
 )
 
 
-def _open_existing_store(db_path: Path) -> ProbeStore:
+def _open_existing_store(db_path: Path, *, read_only: bool = True) -> ProbeStore:
     if not db_path.is_file():
         typer.echo(f"No probe database found at {db_path}. Run with PROBES=1 first.", err=True)
         raise typer.Exit(code=1)
-    return ProbeStore(db_path, create=False)
+    return ProbeStore(db_path, create=not read_only)
 
 
 def _run_status_label(run: RunRecord, events: list[EventRecord]) -> str:
@@ -177,7 +178,27 @@ def _format_report_md(run: RunRecord, events: list[EventRecord], *, show_all: bo
             out.append(f"  - [{mark} p={s.probability:.2f}] {s.check}")
         if ev.text_analysis:
             out.append(f"  - analysis: {ev.text_analysis}")
+        if ev.stack_excerpt and ev.verdict in {"fail", "error"}:
+            out.append("  - stack:")
+            out.append("    ```text")
+            for sline in ev.stack_excerpt.splitlines():
+                out.append(f"    {sline}")
+            out.append("    ```")
     return "\n".join(out)
+
+
+def _resolve_cli_scan_paths(paths: list[Path] | None) -> list[Path]:
+    if not paths:
+        return []
+    cwd = Path.cwd()
+    resolved_paths: list[Path] = []
+    for p in paths:
+        resolved = p.resolve() if p.is_absolute() else (cwd / p).resolve()
+        if not resolved.exists():
+            typer.echo(f"Path does not exist: {p}", err=True)
+            raise typer.Exit(code=1)
+        resolved_paths.append(resolved)
+    return resolved_paths
 
 
 @app.command("check")
@@ -187,8 +208,13 @@ def check_cmd(
     json_out: bool = typer.Option(False, "--json", help="Emit machine-readable JSON output."),
 ) -> None:
     """Run Gates 1-3 on new or changed probes and update .probes/lock.json."""
-    cfg = load_config()
-    ok, results = run_probe_check(paths or (), force=force, config=cfg)
+    resolved_paths = _resolve_cli_scan_paths(paths)
+    try:
+        cfg = load_config()
+        ok, results = run_probe_check(resolved_paths, force=force, config=cfg)
+    except (BackendError, ValueError) as exc:
+        typer.echo(f"Error: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
 
     if json_out:
         typer.echo(
@@ -220,9 +246,14 @@ def list_cmd(
     json_out: bool = typer.Option(False, "--json", help="Emit JSON output."),
 ) -> None:
     """List statically discovered @probe and probe.here call sites and lock status."""
-    cfg = load_config()
-    discovered = discover_probes(paths or (), root=cfg.project_root)
-    lock_data = _load_lockfile(cfg.resolve_lock_path())
+    resolved_paths = _resolve_cli_scan_paths(paths)
+    try:
+        cfg = load_config()
+        discovered = discover_probes(resolved_paths, root=cfg.project_root)
+        lock_data = _load_lockfile(cfg.resolve_lock_path())
+    except (BackendError, ValueError) as exc:
+        typer.echo(f"Error: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
     locked = lock_data.get("probes", {})
 
     rows: list[dict[str, Any]] = []
@@ -273,11 +304,12 @@ def report_cmd(
 ) -> None:
     """Print call-ordered summary of the latest or specified probe run."""
     cfg = load_config()
-    store = _open_existing_store(cfg.resolve_db_path())
+    db_path = cfg.resolve_db_path()
+    store = _open_existing_store(db_path)
     try:
         run = store.get_run(run_id)
         if run is None:
-            typer.echo("No matching run found in .probes/probes.db.", err=True)
+            typer.echo(f"No matching run found in {db_path}.", err=True)
             raise typer.Exit(code=1)
         events = store.list_events(run.id)
     finally:
@@ -308,12 +340,16 @@ def log_cmd(
     fmt: str = typer.Option("text", "--format", help="Output format: text | md | json."),
 ) -> None:
     """Interleave detailed chronological entries (call_seq ASC) for one or more probe IDs/globs."""
+    if not probe_ids or any(not pat.strip() for pat in probe_ids):
+        typer.echo("Probe ID or glob pattern must not be empty.", err=True)
+        raise typer.Exit(code=1)
     cfg = load_config()
-    store = _open_existing_store(cfg.resolve_db_path())
+    db_path = cfg.resolve_db_path()
+    store = _open_existing_store(db_path)
     try:
         run = store.get_run(run_id)
         if run is None:
-            typer.echo("No matching run found in .probes/probes.db.", err=True)
+            typer.echo(f"No matching run found in {db_path}.", err=True)
             raise typer.Exit(code=1)
         events = store.list_events(run.id, probe_patterns=probe_ids)
     finally:
@@ -324,7 +360,7 @@ def log_cmd(
         out = {
             "run": dataclasses.asdict(run),
             "patterns": probe_ids,
-            "events": [_event_to_dict(e, include_payload=True) for e in events],
+            "events": [_event_to_dict(e, include_payload=payload) for e in events],
         }
         typer.echo(json.dumps(out, indent=2, ensure_ascii=False))
         return
@@ -342,11 +378,19 @@ def log_cmd(
                 f"- `#{ev.call_seq:03d}` `+{sec:.3f}s` **`[{ev.verdict.upper()}]`** "
                 f"`{ev.probe_id}` (`{ev.file_line}`)"
             )
+            if ev.error_code:
+                lines.append(f"  - error: `{ev.error_code}`")
             for s in ev.check_scores:
                 mark = "PASS" if s.passed else "FAIL"
                 lines.append(f"  - [{mark} p={s.probability:.2f}] {s.check}")
             if ev.text_analysis:
                 lines.append(f"  - analysis: {ev.text_analysis}")
+            if ev.stack_excerpt and ev.verdict in {"fail", "error"}:
+                lines.append("  - stack:")
+                lines.append("    ```text")
+                for sline in ev.stack_excerpt.splitlines():
+                    lines.append(f"    {sline}")
+                lines.append("    ```")
             if payload:
                 lines.append(f"  - payload: `{ev.payload_json}`")
         typer.echo("\n".join(lines))
@@ -378,7 +422,7 @@ def log_cmd(
 
 @app.command("runs")
 def runs_cmd(
-    limit: int = typer.Option(20, "--limit", help="Maximum number of recent runs to show."),
+    limit: int = typer.Option(20, "--limit", min=1, help="Maximum number of recent runs to show."),
     json_out: bool = typer.Option(False, "--json", help="Emit JSON output."),
 ) -> None:
     """List recent probe runs with timestamps, verdict counts, and status."""
@@ -407,11 +451,11 @@ def runs_cmd(
 
 @app.command("clean")
 def clean_cmd(
-    keep: int = typer.Option(20, "--keep", help="Number of newest runs to retain."),
+    keep: int = typer.Option(20, "--keep", min=0, help="Number of newest runs to retain."),
 ) -> None:
     """Prune old runs from .probes/probes.db and truncate WAL."""
     cfg = load_config()
-    store = _open_existing_store(cfg.resolve_db_path())
+    store = _open_existing_store(cfg.resolve_db_path(), read_only=False)
     try:
         deleted = store.clean_runs(keep=keep)
     finally:

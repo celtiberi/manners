@@ -138,10 +138,12 @@ def test_live_typesafe_jev_spanish_tutor_checks(tmp_path: Path, monkeypatch) -> 
     monkeypatch.setenv("PROBE_CONFIG", str(tmp_path / "no_user_config.toml"))
     monkeypatch.delenv("TYPESAFE_API_KEY", raising=False)
     monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
-    cfg = load_config(cwd=PROBE_ROOT)
+    (tmp_path / ".env").write_text(f"TYPESAFE_API_KEY={_TYPESAFE_KEY}\n", encoding="utf-8")
+    (tmp_path / "pyproject.toml").write_text("[project]\nname = 'live-jev-checks'\n", encoding="utf-8")
+    cfg = load_config(cwd=tmp_path)
 
     assert cfg.models_decision.provider == "typesafe_jev"
-    assert cfg.models_decision.resolve_api_key(), "Expected TYPESAFE_API_KEY from probe/.env"
+    assert cfg.models_decision.resolve_api_key(), "Expected TYPESAFE_API_KEY from seeded .env"
 
     spec_checks = [
         "Tutor opens with a short Spanish greeting or phrase",
@@ -355,10 +357,12 @@ def test_live_runtime_decision_text_redaction_and_cli_report(
 
 
 @pytest.mark.skipif(
-    not (_TYPESAFE_KEY and _has_local_qwen()),
-    reason="Requires TYPESAFE_API_KEY and local Ollama at http://127.0.0.1:11434 with qwen3.5:9b",
+    not _TYPESAFE_KEY,
+    reason="Requires TYPESAFE_API_KEY in env or probe/.env",
 )
 def test_live_jev_decision_with_local_qwen_text_pipeline(tmp_path: Path, monkeypatch) -> None:
+    if not _has_local_qwen():
+        pytest.skip("Requires local Ollama at http://127.0.0.1:11434 with qwen3.5:9b")
     monkeypatch.setenv("PROBE_CONFIG", str(tmp_path / "no_user_config.toml"))
     monkeypatch.setenv("PROBES", "1")
     monkeypatch.setenv("PROBE_NO_PDB", "1")

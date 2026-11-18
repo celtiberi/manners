@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import json
+import threading
 from dataclasses import dataclass
 from pathlib import Path
+from typing import NamedTuple
 
 from probe import probe
 from probe.config import RedactConfig
@@ -153,3 +155,81 @@ def test_bounded_serialization_and_oversized_secret_scrub() -> None:
     assert "25 more items" in str(parsed["many"][-1])
     assert "<circular>" in json.dumps(parsed["loop"])
     assert probe.REDACTED if hasattr(probe, "REDACTED") else True
+
+
+def test_redactor_edge_cases_webhooks_depth_namedtuple_slots_lock_and_subdirs(
+    tmp_path: Path, monkeypatch
+) -> None:
+    proj = tmp_path / "proj"
+    subdir = proj / "sub"
+    subdir.mkdir(parents=True)
+    (proj / ".env").write_text(
+        "\n".join(
+            [
+                "POSTGRES_USER=postgres",
+                "APP_NAME=spanish-tutor",
+                "SLACK_WEBHOOK_URL=https://hooks.slack.com/services/T000/B000/SecretHookToken123",
+                'MULTILINE_KEY="line_one_secret\nline_two_secret"',
+                'QUOTE_SECRET="abc\\"def\\\\ghi"',
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    (subdir / ".env.sub").write_text("SUB_API_TOKEN=sub_token_987654\n", encoding="utf-8")
+
+    redactor = SecretRedactor.from_environment(
+        RedactConfig(env_files=(".env",)),
+        cwd=proj,
+        extra_dirs=(subdir,),
+    )
+
+    # Ordinary non-secret config values stay unredacted while webhook/subdir/JSON-escaped secrets scrub.
+    text = (
+        "postgres spanish-tutor "
+        "https://hooks.slack.com/services/T000/B000/SecretHookToken123 "
+        "sub_token_987654 "
+        'line_one_secret\nline_two_secret json={"k":"abc\\"def\\\\ghi"}'
+    )
+    scrubbed = redactor.scrub_text(text)
+    assert "postgres" in scrubbed
+    assert "spanish-tutor" in scrubbed
+    assert "SecretHookToken123" not in scrubbed
+    assert "sub_token_987654" not in scrubbed
+    assert "line_one_secret" not in scrubbed
+    assert 'abc\\"def' not in scrubbed
+
+    class CredTuple(NamedTuple):
+        user: str
+        x_api_key: str
+
+    class SlottedCreds:
+        __slots__ = ("label", "access_token", "_internal")
+
+        def __init__(self, label: str, access_token: str) -> None:
+            self.label = label
+            self.access_token = access_token
+            self._internal = "hidden"
+
+    @dataclass
+    class GuardedCtx:
+        lock: threading.Lock
+        password: str
+
+    snap_json = serialize_here_snapshot(
+        {
+            "deep": {"a": {"b": {"c": {"password": "must_not_leak_at_max_depth"}}}},
+            "nt": CredTuple("bob", "secret_key_val"),
+            "slots": SlottedCreds("svc", "tok_secret_99"),
+            "ctx": GuardedCtx(lock=threading.Lock(), password="pw_secret"),
+        },
+        redactor,
+        max_depth=4,
+    )
+    assert "must_not_leak_at_max_depth" not in snap_json
+    parsed = json.loads(snap_json)["watched"]
+    assert parsed["deep"]["a"]["b"]["c"] == "<dict len=1 max_depth>"
+    assert parsed["nt"] == {"user": "bob", "x_api_key": REDACTED}
+    assert parsed["slots"] == {"label": "svc", "access_token": REDACTED}
+    assert parsed["ctx"]["password"] == REDACTED
+    assert "_thread.lock" in str(parsed["ctx"]["lock"]) or "lock" in str(parsed["ctx"]["lock"]).lower()
