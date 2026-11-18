@@ -44,7 +44,7 @@ probe.here(
     ],
     id="rag.draft_answer",
     kind=probe.type.text,
-    sync="when draft cites specific figures or dates absent from retrieved_chunks",
+    when="draft cites specific figures or dates absent from retrieved_chunks",
     user_question=question,
     retrieved_chunks=chunks,
     draft=draft_text,
@@ -57,13 +57,17 @@ probe.here(
 probe check
 ```
 
-3. Run your code or tests with probes enabled:
+3. Run your server or tests with probes enabled (either in the shell or by setting `PROBES=1` in `.env`):
 
 ```sh
+PROBES=1 uvicorn app:app --reload
+# or
 PROBES=1 pytest
 ```
 
-4. Inspect results in call-entry order:
+Each probe checks inputs/outputs inline. On failure (or `when=` match), `probe` opens `pdb` on that caller frame in an interactive terminal or raises `ProbeHaltError`.
+
+4. Inspect results in call-entry order (works while a server is running too, via SQLite WAL):
 
 ```sh
 probe report --all
@@ -111,7 +115,7 @@ system_prompt = ""
 [rate_limit]
 max_calls = 5
 window_seconds = 10.0
-max_calls_per_run = 100
+max_calls_per_run = -1
 
 [check]
 max_checks = 5
@@ -125,8 +129,6 @@ extra_keys = []
 [runtime]
 db_path = ".probes/probes.db"
 lock_path = ".probes/lock.json"
-max_concurrency = 6
-drain_timeout_s = 15.0
 ```
 
 ## License

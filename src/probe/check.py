@@ -43,7 +43,7 @@ class DiscoveredProbe:
     probe_id: str
     site: str  # "decorator" | "here"
     probe_type: ProbeType
-    sync_repr: str
+    when: str | None
     file_path: str
     lineno: int
     file_line: str
@@ -234,10 +234,17 @@ def _extract_probe_type(expr: ast.expr | None) -> tuple[ProbeType, str | None]:
     return ProbeType.decision, f"Unsupported dynamic probe kind expression: {ast.unparse(expr)}"
 
 
-def _format_sync_expr(expr: ast.expr | None) -> str:
+def _extract_when_cond(expr: ast.expr | None) -> tuple[str | None, str | None]:
     if expr is None:
-        return "False"
-    return ast.unparse(expr)
+        return None, None
+    if isinstance(expr, ast.Constant) and expr.value is None:
+        return None, None
+    if isinstance(expr, ast.Constant) and isinstance(expr.value, str):
+        stripped = expr.value.strip()
+        if not stripped:
+            return None, "`when` condition string must not be empty"
+        return stripped, None
+    return None, f"`when` must be a string literal or None: {ast.unparse(expr)}"
 
 
 def _format_signature(fn_node: ast.FunctionDef | ast.AsyncFunctionDef) -> str:
@@ -289,8 +296,8 @@ class _ModuleProbeVisitor(ast.NodeVisitor):
             explicit_id = _extract_str_constant(_extract_kwarg(call, "id"))
             probe_id = explicit_id or f"{self.module_name}.{qualname}"
             kind, kind_err = _extract_probe_type(_extract_kwarg(call, "kind"))
-            literal_error = check_err or kind_err
-            sync_repr = _format_sync_expr(_extract_kwarg(call, "sync"))
+            when_cond, when_err = _extract_when_cond(_extract_kwarg(call, "when"))
+            literal_error = check_err or kind_err or when_err
             sig = _format_signature(node)
             body_excerpt = ast.get_source_segment(self.source, node) or sig
             if len(body_excerpt) > 1500:
@@ -303,7 +310,7 @@ class _ModuleProbeVisitor(ast.NodeVisitor):
                     probe_id=probe_id,
                     site="decorator",
                     probe_type=kind,
-                    sync_repr=sync_repr,
+                    when=when_cond,
                     file_path=self.display_path,
                     lineno=node.lineno,
                     file_line=f"{self.display_path}:{node.lineno}",
@@ -345,8 +352,8 @@ class _ModuleProbeVisitor(ast.NodeVisitor):
             )
             probe_id = explicit_id or default_id
             kind, kind_err = _extract_probe_type(_extract_kwarg(call, "kind"))
-            literal_error = check_err or kind_err
-            sync_repr = _format_sync_expr(_extract_kwarg(call, "sync"))
+            when_cond, when_err = _extract_when_cond(_extract_kwarg(call, "when"))
+            literal_error = check_err or kind_err or when_err
             enclosing = self.fn_stack[-1] if self.fn_stack else None
             sig = _format_signature(enclosing) if enclosing else "<module>"
             start_idx = max(0, call.lineno - 6)
@@ -360,7 +367,7 @@ class _ModuleProbeVisitor(ast.NodeVisitor):
                     probe_id=probe_id,
                     site="here",
                     probe_type=kind,
-                    sync_repr=sync_repr,
+                    when=when_cond,
                     file_path=self.display_path,
                     lineno=call.lineno,
                     file_line=f"{self.display_path}:{call.lineno}",

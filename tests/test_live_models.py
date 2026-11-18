@@ -115,8 +115,6 @@ def _seed_live_project_config(tmp_path: Path, *, skip_lock_require: bool = False
     cfg.runtime = RuntimeConfig(
         db_path=str(tmp_path / ".probes" / "probes.db"),
         lock_path=str(tmp_path / ".probes" / "lock.json"),
-        max_concurrency=2,
-        drain_timeout_s=20.0,
     )
     return cfg
 
@@ -269,7 +267,6 @@ def test_live_runtime_decision_text_redaction_and_cli_report(
             ],
             id="rag.live_draft",
             kind=probe.type.text,
-            sync=True,
             retrieved_chunks=["Menu note: Espresso at Cafe Sol costs $3.75."],
             draft="Espresso at Cafe Sol costs $3.75.",
         )
@@ -280,7 +277,6 @@ def test_live_runtime_decision_text_redaction_and_cli_report(
             ],
             id="tutor.live_fail",
             kind=probe.type.decision,
-            sync=True,
         )
         def live_spoiler_turn(topic: str) -> str:
             return "Say this exact sentence in Spanish verbatim: Quiero un café con leche por favor."

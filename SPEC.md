@@ -1,7 +1,7 @@
 # `probe` — Specification
 
-> **Status:** Draft v0.5
-> **Scope:** Cross-project Python instrumentation, pre-run check, model-backed runtime checks, and call-ordered reports.
+> **Status:** Draft v0.6
+> **Scope:** Python instrumentation, pre-run check, inline model-backed runtime checks, and call-ordered reports.
 
 ---
 
@@ -10,7 +10,7 @@
 `probe` puts AI into the debugging loop on running Python code. You attach plain-English checks to functions (`@probe(...)`) or mid-function lines (`probe.here(...)`).
 
 - When `PROBES` is unset or `0` (the default), `@probe` returns the original function unwrapped and `probe.here` does nothing.
-- When `PROBES=1`, `probe` captures runtime inputs, outputs, and watched variables, evaluates the checks asynchronously (or inline when `sync` is set on a specific probe), writes results in call order, and halts the process if a check fails or a probe is firing inside a tight loop.
+- When `PROBES=1` (via shell env or `.env`), `probe` captures runtime inputs, outputs, and watched variables, evaluates checks inline before continuing, writes results in call-entry order, and halts execution on the active frame if a check fails, a `when` condition matches, or a probe fires in a tight loop.
 - Two model roles are configured in `~/.config/probe/config.toml`:
   - **`decision` (Jev-type model):** Takes a snapshot and discrete checks and returns calibrated probabilities `p ∈ [0.0, 1.0]` per check, mapping cleanly to `pass` or `fail`.
   - **`text` (chat/reasoning LLM):** Handles analysis on `probe.type.text` probes (before passing its findings to `[models.decision]` for the final `pass` / `fail` verdict), explains failures when configured, and runs `probe check` pre-run validation.
@@ -59,17 +59,14 @@ def probe(
     *,
     id: str | None = None,
     kind: ProbeType = probe.type.decision,
-    sync: bool | str = False,
+    when: str | None = None,
 ) -> Callable[[F], F]: ...
 ```
 
 - `checks`: One expectation string or a list of discrete expectations checked against arguments and return value (or exception).
 - `id`: Probe identifier (e.g., `"tutor.opening_turn"`). Defaults to `<module>.<qualname>`.
 - `kind`: `probe.type.decision` *(default)* or `probe.type.text`.
-- `sync`:
-  - `False` *(default)*: Snapshot on entry/exit and evaluate in the background worker.
-  - `True`: Evaluate inline on this probe before returning; halt on `fail`.
-  - `"when <condition>"`: Evaluate inline on this probe before returning; break/halt when `<condition>` holds or a check fails.
+- `when`: Optional extra condition string; halts on the caller frame when `<when>` holds (even if `checks` passed).
 
 ### 2.3 `probe.here` Watchpoint
 
@@ -83,7 +80,7 @@ probe.here(
     ],
     id="rag.draft_answer",
     kind=probe.type.text,
-    sync="when draft cites specific figures, dates, or policy rules absent from retrieved_chunks",
+    when="draft cites specific figures, dates, or policy rules absent from retrieved_chunks",
     user_question=question,
     retrieved_chunks=chunks,
     draft=draft_text,
@@ -98,7 +95,7 @@ def here(
     *,
     id: str | None = None,
     kind: ProbeType = probe.type.decision,
-    sync: bool | str = False,
+    when: str | None = None,
     **watched_vars: Any,
 ) -> None: ...
 ```
@@ -111,11 +108,11 @@ def here(
 
 ### 3.1 Call-Entry Ordering & Snapshot Capture
 
-Async model calls finish out of order, so `probe` sequences events at call time instead of completion time:
+When probes are nested (e.g., an outer `@probe` calls an inner `@probe` or `probe.here`), inner checks finish before the outer function returns. `probe` sequences events by call entry:
 
 1. At entry into `@probe` or `probe.here(...)`, the caller claims an atomic `call_seq` (`1, 2, 3, ...`), relative `elapsed_ms`, UTC `started_at`, and `file:line`.
-2. Arguments (or `watched_vars`) are bounded-serialized on the caller thread before later code mutates them (configurable caps, e.g., max depth `4`, max items `25`, max string `4 KB`).
-3. On `@probe` exit, the return value (or exception summary) is serialized and queued with the entry snapshot.
+2. Arguments (or `watched_vars`) are bounded-serialized on entry before function body execution can mutate them (caps: max depth `4`, max items `25`, max string `4 KB`).
+3. On `@probe` exit (and immediately on `probe.here`), the full snapshot is redaction-scrubbed and evaluated inline before execution continues.
 
 ### 3.2 Secret Redaction (Runtime Secret Collection + Key Masking)
 
@@ -130,9 +127,9 @@ Before a snapshot is written to `.probes/probes.db` or sent to any model:
 
 ### 3.3 Rate Guard (`PROBE_MISUSE`)
 
-To catch probes accidentally placed inside row/item loops without breaking long-lived local dev servers, `[rate_limit]` applies a sliding-window check per `probe_id`:
+To catch probes accidentally placed inside row/item loops without cutting off long-lived local dev servers, `[rate_limit]` applies a sliding-window check per `probe_id`:
 
-- Default: max `5` calls per `10.0` seconds sliding window, plus a `100` calls-per-run safety cap.
+- Default: max `5` calls per `10.0` seconds sliding window, with `max_calls_per_run = -1` (unlimited; set a non-negative integer in config to enforce a per-run ceiling).
 - If breached: trip that probe's circuit breaker before making another model call, record `verdict = "error"` (`error_code = "PROBE_MISUSE"`) with caller stack trace, and halt execution (§3.5).
 
 ### 3.4 Verdict Pipeline (`pass` / `fail`)
@@ -159,17 +156,15 @@ Every probe ends at `[models.decision]` and produces either `pass` or `fail` (pl
 | `fail` | Shown in `probe report` with per-check `p` and text analysis | **Halts execution (§3.5)** |
 | `error` | Shown in `probe report` | `PROBE_MISUSE` **halts execution**; backend HTTP errors log `error` unless `strict_api = true` |
 
-### 3.5 Execution Halt & Shutdown Drain
+### 3.5 Execution Halt
 
-When a probe produces `fail`, `PROBE_MISUSE`, or matches a `sync="when ..."` trigger:
+When a probe produces `fail`, `PROBE_MISUSE`, or matches a `when` condition:
 
-1. Flush the full event record (`call_seq`, `probe_id`, `probe_type`, `file_line`, redacted payload, per-check scores, `text_analysis`, `stack_excerpt`) to `.probes/probes.db` and print a `[PROBE HALT]` summary to `stderr`.
-2. Set a global `tripped` flag and cancel queued unstarted async evaluations.
-3. Stop behavior:
-   - **`sync=True` / `sync="when ..."`:** If running in an interactive TTY (`sys.stdin.isatty() and sys.stdout.isatty()`), call `pdb.Pdb().set_trace(caller_frame)` directly in the caller's frame; otherwise raise `ProbeHaltError`.
-   - **Async (`sync=False`):** Interrupt the main thread (`_thread.interrupt_main()` / `SIGINT`) and raise `ProbeHaltError` on any subsequent probe entry.
-
-For short CLI commands and `pytest` runs, an `atexit` hook waits up to `drain_timeout_s` (default `15.0s`) for in-flight async checks to finish writing before exit (stopping immediately if `tripped`).
+1. Flush the full event record (`call_seq`, `probe_id`, `probe_type`, `file_line`, redacted payload, per-check scores, `text_analysis`, `stack_excerpt`) to `.probes/probes.db`, mark the run `halted`, and print `[PROBE HALT]` to `stderr`.
+2. Set a global `tripped` flag so any further probe call raises `ProbeHaltError`.
+3. Stop directly on the active caller stack frame:
+   - In an interactive TTY (`sys.stdin.isatty()` and `sys.stdout.isatty()`, unless `PROBE_NO_PDB=1`), invoke `pdb.Pdb().set_trace(caller_frame)` so locals can be inspected right before the function returns.
+   - Otherwise raise `ProbeHaltError`.
 
 ---
 
@@ -191,7 +186,7 @@ SQLite is internal storage. All inspection goes through the `probe` CLI, with ev
 | Command | Purpose |
 |---|---|
 | `probe check [paths...]` | Run Gates 1–3 on new or changed probes and update `.probes/lock.json` (`--force`, `--json`). |
-| `probe list [paths...]` | List probes (`id`, `file:line`, `kind`, `sync`, lock status, `checks`). |
+| `probe list [paths...]` | List probes (`id`, `file:line`, `kind`, `when`, lock status, `checks`). |
 | `probe report` | Print call-ordered summary of the latest run (`--run <id>`, `--all`, `--format text\|md\|json`). |
 | `probe log <probe_id>...` | Interleave detailed chronological entries (`call_seq ASC`) for one or more probe IDs / glob patterns (e.g., `probe log tutor.opening_turn rag.*`). |
 | `probe runs` | List recent runs with timestamps, command, verdict counts, and status. |
@@ -277,7 +272,7 @@ system_prompt = ""               # Optional custom instructions for [models.text
 [rate_limit]
 max_calls = 5
 window_seconds = 10.0
-max_calls_per_run = 100
+max_calls_per_run = -1           # -1 = unlimited; set >= 0 for a per-run hard cap
 
 [check]
 max_checks = 5
@@ -291,35 +286,35 @@ extra_keys = []                  # Additional argument/dict key names to mask
 [runtime]
 db_path = ".probes/probes.db"
 lock_path = ".probes/lock.json"
-max_concurrency = 6
-drain_timeout_s = 15.0
 ```
 
-**Environment flags:**
-- `PROBES`: `0` *(default, disabled)* | `1` *(enabled)*
+**Environment flags (shell env or `.env`):**
+- `PROBES`: `0` *(default, disabled)* | `1` *(enabled; shell env overrides `.env`)*
 - `PROBE_CONFIG`: Optional path override for `config.toml`
 - `PROBE_SKIP_LOCK`: `1` to bypass `.probes/lock.json` during rapid local edits
+- `PROBE_NO_PDB`: `1` to always raise `ProbeHaltError` instead of opening `pdb` in interactive terminals
 
 ### 6.2 Internal SQLite Schema (`.probes/probes.db`, WAL mode)
 
 - **`runs`**: `id` (ULID), `started_at`, `finished_at`, `cmd`, `pid`, `status` (`running` | `completed` | `halted`), `halt_call_seq`, `decision_model`, `text_model`
-- **`events`**: `run_id`, `call_seq` (`PRIMARY KEY (run_id, call_seq)`), `elapsed_ms`, `started_at`, `probe_id`, `site` (`decorator` | `here`), `probe_type` (`decision` | `text`), `file_line`, `sync_mode`, `checks_json`, `payload_json` (redacted snapshot), `check_scores_json` (array of `{check, probability, passed}`), `verdict` (`pass` | `fail` | `error`), `error_code` (`PROBE_MISUSE` | ...), `text_analysis`, `stack_excerpt`, `judged_at`, `latency_ms`
+- **`events`**: `run_id`, `call_seq` (`PRIMARY KEY (run_id, call_seq)`), `elapsed_ms`, `started_at`, `probe_id`, `site` (`decorator` | `here`), `probe_type` (`decision` | `text`), `file_line`, `when_cond`, `checks_json`, `payload_json` (redacted snapshot), `check_scores_json` (array of `{check, probability, passed}`), `verdict` (`pass` | `fail` | `error`), `error_code` (`PROBE_MISUSE` | ...), `text_analysis`, `stack_excerpt`, `judged_at`, `latency_ms`
 
 Indexes on `(run_id, call_seq)` and `(run_id, probe_id, call_seq)` serve `probe report` and multi-ID `probe log`.
 
-### 6.3 Package Layout (`tools/probe/`)
+### 6.3 Package Layout (`probe/`)
 
 ```text
-tools/probe/
+probe/
+├── LICENSE
 ├── SPEC.md
 ├── pyproject.toml
 ├── src/
 │   └── probe/
 │       ├── __init__.py          # Public API: @probe, probe.here, probe.type.{decision,text}
-│       ├── config.py            # ~/.config/probe/config.toml + pyproject.toml + env resolution
+│       ├── config.py            # ~/.config/probe/config.toml + pyproject.toml + env/.env resolution
 │       ├── redact.py            # .env / os.environ secret collection + request-key masking
 │       ├── backends.py          # Decision providers + Text LLM client
-│       ├── runtime.py           # call_seq tracker, rate guard, async worker, halt switch, atexit drain
+│       ├── runtime.py           # call_seq tracker, rate guard, inline grading, halt switch
 │       ├── store.py             # SQLite WAL store
 │       ├── check.py             # AST discovery + Gates 1-3 + .probes/lock.json
 │       └── cli.py               # Typer CLI: check, list, report, log <ids...>, runs, clean

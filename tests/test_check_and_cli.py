@@ -262,7 +262,7 @@ def test_cli_list_report_log_runs_clean(tmp_path: Path, monkeypatch) -> None:
             decision_model="http_decision:local-decision",
             text_model="openai_compat:qwen3.5:9b",
         )
-        # Insert call #2 before call #1 and call #3 to simulate async finish ordering.
+        # Insert call #2 before call #1 and call #3 to verify call_seq ASC sorting.
         store.insert_event(
             run_id=run_id,
             call_seq=2,
@@ -272,7 +272,7 @@ def test_cli_list_report_log_runs_clean(tmp_path: Path, monkeypatch) -> None:
             site="decorator",
             probe_type="decision",
             file_line="src/tutor/turn.py:3",
-            sync_mode="async",
+            when_cond=None,
             checks=("Opens Spanish", "No spoiler"),
             payload_json='{"output": "Hola, dime algo en español."}',
             check_scores=(CheckScore("Opens Spanish", 0.94, True), CheckScore("No spoiler", 0.91, True)),
@@ -287,7 +287,7 @@ def test_cli_list_report_log_runs_clean(tmp_path: Path, monkeypatch) -> None:
             site="here",
             probe_type="text",
             file_line="src/rag/synth.py:94",
-            sync_mode="async",
+            when_cond="draft cites external facts",
             checks=("Grounded",),
             payload_json='{"watched": {"draft": "Chunk #1"}}',
             check_scores=(CheckScore("Grounded", 0.96, True),),
@@ -303,7 +303,7 @@ def test_cli_list_report_log_runs_clean(tmp_path: Path, monkeypatch) -> None:
             site="decorator",
             probe_type="decision",
             file_line="src/tutor/turn.py:3",
-            sync_mode="async",
+            when_cond=None,
             checks=("Opens Spanish", "No spoiler"),
             payload_json='{"output": "Try saying: Quiero un café"}',
             check_scores=(CheckScore("Opens Spanish", 0.97, True), CheckScore("No spoiler", 0.06, False)),

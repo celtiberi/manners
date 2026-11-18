@@ -1,11 +1,9 @@
-"""Probe runtime: call_seq tracking, rate guard, async worker, verdict pipeline, halt switch, and atexit drain."""
+"""Probe runtime: synchronous inline grading, call_seq tracking, rate guard, and halt switch."""
 
 from __future__ import annotations
 
-import _thread
 import atexit
 import collections
-import concurrent.futures
 import hashlib
 import inspect
 import json
@@ -47,7 +45,7 @@ class ProbeType(StrEnum):
 
 
 class ProbeHaltError(RuntimeError):
-    """Raised when a probe fails, triggers PROBE_MISUSE, matches sync='when ...', or lacks lock approval."""
+    """Raised when a probe fails, triggers PROBE_MISUSE, matches when=..., or lacks lock approval."""
 
 
 def normalize_checks(checks: str | Sequence[str]) -> tuple[str, ...]:
@@ -71,6 +69,18 @@ def normalize_probe_type(kind: ProbeType | str) -> ProbeType:
         raise ValueError(f"Unsupported probe kind: {kind!r} (expected probe.type.decision or probe.type.text)") from exc
 
 
+def validate_when_cond(when: str | None) -> str | None:
+    """Validate optional breakpoint condition string."""
+    if when is None:
+        return None
+    if not isinstance(when, str):
+        raise TypeError("when must be a condition string or None")
+    stripped = when.strip()
+    if not stripped:
+        raise ValueError("when condition string must not be empty")
+    return stripped
+
+
 def compute_checks_hash(kind: ProbeType | str, checks: Sequence[str]) -> str:
     """Compute canonical SHA-256 hex digest for (kind, checks) shared between check and runtime."""
     payload = json.dumps(
@@ -79,12 +89,6 @@ def compute_checks_hash(kind: ProbeType | str, checks: Sequence[str]) -> str:
         separators=(",", ":"),
     )
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
-
-
-def _format_sync_mode(sync: bool | str) -> str:
-    if isinstance(sync, bool):
-        return "sync" if sync else "async"
-    return f"when:{sync}"
 
 
 def _derive_decorator_id(fn: Callable[..., Any]) -> str:
@@ -130,14 +134,13 @@ def _short_stack_excerpt(limit: int = 8) -> str:
 
 
 class ProbeRuntime:
-    """Manages SQLite run lifecycle, redaction, rate limiting, worker execution, and halting."""
+    """Manages SQLite run lifecycle, redaction, rate limiting, inline grading, and halting."""
 
     def __init__(
         self,
         *,
         config: ProbeConfig | None = None,
         transport: httpx.BaseTransport | None = None,
-        interrupt_main_fn: Callable[[], None] | None = None,
     ) -> None:
         self.config = config or load_config()
         self.cwd = self.config.project_root
@@ -167,7 +170,6 @@ class ProbeRuntime:
             self.config.text,
             transport=transport,
         )
-        self._interrupt_main = interrupt_main_fn or _thread.interrupt_main
 
         self._lock_cache: dict[str, dict[str, Any]] | None = None
         self._seq_lock = threading.Lock()
@@ -181,20 +183,12 @@ class ProbeRuntime:
         self._state_lock = threading.Lock()
         self._tripped = False
         self._halt_reason = ""
-        self._draining = False
         self._closed = False
-        self._halt_event = threading.Event()
-
-        self._executor = concurrent.futures.ThreadPoolExecutor(
-            max_workers=max(1, self.config.runtime.max_concurrency),
-            thread_name_prefix="probe-worker",
-        )
-        self._futures: set[concurrent.futures.Future[None]] = set()
         self._atexit_registered = False
 
     def register_atexit(self) -> None:
         if not self._atexit_registered:
-            atexit.register(self.shutdown)
+            atexit.register(self.close)
             self._atexit_registered = True
 
     def next_call_meta(self) -> tuple[int, float, str]:
@@ -221,8 +215,9 @@ class ProbeRuntime:
         started_at: str,
         site: str,
         file_line: str,
-        sync_mode: str,
+        when_cond: str | None,
         payload_json: str,
+        caller_frame: FrameType | None = None,
     ) -> None:
         """Verify probe exists with matching checks_hash in .probes/lock.json unless skipped."""
         if not self.config.check.require_check or is_skip_lock():
@@ -249,7 +244,7 @@ class ProbeRuntime:
             f"Probe '{probe_id}' failed lock check (.probes/lock.json missing or out of date). "
             "Run `probe check` or set PROBE_SKIP_LOCK=1."
         )
-        self._record_and_halt_sync_error(
+        self._record_and_halt_error(
             probe_id=probe_id,
             probe_type=probe_type,
             checks=checks,
@@ -258,11 +253,12 @@ class ProbeRuntime:
             started_at=started_at,
             site=site,
             file_line=file_line,
-            sync_mode=sync_mode,
+            when_cond=when_cond,
             payload_json=payload_json,
             error_code="UNCHECKED_PROBE",
             analysis=msg,
             stack_excerpt=_short_stack_excerpt(),
+            caller_frame=caller_frame,
         )
 
     def check_rate_limit(
@@ -276,10 +272,11 @@ class ProbeRuntime:
         started_at: str,
         site: str,
         file_line: str,
-        sync_mode: str,
+        when_cond: str | None,
         payload_json: str,
+        caller_frame: FrameType | None = None,
     ) -> None:
-        """Enforce sliding-window and per-run caps; trip PROBE_MISUSE before calling models."""
+        """Enforce sliding-window and optional per-run caps; trip PROBE_MISUSE before calling models."""
         rl = self.config.rate_limit
         now = time.monotonic()
         breach_reason: str | None = None
@@ -297,7 +294,7 @@ class ProbeRuntime:
                 total = self._call_totals.get(probe_id, 0) + 1
                 self._call_totals[probe_id] = total
 
-                if total > rl.max_calls_per_run:
+                if rl.max_calls_per_run >= 0 and total > rl.max_calls_per_run:
                     self._tripped_probes.add(probe_id)
                     breach_reason = (
                         f"PROBE_MISUSE: '{probe_id}' exceeded max_calls_per_run "
@@ -311,7 +308,7 @@ class ProbeRuntime:
                     )
 
         if breach_reason is not None:
-            self._record_and_halt_sync_error(
+            self._record_and_halt_error(
                 probe_id=probe_id,
                 probe_type=probe_type,
                 checks=checks,
@@ -320,14 +317,15 @@ class ProbeRuntime:
                 started_at=started_at,
                 site=site,
                 file_line=file_line,
-                sync_mode=sync_mode,
+                when_cond=when_cond,
                 payload_json=payload_json,
                 error_code="PROBE_MISUSE",
                 analysis=breach_reason,
                 stack_excerpt=_short_stack_excerpt(),
+                caller_frame=caller_frame,
             )
 
-    def _record_and_halt_sync_error(
+    def _record_and_halt_error(
         self,
         *,
         probe_id: str,
@@ -338,11 +336,12 @@ class ProbeRuntime:
         started_at: str,
         site: str,
         file_line: str,
-        sync_mode: str,
+        when_cond: str | None,
         payload_json: str,
         error_code: str,
         analysis: str,
         stack_excerpt: str,
+        caller_frame: FrameType | None,
     ) -> None:
         self.store.insert_event(
             run_id=self.run_id,
@@ -353,7 +352,7 @@ class ProbeRuntime:
             site=site,
             probe_type=probe_type.value,
             file_line=file_line,
-            sync_mode=sync_mode,
+            when_cond=when_cond,
             checks=checks,
             payload_json=payload_json,
             check_scores=(),
@@ -368,8 +367,7 @@ class ProbeRuntime:
             probe_id=probe_id,
             file_line=file_line,
             summary=analysis,
-            is_sync=True,
-            caller_frame=None,
+            caller_frame=caller_frame,
         )
 
     def evaluate_event(
@@ -382,24 +380,21 @@ class ProbeRuntime:
         site: str,
         probe_type: ProbeType,
         file_line: str,
-        sync: bool | str,
+        when: str | None,
         checks: tuple[str, ...],
         payload_json: str,
-        is_sync_exec: bool,
         caller_frame: FrameType | None = None,
         stack_excerpt: str | None = None,
     ) -> None:
-        """Run decision/text grading for one event, persist to SQLite, and halt on failure/trigger."""
-        with self._state_lock:
-            if self._tripped:
-                return
+        """Run decision/text grading inline for one event, persist to SQLite, and halt on fail or when match."""
+        self.ensure_not_tripped()
 
         t0 = time.perf_counter()
         analysis_text: str | None = None
         scores: list[CheckScore] = []
         verdict = "pass"
         error_code: str | None = None
-        sync_triggered = False
+        when_triggered = False
 
         try:
             if probe_type == ProbeType.text:
@@ -434,10 +429,10 @@ class ProbeRuntime:
                 except BackendError:
                     analysis_text = None
 
-            if isinstance(sync, str) and verdict == "pass":
-                sync_triggered = self.decision_backend.evaluate_condition(
+            if when and verdict == "pass":
+                when_triggered = self.decision_backend.evaluate_condition(
                     probe_id=probe_id,
-                    condition=sync,
+                    condition=when,
                     snapshot_json=payload_json,
                     analysis=analysis_text or "",
                 )
@@ -457,20 +452,20 @@ class ProbeRuntime:
             site=site,
             probe_type=probe_type.value,
             file_line=file_line,
-            sync_mode=_format_sync_mode(sync),
+            when_cond=when,
             checks=checks,
             payload_json=payload_json,
             check_scores=scores,
             verdict=verdict,
             error_code=error_code,
             text_analysis=analysis_text,
-            stack_excerpt=stack_excerpt if (verdict in {"fail", "error"} or sync_triggered) else None,
+            stack_excerpt=stack_excerpt if (verdict in {"fail", "error"} or when_triggered) else None,
             latency_ms=latency_ms,
         )
 
         should_halt = (
             verdict == "fail"
-            or sync_triggered
+            or when_triggered
             or (verdict == "error" and self.config.runtime.strict_api)
         )
         if should_halt:
@@ -479,8 +474,8 @@ class ProbeRuntime:
                 reason = f"Check(s) failed: {'; '.join(failed)}"
                 if analysis_text:
                     reason = f"{reason}\n  analysis: {analysis_text}"
-            elif sync_triggered:
-                reason = f"Sync breakpoint triggered ({sync})"
+            elif when_triggered:
+                reason = f"Breakpoint condition matched (when={when!r})"
             else:
                 reason = analysis_text or "Backend error with strict_api=true"
 
@@ -489,19 +484,8 @@ class ProbeRuntime:
                 probe_id=probe_id,
                 file_line=file_line,
                 summary=reason,
-                is_sync=is_sync_exec,
                 caller_frame=caller_frame,
             )
-
-    def submit_async(self, **kwargs: Any) -> None:
-        fut = self._executor.submit(self.evaluate_event, **kwargs)
-        with self._state_lock:
-            self._futures.add(fut)
-        fut.add_done_callback(lambda done: self._discard_future(done))
-
-    def _discard_future(self, fut: concurrent.futures.Future[None]) -> None:
-        with self._state_lock:
-            self._futures.discard(fut)
 
     def _trigger_halt(
         self,
@@ -510,22 +494,12 @@ class ProbeRuntime:
         probe_id: str,
         file_line: str,
         summary: str,
-        is_sync: bool,
         caller_frame: FrameType | None,
     ) -> None:
         halt_msg = f"[PROBE HALT] call #{call_seq:03d} {probe_id} ({file_line}): {summary}"
         with self._state_lock:
-            if self._tripped:
-                if is_sync:
-                    raise ProbeHaltError(self._halt_reason or halt_msg)
-                return
             self._tripped = True
             self._halt_reason = halt_msg
-            pending = list(self._futures)
-            draining = self._draining
-
-        for fut in pending:
-            fut.cancel()
 
         self.store.finish_run(
             self.run_id,
@@ -534,52 +508,26 @@ class ProbeRuntime:
             halt_call_seq=call_seq,
         )
         print(halt_msg, file=sys.stderr, flush=True)
-        self._halt_event.set()
 
-        if is_sync:
-            use_pdb = (
-                caller_frame is not None
-                and os.environ.get("PROBE_NO_PDB", "0").strip() != "1"
-                and bool(getattr(sys.stdin, "isatty", lambda: False)())
-                and bool(getattr(sys.stdout, "isatty", lambda: False)())
-            )
-            if use_pdb:
-                pdb.Pdb().set_trace(caller_frame)
-                return
-            raise ProbeHaltError(halt_msg)
+        use_pdb = (
+            caller_frame is not None
+            and os.environ.get("PROBE_NO_PDB", "0").strip() != "1"
+            and bool(getattr(sys.stdin, "isatty", lambda: False)())
+            and bool(getattr(sys.stdout, "isatty", lambda: False)())
+        )
+        if use_pdb:
+            pdb.Pdb().set_trace(caller_frame)
+            return
+        raise ProbeHaltError(halt_msg)
 
-        if not draining:
-            try:
-                self._interrupt_main()
-            except Exception:
-                pass
-
-    def shutdown(self) -> None:
-        """Drain in-flight async evaluations up to drain_timeout_s on process exit."""
+    def close(self) -> None:
+        """Finalize run status and close model clients and SQLite store on exit."""
         with self._state_lock:
             if self._closed:
                 return
-            self._draining = True
-            pending = list(self._futures)
-
-        deadline = time.monotonic() + max(0.0, self.config.runtime.drain_timeout_s)
-        while pending and not self._halt_event.is_set():
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                break
-            done, not_done = concurrent.futures.wait(
-                pending,
-                timeout=min(0.05, remaining),
-                return_when=concurrent.futures.FIRST_COMPLETED,
-            )
-            _ = done
-            pending = list(not_done)
-
-        with self._state_lock:
-            tripped = self._tripped
             self._closed = True
+            tripped = self._tripped
 
-        self._executor.shutdown(wait=False, cancel_futures=tripped)
         if not tripped:
             self.store.finish_run(
                 self.run_id,

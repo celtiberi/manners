@@ -105,14 +105,40 @@ def utc_now_iso() -> str:
     return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
 
 
-def is_probes_enabled() -> bool:
-    """Return True when runtime probing is enabled via PROBES env var."""
-    return os.environ.get("PROBES", "0").strip().lower() in {"1", "true", "yes", "on"}
+_ENV_FLAG_CACHE: dict[tuple[Path, str], tuple[int, str]] = {}
+_ENV_FLAG_CACHE_LOCK = threading.Lock()
 
 
-def is_skip_lock() -> bool:
+def _read_env_flag(var_name: str, cwd: Path | None = None) -> str:
+    env_val = os.environ.get(var_name)
+    if env_val is not None and env_val.strip() != "":
+        return env_val.strip()
+
+    root = find_project_root(cwd)
+    env_path = (root / ".env").resolve()
+    try:
+        mtime_ns = env_path.stat().st_mtime_ns
+    except OSError:
+        return ""
+
+    cache_key = (env_path, var_name)
+    with _ENV_FLAG_CACHE_LOCK:
+        cached = _ENV_FLAG_CACHE.get(cache_key)
+        if cached is not None and cached[0] == mtime_ns:
+            return cached[1]
+        parsed = _parse_dotenv_key(env_path, var_name)
+        _ENV_FLAG_CACHE[cache_key] = (mtime_ns, parsed)
+        return parsed
+
+
+def is_probes_enabled(cwd: Path | None = None) -> bool:
+    """Return True when PROBES is enabled in os.environ or project .env."""
+    return _read_env_flag("PROBES", cwd).lower() in {"1", "true", "yes", "on"}
+
+
+def is_skip_lock(cwd: Path | None = None) -> bool:
     """Return True when PROBE_SKIP_LOCK=1 bypasses .probes/lock.json checks."""
-    return os.environ.get("PROBE_SKIP_LOCK", "0").strip().lower() in {"1", "true", "yes", "on"}
+    return _read_env_flag("PROBE_SKIP_LOCK", cwd).lower() in {"1", "true", "yes", "on"}
 
 
 @dataclass(slots=True)
@@ -179,11 +205,11 @@ class TextConfig:
 
 @dataclass(slots=True)
 class RateLimitConfig:
-    """Per-probe sliding-window and per-run call caps."""
+    """Per-probe sliding-window and optional per-run call caps (-1 = unlimited)."""
 
     max_calls: int = 5
     window_seconds: float = 10.0
-    max_calls_per_run: int = 100
+    max_calls_per_run: int = -1
 
 
 @dataclass(slots=True)
@@ -205,12 +231,10 @@ class RedactConfig:
 
 @dataclass(slots=True)
 class RuntimeConfig:
-    """Storage paths, snapshot caps, concurrency, and shutdown drain settings."""
+    """Storage paths, snapshot caps, and strict API handling."""
 
     db_path: str = ".probes/probes.db"
     lock_path: str = ".probes/lock.json"
-    max_concurrency: int = 6
-    drain_timeout_s: float = 15.0
     strict_api: bool = False
     max_depth: int = 4
     max_items: int = 25

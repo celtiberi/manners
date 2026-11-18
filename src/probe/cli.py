@@ -49,7 +49,7 @@ def _event_to_dict(ev: EventRecord, *, include_payload: bool = True) -> dict[str
         "site": ev.site,
         "probe_type": ev.probe_type,
         "file_line": ev.file_line,
-        "sync_mode": ev.sync_mode,
+        "when": ev.when_cond,
         "verdict": ev.verdict,
         "error_code": ev.error_code,
         "check_scores": [dataclasses.asdict(s) for s in ev.check_scores],
@@ -244,7 +244,7 @@ def list_cmd(
                 "file_line": item.file_line,
                 "site": item.site,
                 "kind": item.probe_type.value,
-                "sync": item.sync_repr,
+                "when": item.when,
                 "lock_status": lock_status,
                 "checks": list(item.checks),
             }
@@ -259,9 +259,10 @@ def list_cmd(
         return
 
     for row in rows:
+        when_part = f", when={row['when']!r}" if row["when"] else ""
         typer.echo(
             f"{row['probe_id']}  [{row['lock_status']}]  "
-            f"({row['file_line']}, site={row['site']}, kind={row['kind']}, sync={row['sync']})"
+            f"({row['file_line']}, site={row['site']}, kind={row['kind']}{when_part})"
         )
         for chk in row["checks"]:
             typer.echo(f"  - {chk}")
