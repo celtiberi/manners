@@ -91,6 +91,13 @@ if hasattr(os, "register_at_fork"):
     os.register_at_fork(after_in_child=_reset_child_runtime)
 
 
+def _callable_param_names(fn: Callable[..., Any]) -> tuple[str, ...] | None:
+    try:
+        return tuple(inspect.signature(inspect.unwrap(fn)).parameters.keys())
+    except (TypeError, ValueError):
+        return None
+
+
 def _prepare_decorator_call(
     fn: Callable[..., Any],
     args: tuple[Any, ...],
@@ -105,7 +112,7 @@ def _prepare_decorator_call(
     rt = _get_runtime()
     rt.ensure_not_tripped()
     resolved_id = probe_id or _derive_decorator_id(fn, project_root=rt.cwd)
-    file_line = _decorator_file_line(fn)
+    file_line = _decorator_file_line(fn, project_root=rt.cwd)
     call_seq, elapsed_ms, started_at = rt.next_call_meta()
     caps = rt.config.runtime
     inputs_data = serialize_call_inputs(
@@ -130,6 +137,7 @@ def _prepare_decorator_call(
         file_line=file_line,
         payload_json=entry_payload_json,
         caller_frame=caller_frame,
+        param_names=_callable_param_names(fn),
     )
     if entered_pdb_lock or rt.is_tripped:
         raise ProbeHaltError(rt._halt_reason or "Probe halted before target call")
@@ -402,7 +410,7 @@ class _ProbeAPI:
         del frame
 
         resolved_id = id or _derive_here_id(caller_frame, project_root=rt.cwd)
-        file_line = _here_file_line(caller_frame)
+        file_line = _here_file_line(caller_frame, project_root=rt.cwd)
 
         caps = rt.config.runtime
         payload_json = serialize_here_snapshot(

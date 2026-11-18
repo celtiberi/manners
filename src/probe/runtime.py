@@ -9,7 +9,6 @@ import inspect
 import json
 import os
 import pdb
-import re
 import shlex
 import sys
 import threading
@@ -82,18 +81,19 @@ def compute_checks_hash(kind: ProbeType | str, checks: Sequence[str]) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
-_COMP_SCOPE_RE = re.compile(r"\.<locals>\.<(?:list|dict|set)comp>")
-
-
 def resolve_module_name(file_path: Path, root: Path | None = None) -> str:
-    """Resolve dotted Python module name matching importable package layout."""
+    """Resolve dotted Python module name matching importable package & PEP 420 namespace layouts."""
     resolved_file = file_path.resolve()
     resolved_root = root.resolve() if root is not None else None
 
     pkg_parts: list[str] = []
     cur = resolved_file.parent
+    reached_root = False
     while True:
         if resolved_root is not None and cur == resolved_root:
+            if (cur / "__init__.py").is_file():
+                pkg_parts.append(cur.name)
+            reached_root = True
             break
         if not (cur / "__init__.py").is_file():
             break
@@ -102,6 +102,19 @@ def resolve_module_name(file_path: Path, root: Path | None = None) -> str:
             break
         cur = cur.parent
     pkg_parts.reverse()
+
+    if resolved_root is not None and not reached_root:
+        src_dir = (resolved_root / "src").resolve()
+        ns_base: Path | None = None
+        if (resolved_root / "src").is_dir() and resolved_file.is_relative_to(src_dir):
+            ns_base = src_dir
+        elif resolved_file.is_relative_to(resolved_root):
+            ns_base = resolved_root
+        if ns_base is not None:
+            rel = resolved_file.relative_to(ns_base)
+            dir_parts = rel.parent.parts
+            if dir_parts and all(part.isidentifier() for part in dir_parts):
+                pkg_parts = list(dir_parts)
 
     if resolved_file.stem == "__init__":
         return ".".join(pkg_parts) if pkg_parts else resolved_file.stem
@@ -127,14 +140,39 @@ def _resolve_runtime_module(
     return mod_name or "__main__"
 
 
+def _normalize_here_qualname(raw_qual: str) -> str:
+    parts = [p for p in str(raw_qual).split(".") if p and p not in {"<listcomp>", "<dictcomp>", "<setcomp>"}]
+    cleaned: list[str] = []
+    for part in parts:
+        if part == "<locals>" and cleaned and cleaned[-1] == "<locals>":
+            continue
+        cleaned.append(part)
+    while cleaned and cleaned[-1] == "<locals>":
+        cleaned.pop()
+    if not cleaned:
+        return "<module>"
+    return ".".join(cleaned)
+
+
+def _rel_file_line(src_file: str, lineno: int, project_root: Path | None = None) -> str:
+    if project_root is not None and src_file and src_file != "unknown":
+        try:
+            rel = Path(src_file).resolve().relative_to(project_root.resolve())
+            return f"{rel.as_posix()}:{lineno}"
+        except (OSError, ValueError):
+            pass
+    return f"{src_file}:{lineno}"
+
+
 def _derive_decorator_id(fn: Callable[..., Any], *, project_root: Path | None = None) -> str:
-    raw_mod = getattr(fn, "__module__", "") or getattr(type(fn), "__module__", "") or "__main__"
-    qual = getattr(fn, "__qualname__", getattr(fn, "__name__", "")) or type(fn).__qualname__
+    target = inspect.unwrap(fn)
+    raw_mod = getattr(target, "__module__", "") or getattr(type(target), "__module__", "") or "__main__"
+    qual = getattr(target, "__qualname__", getattr(target, "__name__", "")) or type(target).__qualname__
     src_file: str | None = None
     try:
-        src_file = inspect.getsourcefile(fn)
+        src_file = inspect.getsourcefile(target)
     except Exception:
-        code = getattr(fn, "__code__", None)
+        code = getattr(target, "__code__", None)
         src_file = code.co_filename if code is not None else None
     mod = _resolve_runtime_module(str(raw_mod), src_file, project_root)
     return f"{mod}.{qual}"
@@ -147,28 +185,35 @@ def _derive_here_id(frame: FrameType | None, *, project_root: Path | None = None
     code = frame.f_code
     mod = _resolve_runtime_module(raw_mod, code.co_filename, project_root)
     raw_qual = getattr(code, "co_qualname", None) or code.co_name
-    qual = _COMP_SCOPE_RE.sub("", str(raw_qual))
+    qual = _normalize_here_qualname(str(raw_qual))
     if qual == "<module>":
         return f"{mod}:L{frame.f_lineno}"
     return f"{mod}.{qual}:L{frame.f_lineno}"
 
 
-def _decorator_file_line(fn: Callable[..., Any]) -> str:
+def _decorator_file_line(fn: Callable[..., Any], *, project_root: Path | None = None) -> str:
+    target = inspect.unwrap(fn)
+    code = getattr(target, "__code__", None)
     try:
-        src_file = inspect.getsourcefile(fn) or fn.__code__.co_filename
-        _, lineno = inspect.getsourcelines(fn)
-        return f"{src_file}:{lineno}"
+        src_file = inspect.getsourcefile(target) or (code.co_filename if code is not None else None)
     except Exception:
-        code = getattr(fn, "__code__", None)
-        if code is not None:
-            return f"{code.co_filename}:{code.co_firstlineno}"
-        return "unknown:0"
+        src_file = code.co_filename if code is not None else None
+    if code is not None and src_file:
+        return _rel_file_line(src_file, code.co_firstlineno, project_root)
+    try:
+        resolved_file = inspect.getsourcefile(target)
+        _, lineno = inspect.getsourcelines(target)
+        if resolved_file:
+            return _rel_file_line(resolved_file, lineno, project_root)
+    except Exception:
+        pass
+    return "unknown:0"
 
 
-def _here_file_line(frame: FrameType | None) -> str:
+def _here_file_line(frame: FrameType | None, *, project_root: Path | None = None) -> str:
     if frame is None:
         return "unknown:0"
-    return f"{frame.f_code.co_filename}:{frame.f_lineno}"
+    return _rel_file_line(frame.f_code.co_filename, frame.f_lineno, project_root)
 
 
 @dataclass(slots=True, frozen=True)
@@ -299,8 +344,9 @@ class ProbeRuntime:
         payload_json: str,
         caller_frame: FrameType | None = None,
         watched_keys: tuple[str, ...] = (),
+        param_names: tuple[str, ...] | None = None,
     ) -> bool:
-        """Verify probe matches lockfile (checks_hash, site, watched_keys) unless skipped."""
+        """Verify probe matches lockfile (checks_hash, site, params/watched_keys, file) unless skipped."""
         if not self.config.check.require_check or is_skip_lock(self.cwd):
             return False
 
@@ -326,11 +372,28 @@ class ProbeRuntime:
             locked_keys = entry.get("watched_keys")
             watched_ok = isinstance(locked_keys, list) and {str(k) for k in locked_keys} == set(watched_keys)
 
+        params_ok = True
+        if site == "decorator" and param_names is not None and isinstance(entry, dict):
+            locked_params = entry.get("param_names")
+            if isinstance(locked_params, list):
+                params_ok = [str(k) for k in locked_params] == list(param_names)
+
+        file_ok = True
+        if isinstance(entry, dict) and isinstance(entry.get("file_line"), str):
+            entry_fl = entry["file_line"]
+            if ":" in entry_fl and ":" in file_line:
+                entry_file = entry_fl.rsplit(":", 1)[0]
+                runtime_file = file_line.rsplit(":", 1)[0]
+                if not Path(runtime_file).is_absolute() and not Path(entry_file).is_absolute():
+                    file_ok = entry_file == runtime_file
+
         if (
             isinstance(entry, dict)
             and entry.get("checks_hash") == expected_hash
             and site_ok
             and watched_ok
+            and params_ok
+            and file_ok
         ):
             return False
 

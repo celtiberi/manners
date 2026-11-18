@@ -4,13 +4,21 @@ from __future__ import annotations
 
 import dataclasses
 import json
+from collections import Counter
 from pathlib import Path
 from typing import Any
 
 import typer
 
 from probe.backends import BackendError
-from probe.check import _load_lockfile, discover_probes, run_probe_check
+from probe.check import (
+    _load_lockfile,
+    _matches_file_or_dir_prefixes,
+    _rel_display_path,
+    _scan_files,
+    compute_effective_combined_hash,
+    run_probe_check,
+)
 from probe.config import load_config
 from probe.store import EventRecord, ProbeStore, RunRecord
 
@@ -187,16 +195,34 @@ def _format_report_md(run: RunRecord, events: list[EventRecord], *, show_all: bo
     return "\n".join(out)
 
 
-def _resolve_cli_scan_paths(paths: list[Path] | None) -> list[Path]:
+def _resolve_cli_scan_paths(
+    paths: list[Path] | None,
+    *,
+    lock_path: Path | None = None,
+    project_root: Path | None = None,
+) -> list[Path]:
     if not paths:
         return []
     cwd = Path.cwd()
+    base_root = (project_root or cwd).resolve()
+    locked: dict[str, Any] | None = None
     resolved_paths: list[Path] = []
     for p in paths:
         resolved = p.resolve() if p.is_absolute() else (cwd / p).resolve()
         if not resolved.exists():
-            typer.echo(f"Path does not exist: {p}", err=True)
-            raise typer.Exit(code=1)
+            allow_deleted = False
+            if lock_path is not None and lock_path.exists():
+                if locked is None:
+                    locked = _load_lockfile(lock_path).get("probes", {})
+                rel = _rel_display_path(resolved, base_root)
+                allow_deleted = any(
+                    isinstance(meta, dict)
+                    and _matches_file_or_dir_prefixes(str(meta.get("file_line", "")), {rel})
+                    for meta in locked.values()
+                )
+            if not allow_deleted:
+                typer.echo(f"Path does not exist: {p}", err=True)
+                raise typer.Exit(code=1)
         resolved_paths.append(resolved)
     return resolved_paths
 
@@ -208,11 +234,15 @@ def check_cmd(
     json_out: bool = typer.Option(False, "--json", help="Emit machine-readable JSON output."),
 ) -> None:
     """Run Gates 1-3 on new or changed probes and update .probes/lock.json."""
-    resolved_paths = _resolve_cli_scan_paths(paths)
     try:
         cfg = load_config()
+        resolved_paths = _resolve_cli_scan_paths(
+            paths,
+            lock_path=cfg.resolve_lock_path(),
+            project_root=cfg.project_root,
+        )
         ok, results = run_probe_check(resolved_paths, force=force, config=cfg)
-    except (BackendError, ValueError) as exc:
+    except (BackendError, ValueError, OSError) as exc:
         typer.echo(f"Error: {exc}", err=True)
         raise typer.Exit(code=1) from exc
 
@@ -246,22 +276,51 @@ def list_cmd(
     json_out: bool = typer.Option(False, "--json", help="Emit JSON output."),
 ) -> None:
     """List statically discovered @probe and probe.here call sites and lock status."""
-    resolved_paths = _resolve_cli_scan_paths(paths)
     try:
         cfg = load_config()
-        discovered = discover_probes(resolved_paths, root=cfg.project_root)
-        lock_data = _load_lockfile(cfg.resolve_lock_path())
-    except (BackendError, ValueError) as exc:
+        resolved_paths = _resolve_cli_scan_paths(paths, project_root=cfg.project_root)
+        _, discovered, parse_errors = _scan_files(resolved_paths, root=cfg.project_root)
+        lock_path = cfg.resolve_lock_path()
+        lock_data = _load_lockfile(lock_path)
+    except (BackendError, ValueError, OSError) as exc:
         typer.echo(f"Error: {exc}", err=True)
         raise typer.Exit(code=1) from exc
+
+    if parse_errors:
+        base_root = cfg.project_root.resolve()
+        for pf, err in sorted(parse_errors.items()):
+            typer.echo(f"Error parsing {_rel_display_path(pf, base_root)}: {err}", err=True)
+        raise typer.Exit(code=1)
+
     locked = lock_data.get("probes", {})
+    fixtures_dir = lock_path.parent / "fixtures"
+    id_counts = Counter(item.probe_id for item in discovered)
 
     rows: list[dict[str, Any]] = []
     for item in discovered:
+        effective_hash, _, fixture_error = compute_effective_combined_hash(
+            item,
+            fixtures_dir=fixtures_dir,
+            pass_threshold=cfg.decision.pass_threshold,
+        )
         entry = locked.get(item.probe_id)
-        if not isinstance(entry, dict):
+        watched_ok = item.site != "here" or (
+            isinstance(entry, dict) and entry.get("watched_keys") == list(item.watched_keys)
+        )
+        params_ok = item.site != "decorator" or (
+            isinstance(entry, dict) and entry.get("param_names") == list(item.param_names)
+        )
+        if item.literal_error or id_counts[item.probe_id] > 1 or fixture_error is not None:
+            lock_status = "invalid"
+        elif not isinstance(entry, dict):
             lock_status = "unlocked"
-        elif entry.get("combined_hash") == item.combined_hash:
+        elif (
+            entry.get("combined_hash") == effective_hash
+            and entry.get("site") == item.site
+            and entry.get("kind") == item.probe_type.value
+            and watched_ok
+            and params_ok
+        ):
             lock_status = "locked"
         elif entry.get("checks_hash") == item.checks_hash:
             lock_status = "source_changed"
