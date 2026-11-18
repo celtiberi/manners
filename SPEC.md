@@ -10,7 +10,7 @@
 `probe` puts AI into the debugging loop on running Python code. You attach plain-English checks to functions (`@probe(...)`) or mid-function lines (`probe.here(...)`).
 
 - When `PROBES` is unset or `0` (the default), `@probe` returns the original function unwrapped and `probe.here` does nothing.
-- When `PROBES=1` (via shell env or `.env`), `probe` captures runtime inputs, outputs, and watched variables, evaluates checks inline before continuing, writes results in call-entry order, and halts execution on the active frame if a check fails, a `when` condition matches, or a probe fires in a tight loop.
+- When `PROBES=1` (via shell env or `.env`), `probe` captures runtime inputs, outputs, and watched variables, evaluates checks inline before continuing, writes results in call-entry order, and halts execution on the active frame if a check fails or a probe fires in a tight loop.
 - Two model roles are configured in `~/.config/probe/config.toml`:
   - **`decision` (Jev-type model):** Takes a snapshot and discrete checks and returns calibrated probabilities `p ∈ [0.0, 1.0]` per check, mapping cleanly to `pass` or `fail`.
   - **`text` (chat/reasoning LLM):** Handles analysis on `probe.type.text` probes (before passing its findings to `[models.decision]` for the final `pass` / `fail` verdict), explains failures when configured, and runs `probe check` pre-run validation.
@@ -59,14 +59,12 @@ def probe(
     *,
     id: str | None = None,
     kind: ProbeType = probe.type.decision,
-    when: str | None = None,
 ) -> Callable[[F], F]: ...
 ```
 
 - `checks`: One expectation string or a list of discrete expectations checked against arguments and return value (or exception).
 - `id`: Probe identifier (e.g., `"tutor.opening_turn"`). Defaults to `<module>.<qualname>`.
 - `kind`: `probe.type.decision` *(default)* or `probe.type.text`.
-- `when`: Optional extra condition string; halts on the caller frame when `<when>` holds (even if `checks` passed).
 
 ### 2.3 `probe.here` Watchpoint
 
@@ -77,10 +75,10 @@ probe.here(
     [
         "Draft answer stays faithful to the meaning and conditions of retrieved_chunks",
         "Draft answer directly addresses the user's question",
+        "Draft does NOT answer confidently when retrieved_chunks do not cover user_question",
     ],
     id="rag.draft_answer",
     kind=probe.type.text,
-    when="draft answers confidently even though retrieved_chunks do not cover user_question",
     user_question=question,
     retrieved_chunks=chunks,
     draft=draft_text,
@@ -95,7 +93,6 @@ def here(
     *,
     id: str | None = None,
     kind: ProbeType = probe.type.decision,
-    when: str | None = None,
     **watched_vars: Any,
 ) -> None: ...
 ```
@@ -158,7 +155,7 @@ Every probe ends at `[models.decision]` and produces either `pass` or `fail` (pl
 
 ### 3.5 Execution Halt
 
-When a probe produces `fail`, `PROBE_MISUSE`, or matches a `when` condition:
+When a probe produces `fail` or `PROBE_MISUSE`:
 
 1. Flush the full event record (`call_seq`, `probe_id`, `probe_type`, `file_line`, redacted payload, per-check scores, `text_analysis`, `stack_excerpt`) to `.probes/probes.db`, mark the run `halted`, and print `[PROBE HALT]` to `stderr`.
 2. Set a global `tripped` flag so any further probe call raises `ProbeHaltError`.
@@ -186,7 +183,7 @@ SQLite is internal storage. All inspection goes through the `probe` CLI, with ev
 | Command | Purpose |
 |---|---|
 | `probe check [paths...]` | Run Gates 1–3 on new or changed probes and update `.probes/lock.json` (`--force`, `--json`). |
-| `probe list [paths...]` | List probes (`id`, `file:line`, `kind`, `when`, lock status, `checks`). |
+| `probe list [paths...]` | List probes (`id`, `file:line`, `kind`, lock status, `checks`). |
 | `probe report` | Print call-ordered summary of the latest run (`--run <id>`, `--all`, `--format text\|md\|json`). |
 | `probe log <probe_id>...` | Interleave detailed chronological entries (`call_seq ASC`) for one or more probe IDs / glob patterns (e.g., `probe log tutor.opening_turn rag.*`). |
 | `probe runs` | List recent runs with timestamps, command, verdict counts, and status. |
@@ -297,7 +294,7 @@ lock_path = ".probes/lock.json"
 ### 6.2 Internal SQLite Schema (`.probes/probes.db`, WAL mode)
 
 - **`runs`**: `id` (ULID), `started_at`, `finished_at`, `cmd`, `pid`, `status` (`running` | `completed` | `halted`), `halt_call_seq`, `decision_model`, `text_model`
-- **`events`**: `run_id`, `call_seq` (`PRIMARY KEY (run_id, call_seq)`), `elapsed_ms`, `started_at`, `probe_id`, `site` (`decorator` | `here`), `probe_type` (`decision` | `text`), `file_line`, `when_cond`, `checks_json`, `payload_json` (redacted snapshot), `check_scores_json` (array of `{check, probability, passed}`), `verdict` (`pass` | `fail` | `error`), `error_code` (`PROBE_MISUSE` | ...), `text_analysis`, `stack_excerpt`, `judged_at`, `latency_ms`
+- **`events`**: `run_id`, `call_seq` (`PRIMARY KEY (run_id, call_seq)`), `elapsed_ms`, `started_at`, `probe_id`, `site` (`decorator` | `here`), `probe_type` (`decision` | `text`), `file_line`, `checks_json`, `payload_json` (redacted snapshot), `check_scores_json` (array of `{check, probability, passed}`), `verdict` (`pass` | `fail` | `error`), `error_code` (`PROBE_MISUSE` | ...), `text_analysis`, `stack_excerpt`, `judged_at`, `latency_ms`
 
 Indexes on `(run_id, call_seq)` and `(run_id, probe_id, call_seq)` serve `probe report` and multi-ID `probe log`.
 

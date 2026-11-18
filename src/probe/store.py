@@ -35,7 +35,6 @@ CREATE TABLE IF NOT EXISTS events (
     site TEXT NOT NULL,
     probe_type TEXT NOT NULL,
     file_line TEXT NOT NULL,
-    when_cond TEXT,
     checks_json TEXT NOT NULL,
     payload_json TEXT NOT NULL,
     check_scores_json TEXT NOT NULL,
@@ -85,7 +84,6 @@ class EventRecord:
     site: str
     probe_type: str
     file_line: str
-    when_cond: str | None
     checks: tuple[str, ...]
     payload_json: str
     check_scores: tuple[CheckScore, ...]
@@ -129,7 +127,7 @@ class ProbeStore:
                 str(r["name"])
                 for r in self._conn.execute("PRAGMA table_info(events)").fetchall()
             }
-            if cols and "when_cond" not in cols:
+            if cols and "when_cond" in cols:
                 self._conn.execute("DROP TABLE events")
             self._conn.executescript(_SCHEMA_SQL)
             self._conn.commit()
@@ -192,7 +190,6 @@ class ProbeStore:
         site: str,
         probe_type: str,
         file_line: str,
-        when_cond: str | None = None,
         checks: Sequence[str],
         payload_json: str,
         check_scores: Sequence[CheckScore],
@@ -220,10 +217,10 @@ class ProbeStore:
                 """
                 INSERT INTO events (
                     run_id, call_seq, elapsed_ms, started_at, probe_id,
-                    site, probe_type, file_line, when_cond, checks_json,
+                    site, probe_type, file_line, checks_json,
                     payload_json, check_scores_json, verdict, error_code,
                     text_analysis, stack_excerpt, judged_at, latency_ms
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     run_id,
@@ -234,7 +231,6 @@ class ProbeStore:
                     site,
                     probe_type,
                     file_line,
-                    when_cond,
                     checks_json,
                     payload_json,
                     scores_json,
@@ -347,7 +343,6 @@ class ProbeStore:
                     site=str(row["site"]),
                     probe_type=str(row["probe_type"]),
                     file_line=str(row["file_line"]),
-                    when_cond=row["when_cond"],
                     checks=checks,
                     payload_json=str(row["payload_json"]),
                     check_scores=scores,

@@ -1,4 +1,4 @@
-"""Tests for synchronous @probe, probe.here, .env flags, nested ordering, pdb halts, when=, and rate limits."""
+"""Tests for synchronous @probe, probe.here, .env flags, nested ordering, pdb halts, and rate limits."""
 
 from __future__ import annotations
 
@@ -226,43 +226,6 @@ def test_inline_halt_non_tty_and_mock_tty_pdb(tmp_path: Path, monkeypatch) -> No
     reset_for_testing()
     assert len(pdb_frames) == 1
     assert pdb_frames[0].f_code.co_name == "outer_caller"  # type: ignore[attr-defined]
-
-
-def test_when_condition_triggers_only_when_condition_holds(tmp_path: Path, monkeypatch) -> None:
-    monkeypatch.setenv("PROBES", "1")
-    monkeypatch.setenv("PROBE_NO_PDB", "1")
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        body = json.loads(request.content.decode("utf-8"))
-        snap = json.loads(body["snapshot"])["watched"]
-        if body["probe_id"].endswith("#when"):
-            triggered = snap["draft"].startswith("BAD")
-            return httpx.Response(200, json={"probabilities": [0.95 if triggered else 0.05]})
-        return httpx.Response(200, json={"probabilities": [0.92]})
-
-    cfg = _make_config(tmp_path)
-    reset_for_testing(config=cfg, transport=httpx.MockTransport(handler))
-
-    try:
-        # Condition does not hold -> continues cleanly.
-        probe.here(
-            "Grounded draft",
-            id="rag.draft_answer",
-            when="draft cites figures absent from source",
-            draft="GOOD answer",
-        )
-        # Condition holds -> halts cleanly inline.
-        with pytest.raises(ProbeHaltError) as exc_info:
-            probe.here(
-                "Grounded draft",
-                id="rag.draft_answer",
-                when="draft cites figures absent from source",
-                draft="BAD answer",
-            )
-        assert "Breakpoint condition matched" in str(exc_info.value)
-    finally:
-        probe.flush_for_testing()
-        reset_for_testing()
 
 
 def test_rate_limit_unlimited_per_run_default_sliding_window_and_lock(

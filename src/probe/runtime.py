@@ -45,7 +45,7 @@ class ProbeType(StrEnum):
 
 
 class ProbeHaltError(RuntimeError):
-    """Raised when a probe fails, triggers PROBE_MISUSE, matches when=..., or lacks lock approval."""
+    """Raised when a probe fails, triggers PROBE_MISUSE, or lacks lock approval."""
 
 
 def normalize_checks(checks: str | Sequence[str]) -> tuple[str, ...]:
@@ -67,18 +67,6 @@ def normalize_probe_type(kind: ProbeType | str) -> ProbeType:
         return ProbeType(str(kind).strip().lower())
     except ValueError as exc:
         raise ValueError(f"Unsupported probe kind: {kind!r} (expected probe.type.decision or probe.type.text)") from exc
-
-
-def validate_when_cond(when: str | None) -> str | None:
-    """Validate optional breakpoint condition string."""
-    if when is None:
-        return None
-    if not isinstance(when, str):
-        raise TypeError("when must be a condition string or None")
-    stripped = when.strip()
-    if not stripped:
-        raise ValueError("when condition string must not be empty")
-    return stripped
 
 
 def compute_checks_hash(kind: ProbeType | str, checks: Sequence[str]) -> str:
@@ -215,7 +203,6 @@ class ProbeRuntime:
         started_at: str,
         site: str,
         file_line: str,
-        when_cond: str | None,
         payload_json: str,
         caller_frame: FrameType | None = None,
     ) -> None:
@@ -253,7 +240,6 @@ class ProbeRuntime:
             started_at=started_at,
             site=site,
             file_line=file_line,
-            when_cond=when_cond,
             payload_json=payload_json,
             error_code="UNCHECKED_PROBE",
             analysis=msg,
@@ -272,7 +258,6 @@ class ProbeRuntime:
         started_at: str,
         site: str,
         file_line: str,
-        when_cond: str | None,
         payload_json: str,
         caller_frame: FrameType | None = None,
     ) -> None:
@@ -317,7 +302,6 @@ class ProbeRuntime:
                 started_at=started_at,
                 site=site,
                 file_line=file_line,
-                when_cond=when_cond,
                 payload_json=payload_json,
                 error_code="PROBE_MISUSE",
                 analysis=breach_reason,
@@ -336,7 +320,6 @@ class ProbeRuntime:
         started_at: str,
         site: str,
         file_line: str,
-        when_cond: str | None,
         payload_json: str,
         error_code: str,
         analysis: str,
@@ -352,7 +335,6 @@ class ProbeRuntime:
             site=site,
             probe_type=probe_type.value,
             file_line=file_line,
-            when_cond=when_cond,
             checks=checks,
             payload_json=payload_json,
             check_scores=(),
@@ -380,13 +362,12 @@ class ProbeRuntime:
         site: str,
         probe_type: ProbeType,
         file_line: str,
-        when: str | None,
         checks: tuple[str, ...],
         payload_json: str,
         caller_frame: FrameType | None = None,
         stack_excerpt: str | None = None,
     ) -> None:
-        """Run decision/text grading inline for one event, persist to SQLite, and halt on fail or when match."""
+        """Run decision/text grading inline for one event, persist to SQLite, and halt on fail."""
         self.ensure_not_tripped()
 
         t0 = time.perf_counter()
@@ -394,7 +375,6 @@ class ProbeRuntime:
         scores: list[CheckScore] = []
         verdict = "pass"
         error_code: str | None = None
-        when_triggered = False
 
         try:
             if probe_type == ProbeType.text:
@@ -428,14 +408,6 @@ class ProbeRuntime:
                     )
                 except BackendError:
                     analysis_text = None
-
-            if when and verdict == "pass":
-                when_triggered = self.decision_backend.evaluate_condition(
-                    probe_id=probe_id,
-                    condition=when,
-                    snapshot_json=payload_json,
-                    analysis=analysis_text or "",
-                )
         except BackendError as exc:
             verdict = "error"
             error_code = "BACKEND_ERROR"
@@ -452,20 +424,18 @@ class ProbeRuntime:
             site=site,
             probe_type=probe_type.value,
             file_line=file_line,
-            when_cond=when,
             checks=checks,
             payload_json=payload_json,
             check_scores=scores,
             verdict=verdict,
             error_code=error_code,
             text_analysis=analysis_text,
-            stack_excerpt=stack_excerpt if (verdict in {"fail", "error"} or when_triggered) else None,
+            stack_excerpt=stack_excerpt if verdict in {"fail", "error"} else None,
             latency_ms=latency_ms,
         )
 
         should_halt = (
             verdict == "fail"
-            or when_triggered
             or (verdict == "error" and self.config.runtime.strict_api)
         )
         if should_halt:
@@ -474,8 +444,6 @@ class ProbeRuntime:
                 reason = f"Check(s) failed: {'; '.join(failed)}"
                 if analysis_text:
                     reason = f"{reason}\n  analysis: {analysis_text}"
-            elif when_triggered:
-                reason = f"Breakpoint condition matched (when={when!r})"
             else:
                 reason = analysis_text or "Backend error with strict_api=true"
 

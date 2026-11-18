@@ -15,7 +15,6 @@ from probe.prompts import (
     get_nouls,
     get_prompt,
     load_prompt_catalog,
-    normalize_when_noul,
 )
 
 
@@ -139,7 +138,7 @@ def test_http_decision_provider_and_api_key_header(monkeypatch) -> None:
     ]
 
 
-def test_decision_backend_rejects_text_llm_providers_and_evaluates_when_noul_directly() -> None:
+def test_decision_backend_rejects_text_llm_providers() -> None:
     for bad_provider in ("openai_compat", "logprob_bool"):
         bad_backend = DecisionBackend(
             ModelEndpointConfig(provider=bad_provider, url="http://127.0.0.1:11434/v1", model="qwen3.5:9b"),
@@ -154,36 +153,6 @@ def test_decision_backend_rejects_text_llm_providers_and_evaluates_when_noul_dir
                 )
         finally:
             bad_backend.close()
-
-    captured: list[dict] = []
-
-    def handler_when(request: httpx.Request) -> httpx.Response:
-        captured.append(json.loads(request.content.decode("utf-8")))
-        return httpx.Response(200, json={"probabilities": [0.88]})
-
-    backend = DecisionBackend(
-        ModelEndpointConfig(provider="http_decision", url="http://decision.local/v1/eval", model="local"),
-        DecisionConfig(pass_threshold=0.50),
-        transport=httpx.MockTransport(handler_when),
-    )
-    try:
-        triggered = backend.evaluate_condition(
-            probe_id="rag.draft",
-            condition="when draft cites external facts",
-            snapshot_json='{"watched": {"draft": "Chunk 1"}}',
-        )
-    finally:
-        backend.close()
-
-    assert triggered is True
-    assert captured == [
-        {
-            "model": "local",
-            "probe_id": "rag.draft#when",
-            "checks": ["draft cites external facts"],
-            "snapshot": '{"watched": {"draft": "Chunk 1"}}',
-        }
-    ]
 
 
 def test_text_backend_analysis_and_failure_explanation() -> None:
@@ -238,5 +207,4 @@ def test_prompts_json_catalog_and_formatting() -> None:
 
     gate2_nouls = get_nouls("check_gate2_nouls")
     assert len(gate2_nouls) == 3
-    assert normalize_when_noul("when draft cites external facts") == "draft cites external facts"
     assert compose_system_prompt("Base.", "Custom.") == "Custom.\n\nBase."

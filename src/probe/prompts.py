@@ -109,14 +109,6 @@ def compose_system_prompt(base_system: str, user_system_prompt: str = "") -> str
     return f"{extra}\n\n{base_system}".strip()
 
 
-def normalize_when_noul(condition: str) -> str:
-    """Normalize a `when="..."` expression directly into a clean decision noul."""
-    cond = condition.strip()
-    if cond.lower().startswith("when "):
-        cond = cond[5:].strip()
-    return cond
-
-
 def format_typesafe_state(probe_id: str, snapshot_json: str, analysis: str = "") -> str:
     """Format the serialized state string sent to TypeSafe Jev /v1/systemone."""
     parts = [f"Probe: {probe_id}"]
@@ -234,5 +226,4 @@ __all__ = [
     "get_nouls",
     "get_prompt",
     "load_prompt_catalog",
-    "normalize_when_noul",
 ]

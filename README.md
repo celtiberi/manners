@@ -63,10 +63,10 @@ probe.here(
     [
         "Draft answer stays strictly grounded in retrieved chunks",
         "Draft answer directly addresses the user question",
+        "Draft does NOT answer confidently when retrieved_chunks do not cover user_question",
     ],
     id="rag.draft_answer",
     kind=probe.type.text,
-    when="draft answers confidently even though retrieved_chunks do not cover user_question",
     user_question=question,
     retrieved_chunks=chunks,
     draft=draft_text,

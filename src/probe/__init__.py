@@ -24,7 +24,6 @@ from probe.runtime import (
     _short_stack_excerpt,
     normalize_checks,
     normalize_probe_type,
-    validate_when_cond,
 )
 
 P = ParamSpec("P")
@@ -77,7 +76,6 @@ def _dispatch_probe_event(
     site: str,
     probe_type: ProbeType,
     file_line: str,
-    when: str | None,
     checks: tuple[str, ...],
     payload_json: str,
     caller_frame: FrameType | None,
@@ -92,7 +90,6 @@ def _dispatch_probe_event(
         started_at=started_at,
         site=site,
         file_line=file_line,
-        when_cond=when,
         payload_json=payload_json,
         caller_frame=caller_frame,
     )
@@ -105,7 +102,6 @@ def _dispatch_probe_event(
         started_at=started_at,
         site=site,
         file_line=file_line,
-        when_cond=when,
         payload_json=payload_json,
         caller_frame=caller_frame,
     )
@@ -117,7 +113,6 @@ def _dispatch_probe_event(
         site=site,
         probe_type=probe_type,
         file_line=file_line,
-        when=when,
         checks=checks,
         payload_json=payload_json,
         caller_frame=caller_frame,
@@ -131,7 +126,6 @@ def _wrap_sync_fn(
     checks: tuple[str, ...],
     probe_id: str | None,
     probe_type: ProbeType,
-    when: str | None,
 ) -> Callable[P, R]:
     resolved_id = probe_id or _derive_decorator_id(fn)
     file_line = _decorator_file_line(fn)
@@ -191,7 +185,6 @@ def _wrap_sync_fn(
                 site="decorator",
                 probe_type=probe_type,
                 file_line=file_line,
-                when=when,
                 checks=checks,
                 payload_json=payload_json,
                 caller_frame=caller_frame,
@@ -213,7 +206,6 @@ def _wrap_async_fn(
     checks: tuple[str, ...],
     probe_id: str | None,
     probe_type: ProbeType,
-    when: str | None,
 ) -> Callable[P, Any]:
     resolved_id = probe_id or _derive_decorator_id(fn)
     file_line = _decorator_file_line(fn)
@@ -273,7 +265,6 @@ def _wrap_async_fn(
                 site="decorator",
                 probe_type=probe_type,
                 file_line=file_line,
-                when=when,
                 checks=checks,
                 payload_json=payload_json,
                 caller_frame=caller_frame,
@@ -301,11 +292,9 @@ class _ProbeAPI:
         *,
         id: str | None = None,
         kind: ProbeType | str = ProbeType.decision,
-        when: str | None = None,
     ) -> Callable[[Callable[P, R]], Callable[P, R]]:
         norm_checks = normalize_checks(checks)
         norm_kind = normalize_probe_type(kind)
-        norm_when = validate_when_cond(when)
 
         def decorator(fn: Callable[P, R]) -> Callable[P, R]:
             if not is_probes_enabled():
@@ -316,14 +305,12 @@ class _ProbeAPI:
                     checks=norm_checks,
                     probe_id=id,
                     probe_type=norm_kind,
-                    when=norm_when,
                 )
             return _wrap_sync_fn(
                 fn,
                 checks=norm_checks,
                 probe_id=id,
                 probe_type=norm_kind,
-                when=norm_when,
             )
 
         return decorator
@@ -334,7 +321,6 @@ class _ProbeAPI:
         *,
         id: str | None = None,
         kind: ProbeType | str = ProbeType.decision,
-        when: str | None = None,
         **watched_vars: Any,
     ) -> None:
         """Mid-function watchpoint capturing watched_vars and evaluating checks inline."""
@@ -343,7 +329,6 @@ class _ProbeAPI:
 
         norm_checks = normalize_checks(checks)
         norm_kind = normalize_probe_type(kind)
-        norm_when = validate_when_cond(when)
 
         rt = _get_runtime()
         rt.ensure_not_tripped()
@@ -375,7 +360,6 @@ class _ProbeAPI:
                 site="here",
                 probe_type=norm_kind,
                 file_line=file_line,
-                when=norm_when,
                 checks=norm_checks,
                 payload_json=payload_json,
                 caller_frame=caller_frame,

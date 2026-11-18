@@ -20,7 +20,6 @@ from probe.prompts import (
     format_gate2_analysis_prompts,
     format_gate3_fixtures_prompts,
     format_typesafe_state,
-    normalize_when_noul,
 )
 
 _THINK_BLOCK_RE = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
@@ -247,24 +246,6 @@ class DecisionBackend:
             )
             for check, p in zip(check_list, probs, strict=True)
         ]
-
-    def evaluate_condition(
-        self,
-        *,
-        probe_id: str,
-        condition: str,
-        snapshot_json: str,
-        analysis: str = "",
-    ) -> bool:
-        """Evaluate a when="<condition>" expression against the current snapshot."""
-        noul = normalize_when_noul(condition)
-        scores = self.evaluate_checks(
-            probe_id=f"{probe_id}#when",
-            checks=[noul],
-            snapshot_json=snapshot_json,
-            analysis=analysis,
-        )
-        return scores[0].passed if scores else False
 
     def _post_json(self, url: str, payload: dict[str, Any]) -> dict[str, Any]:
         return _post_json_with_retry(
