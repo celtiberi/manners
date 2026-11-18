@@ -5,6 +5,17 @@ All notable changes to `probe` will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] - 2026-11-18
+
+### Added
+- Support for multi-case regression fixture lists in `.probes/fixtures/<probe_id>.json` (`"pass": [...]` and `"fail": [...]` alongside single snapshot objects): `probe check` validates and scores every passing and failing snapshot during Gate 3, folds all cases into the lock hash, and reports specific failing case indices.
+- Declarative `"expected"` boolean polarity on `models.decision` entries in `prompts.json` (`get_noul_expected`), enabling positive defect questions where passing requires `probability < 0.50`.
+
+### Changed
+- Raised default `[check].max_checks` from `5` to `12` so `probe.type.decision` suites can decompose compound requirements into short, atomic single-fact checks.
+- Rewrote `check_gate2_nouls` in `prompts.json` as short, positive, single-fact defect questions (`"expected": false`) and aligned `check_gate2_analysis` to describe observed defects factually without echoing unrelated buzzwords.
+- Updated `format_typesafe_state` (`src/probe/prompts.py`) and `_format_onnx_premise` (`src/probe/backends.py`) to foreground and label `Observed Output (under test)` / `Watched Variables (under test)` ahead of `Call Inputs (context only)`.
+
 ## [0.3.0] - 2026-11-18
 
 ### Added

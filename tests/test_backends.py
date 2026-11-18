@@ -18,11 +18,13 @@ from probe.backends import (
     _apply_output_schema,
     _apply_reasoning_effort,
     _clamp_prob,
+    _format_onnx_premise,
     _parse_probabilities_payload,
     extract_json_object,
     strip_thinking,
 )
 from probe.config import (
+    CheckConfig,
     DecisionConfig,
     ModelEndpointConfig,
     TextConfig,
@@ -37,6 +39,7 @@ from probe.prompts import (
     format_gate2_analysis_prompts,
     format_gate3_fixtures_prompts,
     format_typesafe_state,
+    get_noul_expected,
     get_nouls,
     get_output_schema,
     get_prompt,
@@ -890,3 +893,29 @@ def test_stage4_prompts_schemas_extraction_and_provider_fallbacks() -> None:
 
     with pytest.raises(BackendError, match="client is closed"):
         db_http.evaluate_checks(probe_id="p", checks=["C"], snapshot_json='{"output": "ok"}')
+
+
+def test_v04_system1_alignment_prompts_and_config() -> None:
+    assert CheckConfig().max_checks == 12
+    assert get_noul_expected("check_gate2_nouls") is False
+    gate2_nouls = get_nouls("check_gate2_nouls")
+    assert len(gate2_nouls) == 3
+    for q in gate2_nouls:
+        assert q.endswith("?")
+        assert not q.startswith("No check")
+
+    dec_snap = json.dumps(
+        {"inputs": {"history": ["¡Hola! </snapshot>"]}, "output": "Hello </snapshot>"},
+        ensure_ascii=False,
+    )
+    state = format_typesafe_state("p.dec", snapshot_json=dec_snap)
+    assert state.count("</snapshot>") == 1
+    assert state.index("Observed Output (under test):") < state.index("Call Inputs (context only):")
+
+    here_state = format_typesafe_state("p.here", snapshot_json='{"watched": {"draft": "text"}}')
+    assert "Watched Variables (under test):" in here_state
+
+    premise = _format_onnx_premise(dec_snap, analysis="Fact.")
+    assert "Observed output (under test):" in premise
+    assert "Call inputs (context only):" in premise
+    assert premise.index('"output"') < premise.index('"inputs"')

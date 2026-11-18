@@ -180,9 +180,9 @@ When `PROBE_NO_HALT=1` or `[runtime].halt_on_fail = false` is set (soak / multi-
 Probes must pass `probe check` before running (and whenever checks, `kind`, or target function source change). Approved hashes are saved in `.probes/lock.json`.
 
 1. **Static AST scan:** Extracts `@probe(...)` and `probe.here(...)` calls, signatures, and bodies without importing project modules.
-2. **Gate 1 — Budgets & structure:** Checks for duplicate `probe_id`s, `len(checks) <= max_checks` (default `5`), and `len(check) <= max_check_chars` (default `200`).
-3. **Gate 2 — Assert vs. prose audit (`[models.text]` + `[models.decision]`):** `[models.text]` describes factually what each check inspects at runtime, and `[models.decision]` scores the Gate 2 `noul` propositions—rejecting checks that belong as regular Python `assert`s or regexes (math, null checks, regex matches, type/length checks), vague unfalsifiable filler, or checks requiring uncaptured external state.
-4. **Gate 3 — Dry-run calibration:** Skipped when `(probe_id, site, kind, watched_keys, param_names)` and combined `(checks, source, threshold, domain_context, manual fixture)` hashes are unchanged in `.probes/lock.json` (unless `--force`). For `@probe`, `source_hash` hashes `(signature, docstring)` so editing internal statements/logging does not invalidate `lock.json`; for `probe.here`, `source_hash` hashes `(enclosing_signature, watched_keys)`. Uncached probes run Gates 2–3 in bounded parallel (`[check].max_workers`, default `4`) while returning deterministic order. Uses fixtures from `.probes/fixtures/<probe_id>.json` if present, or asks `[models.text]` for one passing and one failing sample matching the signature (retrying synthetic synthesis up to 1x on transient shape/calibration failures), then verifies the configured evaluator scores the valid sample `pass` and the broken sample `fail`.
+2. **Gate 1 — Budgets & structure:** Checks for duplicate `probe_id`s, `len(checks) <= max_checks` (default `12`), and `len(check) <= max_check_chars` (default `200`).
+3. **Gate 2 — Assert vs. prose audit (`[models.text]` + `[models.decision]`):** `[models.text]` describes factually what each check inspects at runtime, and `[models.decision]` scores short positive Gate 2 defect questions (`expected: false`; every defect question must score `< 0.50` to pass)—rejecting checks that belong as regular Python `assert`s or regexes (math, null checks, regex matches, type/length checks), vague unfalsifiable filler, or checks requiring uncaptured external state.
+4. **Gate 3 — Dry-run calibration:** Skipped when `(probe_id, site, kind, watched_keys, param_names)` and combined `(checks, source, threshold, domain_context, manual fixture)` hashes are unchanged in `.probes/lock.json` (unless `--force`). For `@probe`, `source_hash` hashes `(signature, docstring)` so editing internal statements/logging does not invalidate `lock.json`; for `probe.here`, `source_hash` hashes `(enclosing_signature, watched_keys)`. Uncached probes run Gates 2–3 in bounded parallel (`[check].max_workers`, default `4`) while returning deterministic order. Decision snapshots separate `Observed Output (under test)` / `Watched Variables (under test)` ahead of `Call Inputs (context only)`. Uses fixtures from `.probes/fixtures/<probe_id>.json` if present (either a single `"pass"`/`"fail"` snapshot or lists of historical snapshots `"pass": [...]`, `"fail": [...]`), or asks `[models.text]` for one passing and one failing sample matching the signature (retrying synthetic synthesis up to 1x on transient shape/calibration failures), then verifies every pass sample scores `pass` on all checks and every fail sample fails at least one check.
 
 ---
 
@@ -286,7 +286,7 @@ window_seconds = 10.0
 max_calls_per_run = -1           # -1 = unlimited; set >= 0 for a per-run hard cap
 
 [check]
-max_checks = 5
+max_checks = 12
 max_check_chars = 200
 require_check = true
 max_workers = 4
