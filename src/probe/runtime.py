@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import atexit
 import collections
+import concurrent.futures
 import hashlib
 import inspect
 import json
@@ -308,8 +309,17 @@ class ProbeRuntime:
         self._tripped = False
         self._had_failure = False
         self._halt_reason = ""
+        self._halted_thread: threading.Thread | None = None
+        self._unhandled_thread_halt: str | None = None
+        self._closing = False
         self._closed = False
         self._atexit_registered = False
+
+        self._eval_cond = threading.Condition()
+        self._active_evals = 0
+        self._soak_lock = threading.Lock()
+        self._soak_executor: concurrent.futures.ThreadPoolExecutor | None = None
+        self._soak_slots = threading.BoundedSemaphore(max(1, self.config.runtime.max_workers * 8))
 
     def should_halt_on_fail(self) -> bool:
         """Return False when PROBE_NO_HALT=1 or [runtime].halt_on_fail=false runs in audit mode."""
@@ -319,6 +329,24 @@ class ProbeRuntime:
     def is_tripped(self) -> bool:
         with self._state_lock:
             return self._tripped
+
+    @property
+    def halted_thread(self) -> threading.Thread | None:
+        with self._state_lock:
+            return self._halted_thread
+
+    def record_unhandled_thread_halt(self, message: str) -> None:
+        """Record an uncaught ProbeHaltError from a background thread so flush() can fail main."""
+        with self._state_lock:
+            if self._unhandled_thread_halt is None:
+                self._unhandled_thread_halt = message
+
+    def consume_unhandled_thread_halt(self) -> str | None:
+        """Return and clear any recorded uncaught thread ProbeHaltError message."""
+        with self._state_lock:
+            msg = self._unhandled_thread_halt
+            self._unhandled_thread_halt = None
+            return msg
 
     def register_atexit(self) -> None:
         if not self._atexit_registered:
@@ -333,9 +361,19 @@ class ProbeRuntime:
         elapsed_ms = round((time.monotonic() - self._start_mono) * 1000.0, 3)
         return seq, elapsed_ms, utc_now_iso()
 
+    def _note_halted_thread_locked(self, cur_thread: threading.Thread) -> None:
+        if cur_thread is not threading.main_thread() and "ThreadPoolExecutor" not in cur_thread.name:
+            if self._halted_thread is None or "ThreadPoolExecutor" in self._halted_thread.name:
+                self._halted_thread = cur_thread
+
     def ensure_not_tripped(self) -> None:
+        cur_thread = threading.current_thread()
         with self._state_lock:
             if self._tripped:
+                if cur_thread is threading.main_thread():
+                    self._unhandled_thread_halt = None
+                else:
+                    self._note_halted_thread_locked(cur_thread)
                 raise ProbeHaltError(self._halt_reason or "Probe runtime halted")
 
     def verify_lock(
@@ -777,7 +815,45 @@ class ProbeRuntime:
                 flush=True,
             )
 
-    def evaluate_event(
+    def _get_soak_executor(self) -> concurrent.futures.ThreadPoolExecutor:
+        with self._soak_lock:
+            if self._soak_executor is None:
+                self._soak_executor = concurrent.futures.ThreadPoolExecutor(
+                    max_workers=self.config.runtime.max_workers,
+                    thread_name_prefix="probe-soak",
+                )
+            return self._soak_executor
+
+    def begin_active_eval(self) -> bool:
+        """Increment in-flight evaluation count; return False if runtime is closing/closed."""
+        with self._eval_cond:
+            if self._closing or self._closed:
+                return False
+            self._active_evals += 1
+            return True
+
+    def end_active_eval(self) -> None:
+        """Decrement in-flight evaluation count and wake close/flush waiters."""
+        with self._eval_cond:
+            self._active_evals = max(0, self._active_evals - 1)
+            if self._active_evals == 0:
+                self._eval_cond.notify_all()
+
+    def wait_pending(self, timeout: float | None = None) -> bool:
+        """Wait for all in-flight synchronous, async, and soak evaluations to finish."""
+        deadline = (time.monotonic() + timeout) if timeout is not None else None
+        with self._eval_cond:
+            while self._active_evals > 0:
+                if deadline is not None:
+                    rem = deadline - time.monotonic()
+                    if rem <= 0.0:
+                        return False
+                    self._eval_cond.wait(timeout=rem)
+                else:
+                    self._eval_cond.wait()
+            return True
+
+    def _run_and_record(
         self,
         *,
         call_seq: int,
@@ -789,11 +865,9 @@ class ProbeRuntime:
         file_line: str,
         checks: tuple[str, ...],
         payload_json: str,
-        caller_frame: FrameType | None = None,
-        stack_excerpt: str | None = None,
+        caller_frame: FrameType | None,
+        stack_excerpt: str | None,
     ) -> None:
-        """Run decision/text grading inline for one event, persist to JSONL, and halt on fail."""
-        self.ensure_not_tripped()
         graded = self.grade_event(
             probe_id=probe_id,
             site=site,
@@ -811,6 +885,78 @@ class ProbeRuntime:
             stack_excerpt=stack_excerpt,
         )
 
+    def evaluate_event(
+        self,
+        *,
+        call_seq: int,
+        elapsed_ms: float,
+        started_at: str,
+        probe_id: str,
+        site: str,
+        probe_type: ProbeType,
+        file_line: str,
+        checks: tuple[str, ...],
+        payload_json: str,
+        caller_frame: FrameType | None = None,
+        stack_excerpt: str | None = None,
+    ) -> None:
+        """Grade one event (synchronously in halt mode, or on bounded soak pool when halt_on_fail=false)."""
+        self.ensure_not_tripped()
+        if not self.should_halt_on_fail():
+            captured_stack = stack_excerpt or _short_stack_excerpt(caller_frame)
+            self._soak_slots.acquire()
+            if not self.begin_active_eval():
+                self._soak_slots.release()
+                return
+
+            def _soak_worker() -> None:
+                try:
+                    self._run_and_record(
+                        call_seq=call_seq,
+                        elapsed_ms=elapsed_ms,
+                        started_at=started_at,
+                        probe_id=probe_id,
+                        site=site,
+                        probe_type=probe_type,
+                        file_line=file_line,
+                        checks=checks,
+                        payload_json=payload_json,
+                        caller_frame=None,
+                        stack_excerpt=captured_stack,
+                    )
+                except ProbeHaltError:
+                    pass
+                finally:
+                    self._soak_slots.release()
+                    self.end_active_eval()
+
+            try:
+                self._get_soak_executor().submit(_soak_worker)
+            except BaseException:
+                self._soak_slots.release()
+                self.end_active_eval()
+                raise
+            return
+
+        if not self.begin_active_eval():
+            return
+        try:
+            self._run_and_record(
+                call_seq=call_seq,
+                elapsed_ms=elapsed_ms,
+                started_at=started_at,
+                probe_id=probe_id,
+                site=site,
+                probe_type=probe_type,
+                file_line=file_line,
+                checks=checks,
+                payload_json=payload_json,
+                caller_frame=caller_frame,
+                stack_excerpt=stack_excerpt,
+            )
+        finally:
+            self.end_active_eval()
+
     def _trigger_halt(
         self,
         *,
@@ -821,12 +967,14 @@ class ProbeRuntime:
         caller_frame: FrameType | None,
     ) -> bool:
         halt_msg = f"[PROBE HALT] call #{call_seq:03d} {probe_id} ({file_line}): {summary}"
+        cur_thread = threading.current_thread()
         with self._state_lock:
             is_closed = self._closed
             first_halt = not self._tripped
             self._tripped = True
             if first_halt:
                 self._halt_reason = halt_msg
+            self._note_halted_thread_locked(cur_thread)
 
         if first_halt and not is_closed:
             self.store.finish_run(
@@ -852,15 +1000,30 @@ class ProbeRuntime:
         raise ProbeHaltError(halt_msg)
 
     def close(self) -> None:
-        """Finalize run status and close model clients and store on exit."""
+        """Drain pending evaluations, finalize run status, and close model clients and store on exit."""
         with self._state_lock:
-            if self._closed:
+            if self._closed or self._closing:
                 return
+            self._closing = True
+            atexit_was_registered = self._atexit_registered
+            self._atexit_registered = False
+
+        with self._eval_cond:
+            self._eval_cond.notify_all()
+
+        drain_timeout = max(self.config.models_decision.timeout_s, self.config.models_text.timeout_s) + 5.0
+        self.wait_pending(timeout=drain_timeout)
+
+        with self._soak_lock:
+            soak_exec = self._soak_executor
+            self._soak_executor = None
+        if soak_exec is not None:
+            soak_exec.shutdown(wait=True)
+
+        with self._state_lock:
             self._closed = True
             tripped = self._tripped
             had_failure = self._had_failure
-            atexit_was_registered = self._atexit_registered
-            self._atexit_registered = False
 
         if atexit_was_registered:
             atexit.unregister(self.close)

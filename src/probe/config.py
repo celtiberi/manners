@@ -22,9 +22,9 @@ _LAST_RAND = 0
 
 _DEFAULT_USER_CONFIG_PATH = Path.home() / ".config" / "probe" / "config.toml"
 _EXPORT_PREFIX_RE = re.compile(r"^export\s+")
-_DISABLED_CTX: ContextVar[bool] = ContextVar("probe_disabled", default=False)
+_OVERRIDE_CTX: ContextVar[bool | None] = ContextVar("probe_override", default=None)
 _DISABLED_LOCK = threading.Lock()
-_DISABLED_PROCESS_COUNT = 0
+_PROCESS_OVERRIDES: list[tuple[object, bool]] = []
 _TRUSTED_DEFAULT_HOSTS = frozenset(
     {
         "api.typesafe.ai",
@@ -174,27 +174,30 @@ _TRUE_VALUES = frozenset({"1", "true", "yes", "on"})
 _FALSE_VALUES = frozenset({"0", "false", "no", "off"})
 
 
-def enter_process_disabled() -> None:
-    """Increment process-wide probe disable reference count (thread-safe across executors)."""
-    global _DISABLED_PROCESS_COUNT
+def push_process_override(enabled_state: bool) -> object:
+    """Push a process-wide probe enable/disable override (thread-safe across executors)."""
+    token = object()
     with _DISABLED_LOCK:
-        _DISABLED_PROCESS_COUNT += 1
+        _PROCESS_OVERRIDES.append((token, enabled_state))
+    return token
 
 
-def exit_process_disabled() -> None:
-    """Decrement process-wide probe disable reference count."""
-    global _DISABLED_PROCESS_COUNT
+def pop_process_override(token: object) -> None:
+    """Remove a previously pushed process-wide override by token."""
     with _DISABLED_LOCK:
-        _DISABLED_PROCESS_COUNT = max(0, _DISABLED_PROCESS_COUNT - 1)
+        for idx in range(len(_PROCESS_OVERRIDES) - 1, -1, -1):
+            if _PROCESS_OVERRIDES[idx][0] is token:
+                _PROCESS_OVERRIDES.pop(idx)
+                break
 
 
 def reset_config_locks_after_fork() -> None:
     """Reinitialize module locks in a forked child process to prevent deadlocks."""
-    global _ULID_LOCK, _ENV_FLAG_CACHE_LOCK, _DISABLED_LOCK, _DISABLED_PROCESS_COUNT
+    global _ULID_LOCK, _ENV_FLAG_CACHE_LOCK, _DISABLED_LOCK
     _ULID_LOCK = threading.Lock()
     _ENV_FLAG_CACHE_LOCK = threading.Lock()
     _DISABLED_LOCK = threading.Lock()
-    _DISABLED_PROCESS_COUNT = 0
+    _PROCESS_OVERRIDES.clear()
 
 
 def clear_env_cache() -> None:
@@ -229,9 +232,13 @@ def _read_env_flag(var_name: str, cwd: Path | None = None) -> str:
 
 
 def is_probes_enabled(cwd: Path | None = None) -> bool:
-    """Return True when PROBES is enabled in os.environ or project .env (unless disabled)."""
-    if _DISABLED_PROCESS_COUNT > 0 or _DISABLED_CTX.get():
-        return False
+    """Return True when PROBES is enabled in os.environ or project .env (unless overridden)."""
+    ctx_val = _OVERRIDE_CTX.get()
+    if ctx_val is not None:
+        return ctx_val
+    with _DISABLED_LOCK:
+        if _PROCESS_OVERRIDES:
+            return _PROCESS_OVERRIDES[-1][1]
     return _read_env_flag("PROBES", cwd).lower() in _TRUE_VALUES
 
 
@@ -354,6 +361,7 @@ class RuntimeConfig:
     max_depth: int = 4
     max_items: int = 25
     max_str_bytes: int = 4096
+    max_workers: int = 4
 
 
 @dataclass(slots=True)
@@ -663,7 +671,15 @@ def load_config(cwd: Path | None = None, config_path: Path | None = None) -> Pro
         raise ValueError(
             "Invalid [check] bounds: max_checks >= 1, max_check_chars >= 1, and max_workers >= 1 required"
         )
-    if cfg.runtime.max_depth < 1 or cfg.runtime.max_items < 1 or cfg.runtime.max_str_bytes < 64:
-        raise ValueError("Invalid [runtime] bounds: max_depth >= 1, max_items >= 1, max_str_bytes >= 64 required")
+    if (
+        cfg.runtime.max_depth < 1
+        or cfg.runtime.max_items < 1
+        or cfg.runtime.max_str_bytes < 64
+        or cfg.runtime.max_workers < 1
+    ):
+        raise ValueError(
+            "Invalid [runtime] bounds: max_depth >= 1, max_items >= 1, "
+            "max_str_bytes >= 64, and max_workers >= 1 required"
+        )
 
     return cfg

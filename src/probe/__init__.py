@@ -18,13 +18,13 @@ from typing import Any, ParamSpec, TypeVar
 import httpx
 
 from probe.config import (
-    _DISABLED_CTX,
+    _OVERRIDE_CTX,
     ProbeConfig,
     clear_env_cache,
-    enter_process_disabled,
-    exit_process_disabled,
     is_probes_enabled,
     load_config,
+    pop_process_override,
+    push_process_override,
     reset_config_locks_after_fork,
 )
 from probe.redact import serialize_call_inputs, serialize_call_snapshot, serialize_here_snapshot
@@ -36,6 +36,7 @@ from probe.runtime import (
     _derive_decorator_id,
     _derive_here_id,
     _here_file_line,
+    _short_stack_excerpt,
     normalize_checks,
     normalize_probe_type,
 )
@@ -305,31 +306,106 @@ def _wrap_async_fn(
             max_items=caps.max_items,
             max_str_bytes=caps.max_str_bytes,
         )
-        graded = await asyncio.to_thread(
-            rt.grade_event,
-            probe_id=resolved_id,
-            site="decorator",
-            probe_type=probe_type,
-            file_line=file_line,
-            checks=checks,
-            payload_json=payload_json,
-        )
-        after_frame = inspect.currentframe()
-        after_caller = after_frame.f_back if after_frame is not None else None
-        del after_frame
-        try:
-            rt.record_and_maybe_halt(
-                graded,
+        if not rt.should_halt_on_fail():
+            after_frame = inspect.currentframe()
+            after_caller = after_frame.f_back if after_frame is not None else None
+            del after_frame
+            try:
+                stack_excerpt = _short_stack_excerpt(after_caller)
+            finally:
+                del after_caller
+            rt.evaluate_event(
                 call_seq=call_seq,
                 elapsed_ms=elapsed_ms,
                 started_at=started_at,
-                caller_frame=after_caller,
+                probe_id=resolved_id,
+                site="decorator",
+                probe_type=probe_type,
+                file_line=file_line,
+                checks=checks,
+                payload_json=payload_json,
+                caller_frame=None,
+                stack_excerpt=stack_excerpt,
             )
+            return result
+
+        if not rt.begin_active_eval():
+            return result
+        try:
+            graded = await asyncio.to_thread(
+                rt.grade_event,
+                probe_id=resolved_id,
+                site="decorator",
+                probe_type=probe_type,
+                file_line=file_line,
+                checks=checks,
+                payload_json=payload_json,
+            )
+            after_frame = inspect.currentframe()
+            after_caller = after_frame.f_back if after_frame is not None else None
+            del after_frame
+            try:
+                rt.record_and_maybe_halt(
+                    graded,
+                    call_seq=call_seq,
+                    elapsed_ms=elapsed_ms,
+                    started_at=started_at,
+                    caller_frame=after_caller,
+                )
+            finally:
+                del after_caller
         finally:
-            del after_caller
+            rt.end_active_eval()
         return result
 
     return wrapper
+
+
+def handle_thread_excepthook(
+    args: threading.ExceptHookArgs,
+    prev_hook: Callable[[threading.ExceptHookArgs], Any] | None,
+    *,
+    suppress_forward: bool = False,
+) -> None:
+    """Capture uncaught ProbeHaltError from background threads so flush() surfaces it on main."""
+    if isinstance(args.exc_value, ProbeHaltError):
+        with _RUNTIME_LOCK:
+            rt = _RUNTIME
+        if rt is not None:
+            rt.record_unhandled_thread_halt(str(args.exc_value))
+        if suppress_forward:
+            return
+    if prev_hook is not None:
+        prev_hook(args)
+
+
+_PREV_THREAD_EXCEPTHOOK = threading.excepthook
+
+
+def _probe_thread_excepthook(args: threading.ExceptHookArgs) -> None:
+    handle_thread_excepthook(args, _PREV_THREAD_EXCEPTHOOK, suppress_forward=False)
+
+
+threading.excepthook = _probe_thread_excepthook
+
+
+@contextlib.contextmanager
+def _override_scope(enabled_state: bool, scope: str, api_name: str) -> Iterator[None]:
+    norm_scope = scope.strip().lower()
+    if norm_scope == "process":
+        token = push_process_override(enabled_state)
+        try:
+            yield
+        finally:
+            pop_process_override(token)
+    elif norm_scope == "context":
+        token = _OVERRIDE_CTX.set(enabled_state)
+        try:
+            yield
+        finally:
+            _OVERRIDE_CTX.reset(token)
+    else:
+        raise ValueError(f"Invalid {api_name} scope {scope!r}: expected 'process' or 'context'")
 
 
 class _ProbeAPI:
@@ -479,24 +555,14 @@ class _ProbeAPI:
             del caller_frame
 
     @staticmethod
-    @contextlib.contextmanager
-    def disabled(scope: str = "process") -> Iterator[None]:
+    def disabled(scope: str = "process") -> contextlib.AbstractContextManager[None]:
         """Temporarily suppress @probe and probe.here ('process' covers threads; 'context' is ContextVar-local)."""
-        norm_scope = scope.strip().lower()
-        if norm_scope == "process":
-            enter_process_disabled()
-            try:
-                yield
-            finally:
-                exit_process_disabled()
-        elif norm_scope == "context":
-            token = _DISABLED_CTX.set(True)
-            try:
-                yield
-            finally:
-                _DISABLED_CTX.reset(token)
-        else:
-            raise ValueError(f"Invalid disabled scope {scope!r}: expected 'process' or 'context'")
+        return _override_scope(False, scope, "disabled")
+
+    @staticmethod
+    def enabled(scope: str = "process") -> contextlib.AbstractContextManager[None]:
+        """Temporarily enable @probe and probe.here ('process' covers threads; 'context' is ContextVar-local)."""
+        return _override_scope(True, scope, "enabled")
 
     @staticmethod
     def reset_for_testing(
@@ -505,6 +571,28 @@ class _ProbeAPI:
         transport: httpx.BaseTransport | None = None,
     ) -> None:
         reset_for_testing(config=config, transport=transport)
+
+    @staticmethod
+    def flush(*, check: bool = True) -> None:
+        """Wait for pending soak/background evaluations and surface uncaught thread halts if check=True."""
+        with _RUNTIME_LOCK:
+            rt = _RUNTIME
+        if rt is None:
+            return
+        drain_timeout = max(rt.config.models_decision.timeout_s, rt.config.models_text.timeout_s) + 5.0
+        rt.wait_pending(timeout=drain_timeout)
+        halted_t = rt.halted_thread
+        if (
+            halted_t is not None
+            and halted_t is not threading.current_thread()
+            and halted_t.is_alive()
+            and "ThreadPoolExecutor" not in halted_t.name
+        ):
+            halted_t.join(timeout=1.0)
+        if check:
+            unhandled = rt.consume_unhandled_thread_halt()
+            if unhandled is not None:
+                raise ProbeHaltError(unhandled)
 
     @staticmethod
     def flush_for_testing() -> ProbeRuntime | None:
@@ -520,12 +608,16 @@ class _ProbeAPI:
 probe = _ProbeAPI()
 here = probe.here
 disabled = probe.disabled
+enabled = probe.enabled
+flush = probe.flush
 type = ProbeType
 
 __all__ = [
     "ProbeHaltError",
     "ProbeType",
     "disabled",
+    "enabled",
+    "flush",
     "here",
     "probe",
     "reset_for_testing",

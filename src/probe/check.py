@@ -21,6 +21,7 @@ from probe.config import ProbeConfig, load_config, utc_now_iso
 from probe.prompts import get_noul_expected, get_nouls
 from probe.redact import SecretRedactor
 from probe.runtime import ProbeType, compute_checks_hash, resolve_module_name
+from probe.store import ProbeStore
 
 _VALID_PROBE_ID_RE = re.compile(r"[A-Za-z0-9._:-]{1,128}")
 
@@ -787,9 +788,17 @@ class _ModuleProbeVisitor(ast.NodeVisitor):
             literal_error = struct_err or check_err or kind_err or watched_err
             enclosing = self.fn_stack[-1] if self.fn_stack else None
             sig = _format_signature(enclosing) if enclosing else "<module>"
-            start_idx = max(0, call.lineno - 6)
-            end_idx = min(len(self.lines), call.end_lineno + 3 if call.end_lineno else call.lineno + 3)
-            excerpt = "\n".join(self.lines[start_idx:end_idx])
+            end_idx = min(len(self.lines), (call.end_lineno or call.lineno) + 3)
+            if enclosing is not None:
+                start_idx = max(enclosing.lineno - 1, call.lineno - 41)
+                excerpt = "\n".join(self.lines[start_idx:end_idx])
+                enclosing_doc = ast.get_docstring(enclosing, clean=True) or ""
+                if enclosing_doc and enclosing_doc not in excerpt:
+                    excerpt = f'"""{enclosing_doc}"""\n{excerpt}'
+            else:
+                start_idx = max(0, call.lineno - 16)
+                excerpt = "\n".join(self.lines[start_idx:end_idx])
+            excerpt = excerpt[:1500]
             c_hash = compute_checks_hash(kind, checks)
             s_hash = _sha256_text(f"{sig}\n{','.join(watched_keys)}")
             combined = _sha256_text(f"{c_hash}:{s_hash}")
@@ -911,7 +920,8 @@ def _normalize_fixture_cases(raw_val: Any, *, fp: Path, field_name: str) -> tupl
     )
 
 
-def _load_manual_fixture(fixtures_dir: Path, probe_id: str) -> tuple[tuple[str, ...], tuple[str, ...]] | None:
+def _fixture_candidates(fixtures_dir: Path, probe_id: str) -> tuple[Path, list[Path], str, str]:
+    """Validate probe_id and return (resolved_root, candidate_paths, safe_id, hashed_id)."""
     if (
         not probe_id
         or "/" in probe_id
@@ -925,14 +935,166 @@ def _load_manual_fixture(fixtures_dir: Path, probe_id: str) -> tuple[tuple[str, 
     fixtures_root = fixtures_dir.resolve()
     safe_id = re.sub(r"[^A-Za-z0-9._-]", "_", probe_id)
     hashed_id = f"{safe_id}-{_sha256_text(probe_id)[:6]}"
-    candidates = dict.fromkeys((f"{hashed_id}.json", f"{probe_id}.json", f"{safe_id}.json"))
-    for name in candidates:
+    names = list(dict.fromkeys((f"{hashed_id}.json", f"{probe_id}.json", f"{safe_id}.json")))
+    paths: list[Path] = []
+    for name in names:
         fp = fixtures_dir / name
-        if not fp.exists():
-            continue
         if not fp.resolve().is_relative_to(fixtures_root):
             raise BackendError(f"Fixture path {fp} escapes {fixtures_dir}")
-        if not fp.is_file():
+        paths.append(fp)
+    return fixtures_root, paths, safe_id, hashed_id
+
+
+def resolve_fixture_path(fixtures_dir: Path, probe_id: str) -> Path:
+    """Return existing manual fixture path for probe_id or the canonical path for creating one."""
+    fixtures_root, candidates, safe_id, hashed_id = _fixture_candidates(fixtures_dir, probe_id)
+    for fp in candidates:
+        if fp.exists() and fp.is_file():
+            return fp
+    target_name = f"{probe_id}.json" if safe_id == probe_id else f"{hashed_id}.json"
+    target = fixtures_dir / target_name
+    if not target.resolve().is_relative_to(fixtures_root):
+        raise BackendError(f"Fixture path {target} escapes {fixtures_dir}")
+    return target
+
+
+def build_skeleton_snapshot(item: DiscoveredProbe, tag: str) -> dict[str, Any]:
+    """Build a starter fixture snapshot matching item's AST signature or watched keys."""
+    if item.site == "here":
+        return {"watched": {k: f"<{tag}:{k}>" for k in item.watched_keys}}
+    return {
+        "inputs": {p: f"<{tag}:{p}>" for p in item.param_names},
+        "output": f"<{tag}:output>",
+    }
+
+
+def _parse_existing_fixture_section(raw_val: Any, *, fp: Path, field_name: str) -> list[dict[str, Any]]:
+    if raw_val is None:
+        return []
+    raw_items = raw_val if isinstance(raw_val, list) else [raw_val]
+    out: list[dict[str, Any]] = []
+    for idx, elem in enumerate(raw_items):
+        if isinstance(elem, str):
+            try:
+                elem = json.loads(elem)
+            except json.JSONDecodeError as exc:
+                raise BackendError(f"Invalid JSON in {fp} '{field_name}[{idx}]': {exc}") from exc
+        if not isinstance(elem, dict):
+            raise BackendError(f"Fixture {fp} '{field_name}[{idx}]' must be a JSON object")
+        out.append(elem)
+    return out
+
+
+def upsert_probe_fixture(
+    *,
+    probe_id: str,
+    cfg: ProbeConfig,
+    run_id: str | None = None,
+    init_skeleton: bool = False,
+    max_per_side: int = 5,
+) -> tuple[Path, int, int]:
+    """Promote recorded pass/fail snapshots (and optionally AST skeletons) into .probes/fixtures/<id>.json."""
+    fixtures_dir = cfg.resolve_lock_path().parent / "fixtures"
+    fp = resolve_fixture_path(fixtures_dir, probe_id)
+
+    pass_list: list[dict[str, Any]] = []
+    fail_list: list[dict[str, Any]] = []
+    if fp.is_file():
+        try:
+            existing = json.loads(fp.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise BackendError(f"Failed to read existing fixture {fp}: {exc}") from exc
+        if not isinstance(existing, dict):
+            raise BackendError(f"Fixture {fp} must contain a JSON object")
+        if "probe_id" in existing and existing["probe_id"] != probe_id:
+            raise BackendError(f"Fixture {fp} probe_id {existing['probe_id']!r} does not match {probe_id!r}")
+        pass_list = _parse_existing_fixture_section(
+            existing.get("pass", existing.get("passing_snapshot")),
+            fp=fp,
+            field_name="pass",
+        )
+        fail_list = _parse_existing_fixture_section(
+            existing.get("fail", existing.get("failing_snapshot")),
+            fp=fp,
+            field_name="fail",
+        )
+
+    def _snap_key(obj: dict[str, Any]) -> str:
+        return json.dumps(obj, sort_keys=True, ensure_ascii=False)
+
+    seen_pass = {_snap_key(x) for x in pass_list}
+    seen_fail = {_snap_key(x) for x in fail_list}
+
+    runs_dir = cfg.resolve_runs_dir()
+    if runs_dir.is_dir():
+        store = ProbeStore(runs_dir, create=False)
+        try:
+            if run_id is not None:
+                run = store.get_run(run_id)
+                if run is None:
+                    raise BackendError(f"Run {run_id!r} not found in {runs_dir}")
+                target_runs = [run]
+            else:
+                target_runs = store.list_runs(limit=50)
+
+            added_pass = 0
+            added_fail = 0
+            for r in target_runs:
+                if added_pass >= max_per_side and added_fail >= max_per_side:
+                    break
+                for ev in store.list_events(r.id):
+                    if ev.probe_id != probe_id or ev.verdict not in {"pass", "fail"}:
+                        continue
+                    try:
+                        snap = json.loads(ev.payload_json)
+                    except json.JSONDecodeError:
+                        continue
+                    if not isinstance(snap, dict) or "exception" in snap:
+                        continue
+                    key = _snap_key(snap)
+                    if ev.verdict == "pass" and added_pass < max_per_side and key not in seen_pass:
+                        pass_list.append(snap)
+                        seen_pass.add(key)
+                        added_pass += 1
+                    elif ev.verdict == "fail" and added_fail < max_per_side and key not in seen_fail:
+                        fail_list.append(snap)
+                        seen_fail.add(key)
+                        added_fail += 1
+        finally:
+            store.close()
+    elif run_id is not None:
+        raise BackendError(f"Run {run_id!r} not found: {runs_dir} does not exist")
+
+    if init_skeleton and (not pass_list or not fail_list):
+        discovered = discover_probes(root=cfg.project_root)
+        item = next((p for p in discovered if p.probe_id == probe_id), None)
+        if item is None:
+            raise BackendError(f"Probe {probe_id!r} not found in Python files under {cfg.project_root}")
+        if not pass_list:
+            pass_list.append(build_skeleton_snapshot(item, "PASS"))
+        if not fail_list:
+            fail_list.append(build_skeleton_snapshot(item, "FAIL"))
+
+    if not pass_list or not fail_list:
+        raise BackendError(
+            f"Fixture for {probe_id!r} requires at least 1 pass and 1 fail snapshot "
+            f"(found {len(pass_list)} pass, {len(fail_list)} fail); record both verdicts or pass --init"
+        )
+
+    fp.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "probe_id": probe_id,
+        "pass": pass_list,
+        "fail": fail_list,
+    }
+    fp.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    return fp, len(pass_list), len(fail_list)
+
+
+def _load_manual_fixture(fixtures_dir: Path, probe_id: str) -> tuple[tuple[str, ...], tuple[str, ...]] | None:
+    _, candidates, _, _ = _fixture_candidates(fixtures_dir, probe_id)
+    for fp in candidates:
+        if not fp.exists() or not fp.is_file():
             continue
         try:
             data = json.loads(fp.read_text(encoding="utf-8"))

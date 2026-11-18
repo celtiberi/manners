@@ -66,13 +66,17 @@ def probe(
 - `id`: Probe identifier (e.g., `"tutor.opening_turn"`). Defaults to `<module>.<qualname>`.
 - `kind`: `probe.type.decision` *(default)* or `probe.type.text`.
 
-Waitpoints and decorators can also be suppressed inside targeted blocks (such as unit tests with mocked LLM clients when `PROBES=1` is set globally):
+Waitpoints and decorators can also be suppressed or explicitly opted back in using stackable context managers (`from probe import disabled, enabled, flush`):
 
 ```python
-with probe.disabled():  # or `from probe import disabled`
-    ...
+with probe.disabled():       # Suppress probes across worker threads by default
+    with probe.enabled():    # Re-enable inside nested blocks/workers
+        ...
+probe.flush()                # Drain background soak/thread evaluations and check halts
 ```
-*(Overrides `PROBES=1` across worker threads via `scope="process"` by default; pass `scope="context"` to scope to the active `ContextVar` without mutating environment variables.)*
+*(Overrides `PROBES=1` / unset `PROBES` across worker threads via `scope="process"` by default; pass `scope="context"` to scope to the active `ContextVar` without mutating environment variables.)*
+
+A built-in `pytest11` plugin (`probe.pytest_plugin`) adds `--no-probes`, `--probes`, `@pytest.mark.probes`, and `@pytest.mark.no_probes` (`marker > CLI flag > PROBES env`) and automatically calls `probe.flush(check=not has_exc)` after each test call.
 
 ### 2.3 `probe.here` Watchpoint
 
@@ -171,7 +175,9 @@ By default, when a probe produces `fail`, `PROBE_MISUSE`, `PROBE_TRUNCATED`, or 
    - In an interactive TTY (`sys.stdin.isatty()` and `sys.stdout.isatty()`, unless `PROBE_NO_PDB=1`), invoke `pdb.Pdb().set_trace(caller_frame)` so locals can be inspected right before the function returns.
    - Otherwise raise `ProbeHaltError`.
 
-When `PROBE_NO_HALT=1` or `[runtime].halt_on_fail = false` is set (soak / multi-turn eval mode), `fail` and error events print `[PROBE FAIL]` / `[PROBE ERROR]` to `stderr`, `PROBE_MISUSE` trips the per-probe circuit breaker without halting the rest of the run, the run finishes with status `"failed"`, and `probe report --check` exits `1`.
+When `PROBE_NO_HALT=1` or `[runtime].halt_on_fail = false` is set (soak / multi-turn eval mode), `call_seq`, timestamps, and redacted snapshots are captured synchronously while model grading dispatches onto a bounded background worker pool (`[runtime].max_workers`, default `4`, drained on `probe.flush()` and process `atexit`), `fail` and error events print `[PROBE FAIL]` / `[PROBE ERROR]` to `stderr`, `PROBE_MISUSE` trips the per-probe circuit breaker without halting the rest of the run, the run finishes with status `"failed"`, and `probe report --check` exits `1`.
+
+When a probe running inside a fire-and-forget background `threading.Thread` fails in halting mode, `probe` captures uncaught thread `ProbeHaltError` exits via `threading.excepthook` and re-raises on the caller thread during `probe.flush()` (and automatically at the end of `pytest` item calls).
 
 ---
 
@@ -179,10 +185,10 @@ When `PROBE_NO_HALT=1` or `[runtime].halt_on_fail = false` is set (soak / multi-
 
 Probes must pass `probe check` before running (and whenever checks, `kind`, or target function source change). Approved hashes are saved in `.probes/lock.json`.
 
-1. **Static AST scan:** Extracts `@probe(...)` and `probe.here(...)` calls, signatures, and bodies without importing project modules.
+1. **Static AST scan:** Extracts `@probe(...)` and `probe.here(...)` calls, signatures, and enclosing context (`probe.here` includes the enclosing function's docstring and up to 40 pre-call lines in `source_excerpt`) without importing project modules.
 2. **Gate 1 — Budgets & structure:** Checks for duplicate `probe_id`s, `len(checks) <= max_checks` (default `12`), and `len(check) <= max_check_chars` (default `200`).
 3. **Gate 2 — Assert vs. prose audit (`[models.text]` + `[models.decision]`):** `[models.text]` describes factually what each check inspects at runtime, and `[models.decision]` scores short positive Gate 2 defect questions (`expected: false`; every defect question must score `< 0.50` to pass)—rejecting checks that belong as regular Python `assert`s or regexes (math, null checks, regex matches, type/length checks), vague unfalsifiable filler, or checks requiring uncaptured external state.
-4. **Gate 3 — Dry-run calibration:** Skipped when `(probe_id, site, kind, watched_keys, param_names)` and combined `(checks, source, threshold, domain_context, manual fixture)` hashes are unchanged in `.probes/lock.json` (unless `--force`). For `@probe`, `source_hash` hashes `(signature, docstring)` so editing internal statements/logging does not invalidate `lock.json`; for `probe.here`, `source_hash` hashes `(enclosing_signature, watched_keys)`. Uncached probes run Gates 2–3 in bounded parallel (`[check].max_workers`, default `4`) while returning deterministic order. Decision snapshots separate `Observed Output (under test)` / `Watched Variables (under test)` ahead of `Call Inputs (context only)`. Uses fixtures from `.probes/fixtures/<probe_id>.json` if present (either a single `"pass"`/`"fail"` snapshot or lists of historical snapshots `"pass": [...]`, `"fail": [...]`), or asks `[models.text]` for one passing and one failing sample matching the signature (retrying synthetic synthesis up to 1x on transient shape/calibration failures), then verifies every pass sample scores `pass` on all checks and every fail sample fails at least one check.
+4. **Gate 3 — Dry-run calibration:** Skipped when `(probe_id, site, kind, watched_keys, param_names)` and combined `(checks, source, threshold, domain_context, manual fixture)` hashes are unchanged in `.probes/lock.json` (unless `--force`). For `@probe`, `source_hash` hashes `(signature, docstring)` so editing internal statements/logging does not invalidate `lock.json`; for `probe.here`, `source_hash` hashes `(enclosing_signature, watched_keys)`. Uncached probes run Gates 2–3 in bounded parallel (`[check].max_workers`, default `4`) while returning deterministic order. Decision snapshots separate `Observed Output (under test)` / `Watched Variables (under test)` ahead of `Call Inputs (context only)`. Uses fixtures from `.probes/fixtures/<probe_id>.json` if present (either a single `"pass"`/`"fail"` snapshot or lists of historical snapshots `"pass": [...]`, `"fail": [...]`, optionally promoted via `probe fixture <probe_id>`), or asks `[models.text]` for one passing and one failing sample matching the signature (retrying synthetic synthesis up to 1x on transient shape/calibration failures), then verifies every pass sample scores `pass` on all checks and every fail sample fails at least one check.
 
 ---
 
@@ -194,6 +200,7 @@ Per-run JSONL files (`.probes/runs/<run_id>.jsonl`) are append-only plain text; 
 |---|---|
 | `probe check [paths...]` | Run Gates 1–3 on new or changed probes and update `.probes/lock.json` (`--force`, `--json`). |
 | `probe list [paths...]` | List probes (`id`, `file:line`, `kind`, lock status, `checks`). |
+| `probe fixture <id>` | Promote recorded pass/fail snapshots from `.probes/runs/*.jsonl` into `.probes/fixtures/<id>.json` (`--run ID`, `--init`, `--json`). |
 | `probe report` | Print call-ordered summary of the latest run (`--run <id>`, `--all`, `--format text\|md\|json`, `--check`). |
 | `probe log <probe_id>...` | Interleave detailed chronological entries (`call_seq ASC`) for one or more probe IDs / glob patterns (e.g., `probe log tutor.opening_turn rag.*`). |
 | `probe runs` | List recent runs with timestamps, command, verdict counts, and status. |
@@ -300,6 +307,7 @@ runs_dir = ".probes/runs"
 lock_path = ".probes/lock.json"
 strict_api = true                # Halt on BACKEND_ERROR; set false for stderr warning + non-halting log
 halt_on_fail = true              # Set false (or PROBE_NO_HALT=1) for non-halting soak/eval runs
+max_workers = 4                  # Bounded background grading pool size in non-halting soak mode
 ```
 
 **Environment flags (shell env or `.env`):**
@@ -339,7 +347,8 @@ probe/
 │       ├── runtime.py           # call_seq tracker, rate guard, inline grading, halt switch
 │       ├── store.py             # Per-run JSONL store
 │       ├── check.py             # AST discovery + Gates 1-3 + .probes/lock.json
-│       └── cli.py               # Typer CLI: check, list, report, log <ids...>, runs, clean
+│       ├── pytest_plugin.py     # Built-in pytest11 plugin (--probes/--no-probes, markers, flush)
+│       └── cli.py               # Typer CLI: check, list, fixture, report, log <ids...>, runs, clean
 └── tests/
 ```
 

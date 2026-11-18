@@ -1,4 +1,4 @@
-"""Typer CLI for `probe`: check, list, report, log, runs, clean."""
+"""Typer CLI for `probe`: check, list, fixture, report, log, runs, clean."""
 
 from __future__ import annotations
 
@@ -18,6 +18,7 @@ from probe.check import (
     _scan_files,
     compute_effective_combined_hash,
     run_probe_check,
+    upsert_probe_fixture,
 )
 from probe.config import load_config
 from probe.store import EventRecord, ProbeStore, RunRecord
@@ -546,3 +547,43 @@ def clean_cmd(
         typer.echo(f"Error: {exc}", err=True)
         raise typer.Exit(code=1) from exc
     typer.echo(f"Removed {deleted} old run(s) (kept newest {keep}).")
+
+
+@app.command("fixture")
+def fixture_cmd(
+    probe_id: str = typer.Argument(..., help="Probe ID to promote recorded snapshots or scaffold."),
+    run_id: str | None = typer.Option(None, "--run", help="Specific run ULID to extract snapshots from."),
+    init_skeleton: bool = typer.Option(
+        False, "--init", help="Scaffold missing pass/fail entries from the probe's AST signature/watched keys."
+    ),
+    json_out: bool = typer.Option(False, "--json", help="Emit JSON output."),
+) -> None:
+    """Promote recorded pass/fail snapshots into .probes/fixtures/<id>.json or scaffold a starter fixture."""
+    try:
+        cfg = load_config()
+        fp, pass_count, fail_count = upsert_probe_fixture(
+            probe_id=probe_id,
+            cfg=cfg,
+            run_id=run_id,
+            init_skeleton=init_skeleton,
+        )
+    except (BackendError, ValueError, OSError) as exc:
+        typer.echo(f"Error: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+
+    rel_fp = _rel_display_path(fp, cfg.project_root.resolve())
+    if json_out:
+        typer.echo(
+            json.dumps(
+                {
+                    "probe_id": probe_id,
+                    "path": rel_fp,
+                    "pass_count": pass_count,
+                    "fail_count": fail_count,
+                },
+                indent=2,
+                ensure_ascii=False,
+            )
+        )
+    else:
+        typer.echo(f"Saved fixture for '{probe_id}' at {rel_fp} ({pass_count} pass, {fail_count} fail).")

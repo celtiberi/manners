@@ -5,6 +5,21 @@ All notable changes to `probe` will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.0] - 2026-11-18
+
+### Added
+- `probe fixture <probe_id>` CLI command (`--run`, `--init`, `--json`) and `upsert_probe_fixture` helper to promote deduplicated `"pass"` and `"fail"` snapshots out of `.probes/runs/*.jsonl` into `.probes/fixtures/<probe_id>.json` (or scaffold starter snapshots from AST metadata).
+- Built-in `pytest11` plugin (`probe.pytest_plugin`) adding `--no-probes`, `--probes`, `@pytest.mark.probes`, `@pytest.mark.no_probes`, clean background-thread `ProbeHaltError` capture without spurious `PytestUnhandledThreadExceptionWarning`, and automatic post-test `probe.flush()`.
+- Stackable `probe.enabled(scope="process" | "context")` counterpart to `probe.disabled()`, plus `probe.flush(check=True)` public API (`from probe import disabled, enabled, flush`).
+- `[runtime].max_workers` (default `4`) configuration option and non-blocking bounded background grading pool when `PROBE_NO_HALT=1` / `[runtime].halt_on_fail = false` soak mode is active.
+
+### Changed
+- Expanded AST `source_excerpt` for `probe.here` calls inside functions to include the enclosing function's docstring and up to 40 pre-call source lines (keeping `source_hash` invariant to internal edits).
+- Unified `probe.disabled()` and `probe.enabled()` around stackable context and process override tables (`_OVERRIDE_CTX` and `_PROCESS_OVERRIDES`).
+
+### Fixed
+- Eliminated dropped `ProbeHaltError` failures from fire-and-forget daemon `threading.Thread`s by recording uncaught thread halts via `threading.excepthook` and surfacing them on `probe.flush()` / `pytest` teardown without double-raising on `ThreadPoolExecutor` futures.
+
 ## [0.4.0] - 2026-11-18
 
 ### Added
