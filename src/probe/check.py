@@ -18,7 +18,7 @@ import httpx
 
 from probe.backends import BackendError, CheckScore, DecisionBackend, TextBackend
 from probe.config import ProbeConfig, load_config, utc_now_iso
-from probe.prompts import get_nouls
+from probe.prompts import get_noul_expected, get_nouls
 from probe.redact import SecretRedactor
 from probe.runtime import ProbeType, compute_checks_hash, resolve_module_name
 
@@ -886,7 +886,32 @@ def _save_lockfile(lock_path: Path, data: dict[str, Any]) -> None:
     lock_path.write_text(json.dumps(data, indent=2, sort_keys=True, ensure_ascii=False) + "\n", encoding="utf-8")
 
 
-def _load_manual_fixture(fixtures_dir: Path, probe_id: str) -> tuple[str, str] | None:
+def _normalize_fixture_cases(raw_val: Any, *, fp: Path, field_name: str) -> tuple[str, ...]:
+    """Normalize a manual fixture section into a non-empty tuple of JSON snapshot strings."""
+    if isinstance(raw_val, list):
+        if not raw_val:
+            raise BackendError(f"Fixture {fp} '{field_name}' list must contain at least one snapshot")
+        out: list[str] = []
+        for idx, elem in enumerate(raw_val):
+            if isinstance(elem, dict):
+                out.append(json.dumps(elem, ensure_ascii=False))
+            elif isinstance(elem, str):
+                out.append(elem)
+            else:
+                raise BackendError(
+                    f"Fixture {fp} '{field_name}[{idx}]' must be a JSON snapshot object or JSON string"
+                )
+        return tuple(out)
+    if isinstance(raw_val, dict):
+        return (json.dumps(raw_val, ensure_ascii=False),)
+    if isinstance(raw_val, str):
+        return (raw_val,)
+    raise BackendError(
+        f"Fixture {fp} '{field_name}' must be a JSON snapshot object, non-empty list of snapshots, or JSON string"
+    )
+
+
+def _load_manual_fixture(fixtures_dir: Path, probe_id: str) -> tuple[tuple[str, ...], tuple[str, ...]] | None:
     if (
         not probe_id
         or "/" in probe_id
@@ -923,9 +948,10 @@ def _load_manual_fixture(fixtures_dir: Path, probe_id: str) -> tuple[str, str] |
         failing = data.get("fail", data.get("failing_snapshot"))
         if passing is None or failing is None:
             raise BackendError(f"Fixture {fp} must define both 'pass' and 'fail' snapshots")
-        pass_json = passing if isinstance(passing, str) else json.dumps(passing, ensure_ascii=False)
-        fail_json = failing if isinstance(failing, str) else json.dumps(failing, ensure_ascii=False)
-        return pass_json, fail_json
+        return (
+            _normalize_fixture_cases(passing, fp=fp, field_name="pass"),
+            _normalize_fixture_cases(failing, fp=fp, field_name="fail"),
+        )
     return None
 
 
@@ -935,7 +961,7 @@ def compute_effective_combined_hash(
     fixtures_dir: Path,
     pass_threshold: float,
     domain_context: str = "",
-) -> tuple[str, tuple[str, str] | None, str | None]:
+) -> tuple[str, tuple[tuple[str, ...], tuple[str, ...]] | None, str | None]:
     """Compute effective lock hash folding combined_hash, pass_threshold, domain_context, and any manual fixture."""
     try:
         fixture = _load_manual_fixture(fixtures_dir, item.probe_id)
@@ -948,7 +974,11 @@ def compute_effective_combined_hash(
     if ctx:
         base = f"{base}:ctx={_sha256_text(ctx)}"
     if fixture is not None:
-        fix_digest = _sha256_text(f"{fixture[0]}\n{fixture[1]}")
+        fix_payload = json.dumps(
+            {"pass": list(fixture[0]), "fail": list(fixture[1])},
+            ensure_ascii=False,
+        )
+        fix_digest = _sha256_text(fix_payload)
         effective_hash = _sha256_text(f"{base}:fixture:{fix_digest}")
     else:
         effective_hash = _sha256_text(base)
@@ -1058,11 +1088,24 @@ def _validate_gate3_snapshot(snapshot_json: str, *, item: DiscoveredProbe, label
     return snapshot_json
 
 
+def _format_case_scores(case_scores: list[list[CheckScore]]) -> list[dict[str, Any]]:
+    """Serialize per-case CheckScore lists for ProbeCheckResult."""
+    multi = len(case_scores) > 1
+    out: list[dict[str, Any]] = []
+    for idx, scores in enumerate(case_scores):
+        for s in scores:
+            entry: dict[str, Any] = {"check": s.check, "probability": s.probability, "passed": s.passed}
+            if multi:
+                entry["case"] = idx
+            out.append(entry)
+    return out
+
+
 def _evaluate_uncached_probe(
     item: DiscoveredProbe,
     *,
     effective_combined_hash: str,
-    fixture: tuple[str, str] | None,
+    fixture: tuple[tuple[str, ...], tuple[str, ...]] | None,
     cfg: ProbeConfig,
     decision_backend: DecisionBackend,
     text_backend: TextBackend,
@@ -1109,9 +1152,14 @@ def _evaluate_uncached_probe(
             None,
         )
 
-    approved = bool(gate2_scores) and all(s.probability > 0.50 for s in gate2_scores)
+    gate2_expected = get_noul_expected("check_gate2_nouls")
+
+    def _gate2_noul_ok(score: CheckScore) -> bool:
+        return score.probability > 0.50 if gate2_expected else score.probability < 0.50
+
+    approved = bool(gate2_scores) and all(_gate2_noul_ok(s) for s in gate2_scores)
     if not approved:
-        failed_nouls = [s.check for s in gate2_scores if s.probability <= 0.50]
+        failed_nouls = [s.check for s in gate2_scores if not _gate2_noul_ok(s)]
         audit_reason = (
             f"{gate2_analysis} (failed: {'; '.join(failed_nouls)})".strip()
             if gate2_analysis
@@ -1132,12 +1180,14 @@ def _evaluate_uncached_probe(
         )
     audit_reason = "Passed Gate 2 check audit"
 
-    # Gate 3: Dry-run calibration against manual fixture or synthesized samples (1x synthetic retry).
+    # Gate 3: Dry-run calibration against manual fixture(s) or synthesized samples (1x synthetic retry).
     fixture_source = "fixture" if fixture is not None else "synthetic"
     max_attempts = 1 if fixture is not None else 2
     retry_feedback = ""
-    pass_scores: list[CheckScore] = []
-    fail_scores: list[CheckScore] = []
+    pass_case_scores: list[list[CheckScore]] = []
+    fail_case_scores: list[list[CheckScore]] = []
+    bad_pass_indices: list[int] = []
+    bad_fail_indices: list[int] = []
     pass_ok = False
     fail_ok = False
     gate3_error: str | None = None
@@ -1145,9 +1195,9 @@ def _evaluate_uncached_probe(
     for attempt in range(1, max_attempts + 1):
         try:
             if fixture is not None:
-                pass_snap, fail_snap = fixture
+                raw_pass_cases, raw_fail_cases = fixture
             else:
-                pass_snap, fail_snap = text_backend.generate_calibration_fixtures_gate3(
+                p_snap, f_snap = text_backend.generate_calibration_fixtures_gate3(
                     probe_id=item.probe_id,
                     site=item.site,
                     checks=item.checks,
@@ -1157,6 +1207,7 @@ def _evaluate_uncached_probe(
                     temperature=0.0 if attempt == 1 else 0.3,
                     retry_feedback=retry_feedback,
                 )
+                raw_pass_cases, raw_fail_cases = (p_snap,), (f_snap,)
         except BackendError as exc:
             err_msg = str(exc)
             is_shape_err = (
@@ -1169,8 +1220,22 @@ def _evaluate_uncached_probe(
             break
 
         try:
-            pass_snap = _validate_gate3_snapshot(pass_snap, item=item, label="passing_snapshot")
-            fail_snap = _validate_gate3_snapshot(fail_snap, item=item, label="failing_snapshot")
+            pass_snaps = [
+                _validate_gate3_snapshot(
+                    snap,
+                    item=item,
+                    label="passing_snapshot" if len(raw_pass_cases) == 1 else f"passing_snapshot[{idx}]",
+                )
+                for idx, snap in enumerate(raw_pass_cases)
+            ]
+            fail_snaps = [
+                _validate_gate3_snapshot(
+                    snap,
+                    item=item,
+                    label="failing_snapshot" if len(raw_fail_cases) == 1 else f"failing_snapshot[{idx}]",
+                )
+                for idx, snap in enumerate(raw_fail_cases)
+            ]
         except BackendError as exc:
             if fixture is None and attempt == 1:
                 retry_feedback = str(exc)
@@ -1179,32 +1244,49 @@ def _evaluate_uncached_probe(
             break
 
         try:
-            pass_scores = _evaluate_sample(
-                item=item,
-                snapshot_json=pass_snap,
-                decision_backend=decision_backend,
-                text_backend=text_backend,
-            )
-            fail_scores = _evaluate_sample(
-                item=item,
-                snapshot_json=fail_snap,
-                decision_backend=decision_backend,
-                text_backend=text_backend,
-            )
+            pass_case_scores = [
+                _evaluate_sample(
+                    item=item,
+                    snapshot_json=snap,
+                    decision_backend=decision_backend,
+                    text_backend=text_backend,
+                )
+                for snap in pass_snaps
+            ]
+            fail_case_scores = [
+                _evaluate_sample(
+                    item=item,
+                    snapshot_json=snap,
+                    decision_backend=decision_backend,
+                    text_backend=text_backend,
+                )
+                for snap in fail_snaps
+            ]
         except BackendError as exc:
             gate3_error = str(exc)
             break
 
-        pass_ok = bool(pass_scores) and all(s.passed for s in pass_scores)
-        fail_ok = bool(fail_scores) and any(not s.passed for s in fail_scores)
+        bad_pass_indices = [
+            idx
+            for idx, scores in enumerate(pass_case_scores)
+            if not (scores and all(s.passed for s in scores))
+        ]
+        bad_fail_indices = [
+            idx
+            for idx, scores in enumerate(fail_case_scores)
+            if not (scores and any(not s.passed for s in scores))
+        ]
+        pass_ok = bool(pass_case_scores) and not bad_pass_indices
+        fail_ok = bool(fail_case_scores) and not bad_fail_indices
         if pass_ok and fail_ok:
             break
         if fixture is None and attempt == 1:
             fb_parts: list[str] = []
             if not pass_ok:
+                first_pass_scores = pass_case_scores[0] if pass_case_scores else []
                 failed_pass = [
                     f"{s.check!r} (p={s.probability:.2f})"
-                    for s in pass_scores
+                    for s in first_pass_scores
                     if not s.passed
                 ]
                 fb_parts.append(
@@ -1230,21 +1312,21 @@ def _evaluate_uncached_probe(
             None,
         )
 
-    pass_dicts = [
-        {"check": s.check, "probability": s.probability, "passed": s.passed}
-        for s in pass_scores
-    ]
-    fail_dicts = [
-        {"check": s.check, "probability": s.probability, "passed": s.passed}
-        for s in fail_scores
-    ]
+    pass_dicts = _format_case_scores(pass_case_scores)
+    fail_dicts = _format_case_scores(fail_case_scores)
 
     if not (pass_ok and fail_ok):
         parts = []
         if not pass_ok:
-            parts.append("passing fixture did not pass all checks")
+            if len(pass_case_scores) == 1:
+                parts.append("passing fixture did not pass all checks")
+            else:
+                parts.append(f"passing fixture case(s) {bad_pass_indices} did not pass all checks")
         if not fail_ok:
-            parts.append("failing fixture did not fail any check")
+            if len(fail_case_scores) == 1:
+                parts.append("failing fixture did not fail any check")
+            else:
+                parts.append(f"failing fixture case(s) {bad_fail_indices} did not fail any check")
         return (
             ProbeCheckResult(
                 probe_id=item.probe_id,

@@ -36,7 +36,7 @@ _LEGACY_JEV_MODELS = frozenset({"", "jev", "typesafe-ai/jev"})
 _RETRY_STATUS_CODES = frozenset({429, 500, 502, 503, 504, 529})
 _MAX_HTTP_ATTEMPTS = 2
 _RETRY_BACKOFF_S = 0.4
-_USER_AGENT = "probe/0.3"
+_USER_AGENT = "probe/0.4"
 
 
 class BackendError(RuntimeError):
@@ -664,14 +664,31 @@ def _format_onnx_premise(snapshot_json: str, analysis: str, domain_context: str 
         parsed = None
 
     if isinstance(parsed, dict):
-        ordered: dict[str, Any] = {}
-        for key in ("output", "watched", "exception", "inputs"):
-            if key in parsed:
-                ordered[key] = parsed[key]
-        for key, val in parsed.items():
-            if key not in ordered:
-                ordered[key] = val
-        parts.append(json.dumps(ordered, ensure_ascii=False))
+        keys = set(parsed.keys())
+        if "inputs" in keys and "output" in keys and keys <= {"inputs", "output", "exception"}:
+            parts.append(
+                f"Observed output (under test): {json.dumps({'output': parsed['output']}, ensure_ascii=False)}"
+            )
+            if parsed.get("exception") is not None:
+                parts.append(
+                    f"Observed exception: {json.dumps({'exception': parsed['exception']}, ensure_ascii=False)}"
+                )
+            parts.append(
+                f"Call inputs (context only): {json.dumps({'inputs': parsed['inputs']}, ensure_ascii=False)}"
+            )
+        elif keys == {"watched"}:
+            parts.append(
+                f"Watched variables (under test): {json.dumps({'watched': parsed['watched']}, ensure_ascii=False)}"
+            )
+        else:
+            ordered: dict[str, Any] = {}
+            for key in ("output", "watched", "exception", "inputs"):
+                if key in parsed:
+                    ordered[key] = parsed[key]
+            for key, val in parsed.items():
+                if key not in ordered:
+                    ordered[key] = val
+            parts.append(json.dumps(ordered, ensure_ascii=False))
     else:
         parts.append(snapshot_json)
     return "\n".join(parts)

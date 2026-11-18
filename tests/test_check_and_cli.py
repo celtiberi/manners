@@ -159,7 +159,7 @@ def test_discover_and_gates_with_caching_and_fixtures(tmp_path: Path) -> None:
             )
         if url.endswith("/decision"):
             if body["probe_id"].endswith("#gate2"):
-                return httpx.Response(200, json={"probabilities": [0.95 for _ in body["checks"]]})
+                return httpx.Response(200, json={"probabilities": [0.05 for _ in body["checks"]]})
             snap = body["snapshot"]
             ok = "GOOD" in snap
             probs = [0.95 if ok else 0.10 for _ in body["checks"]]
@@ -265,7 +265,7 @@ def test_gate1_and_gate2_rejections(tmp_path: Path) -> None:
                 },
             )
         if url.endswith("/decision"):
-            return httpx.Response(200, json={"probabilities": [0.05, 0.95, 0.90]})
+            return httpx.Response(200, json={"probabilities": [0.95, 0.05, 0.05]})
         raise AssertionError(f"Unexpected URL: {url}")
 
     ok_g2, res_g2 = run_probe_check(config=cfg, transport=httpx.MockTransport(reject_handler))
@@ -541,7 +541,7 @@ def test_auto_derived_ids_zero_imports_gate1_failures_syntax_errors_and_subdir_c
             return httpx.Response(200, json={"choices": [{"message": {"content": "Factual check audit."}}]})
         if url.endswith("/decision"):
             if body["probe_id"].endswith("#gate2"):
-                return httpx.Response(200, json={"probabilities": [0.95 for _ in body["checks"]]})
+                return httpx.Response(200, json={"probabilities": [0.05 for _ in body["checks"]]})
             ok = "GOOD" in body["snapshot"] or "Hello Ana" in body["snapshot"]
             return httpx.Response(200, json={"probabilities": [0.95 if ok else 0.10 for _ in body["checks"]]})
         raise AssertionError(f"Unexpected URL: {url}")
@@ -665,7 +665,7 @@ def _stage3_mock_handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json={"choices": [{"message": {"content": "Factual check audit."}}]})
     if url.endswith("/decision"):
         if body["probe_id"].endswith("#gate2"):
-            return httpx.Response(200, json={"probabilities": [0.95 for _ in body["checks"]]})
+            return httpx.Response(200, json={"probabilities": [0.05 for _ in body["checks"]]})
         ok = "GOOD" in body["snapshot"]
         return httpx.Response(200, json={"probabilities": [0.95 if ok else 0.10 for _ in body["checks"]]})
     raise AssertionError(f"Unexpected URL: {url}")
@@ -1117,7 +1117,7 @@ def test_stage4_gate3_synthetic_retry_and_manual_fixture_no_retry(tmp_path: Path
             return httpx.Response(200, json={"choices": [{"message": {"content": "Factual check audit."}}]})
         if url.endswith("/decision"):
             if body["probe_id"].endswith("#gate2"):
-                return httpx.Response(200, json={"probabilities": [0.95 for _ in body["checks"]]})
+                return httpx.Response(200, json={"probabilities": [0.05 for _ in body["checks"]]})
             ok = "GOOD" in body["snapshot"]
             return httpx.Response(200, json={"probabilities": [0.95 if ok else 0.15 for _ in body["checks"]]})
         raise AssertionError(f"Unexpected URL: {url}")
@@ -1263,3 +1263,127 @@ def test_v03_parallel_probe_check_and_no_body_lock_churn(tmp_path: Path, monkeyp
         "locked",
         "locked",
     ]
+
+
+def test_multi_case_manual_fixtures_backtest_and_hash_invalidation(tmp_path: Path) -> None:
+    target_py = tmp_path / "tutor.py"
+    target_py.write_text(
+        textwrap.dedent(
+            """
+            from probe import probe
+
+            @probe(["Greets warmly", "Uses Spanish phrase"], id="tutor.multi")
+            def greet(name: str) -> str:
+                return f"Hola {name}"
+            """
+        ).strip()
+        + "\n",
+        encoding="utf-8",
+    )
+
+    fixtures_dir = tmp_path / ".probes" / "fixtures"
+    fixtures_dir.mkdir(parents=True, exist_ok=True)
+    fixture_file = fixtures_dir / "tutor.multi.json"
+    fixture_file.write_text(
+        json.dumps(
+            {
+                "probe_id": "tutor.multi",
+                "pass": [
+                    {"inputs": {"name": "Ana"}, "output": "GOOD Hola Ana!"},
+                    {"inputs": {"name": "Luis"}, "output": "GOOD Buenos dias Luis!"},
+                ],
+                "fail": [
+                    {"inputs": {"name": "Ana"}, "output": "BAD hello"},
+                    {"inputs": {"name": "Luis"}, "output": "BAD hi"},
+                    {"inputs": {"name": "Sol"}, "output": "BAD hey"},
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    cfg = ProbeConfig(
+        models_decision=ModelEndpointConfig(provider="http_decision", url="http://mock.local/decision", model="jev"),
+        models_text=ModelEndpointConfig(provider="openai_compat", url="http://mock.local/v1", model="qwen3.5:9b"),
+        decision=DecisionConfig(pass_threshold=0.50),
+        check=CheckConfig(require_check=True),
+        runtime=RuntimeConfig(
+            runs_dir=str(tmp_path / ".probes" / "runs"),
+            lock_path=str(tmp_path / ".probes" / "lock.json"),
+        ),
+        project_root=tmp_path,
+    )
+
+    transport = httpx.MockTransport(_stage3_mock_handler)
+    ok, results = run_probe_check([target_py], config=cfg, transport=transport)
+    assert ok is True
+    assert results[0].status == "passed"
+    assert len(results[0].pass_scores) == 4  # 2 pass cases x 2 checks
+    assert len(results[0].fail_scores) == 6  # 3 fail cases x 2 checks
+    assert {entry["case"] for entry in results[0].pass_scores} == {0, 1}
+    assert {entry["case"] for entry in results[0].fail_scores} == {0, 1, 2}
+
+    # Unchanged fixture hits cache.
+    ok_cached, res_cached = run_probe_check([target_py], config=cfg, transport=transport)
+    assert ok_cached is True
+    assert res_cached[0].status == "cached"
+
+    # Appending a failing case[1] inside pass list invalidates cache and pinpoints case(s) [1].
+    fixture_file.write_text(
+        json.dumps(
+            {
+                "probe_id": "tutor.multi",
+                "pass": [
+                    {"inputs": {"name": "Ana"}, "output": "GOOD Hola Ana!"},
+                    {"inputs": {"name": "Luis"}, "output": "BAD regressed output"},
+                ],
+                "fail": [
+                    {"inputs": {"name": "Ana"}, "output": "BAD hello"},
+                    {"inputs": {"name": "Luis"}, "output": "BAD hi"},
+                    {"inputs": {"name": "Sol"}, "output": "BAD hey"},
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    ok_bad_pass, res_bad_pass = run_probe_check([target_py], config=cfg, transport=transport)
+    assert ok_bad_pass is False
+    assert res_bad_pass[0].gate == "gate3"
+    assert "case(s) [1]" in res_bad_pass[0].reason
+
+    # Passing all pass cases while fail[2] accidentally passes pinpoints case(s) [2].
+    fixture_file.write_text(
+        json.dumps(
+            {
+                "probe_id": "tutor.multi",
+                "pass": [
+                    {"inputs": {"name": "Ana"}, "output": "GOOD Hola Ana!"},
+                    {"inputs": {"name": "Luis"}, "output": "GOOD Buenos dias Luis!"},
+                ],
+                "fail": [
+                    {"inputs": {"name": "Ana"}, "output": "BAD hello"},
+                    {"inputs": {"name": "Luis"}, "output": "BAD hi"},
+                    {"inputs": {"name": "Sol"}, "output": "GOOD unexpected pass"},
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    ok_bad_fail, res_bad_fail = run_probe_check([target_py], config=cfg, transport=transport)
+    assert ok_bad_fail is False
+    assert res_bad_fail[0].gate == "gate3"
+    assert "case(s) [2]" in res_bad_fail[0].reason
+
+    # Empty lists are rejected cleanly.
+    fixture_file.write_text(
+        json.dumps(
+            {
+                "probe_id": "tutor.multi",
+                "pass": [],
+                "fail": [{"inputs": {"name": "Ana"}, "output": "BAD"}],
+            }
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(BackendError, match="at least one snapshot"):
+        _load_manual_fixture(fixtures_dir, "tutor.multi")

@@ -21,6 +21,7 @@ class PromptEntry:
     description: str
     prompt: str = ""
     nouls: tuple[str, ...] = ()
+    expected: bool = True
     output_schema: dict[str, Any] | None = None
 
 
@@ -71,6 +72,10 @@ def load_prompt_catalog() -> dict[str, PromptEntry]:
         if role == "models.text" and not prompt_text:
             raise ValueError(f"Text entry {key!r} must define non-empty 'prompt'")
 
+        raw_expected = item.get("expected", True)
+        if not isinstance(raw_expected, bool):
+            raise ValueError(f"Prompt entry {key!r} field 'expected' must be a boolean")
+
         raw_schema = item.get("output_schema")
         output_schema: dict[str, Any] | None = None
         if raw_schema is not None:
@@ -92,6 +97,7 @@ def load_prompt_catalog() -> dict[str, PromptEntry]:
             description=description,
             prompt=prompt_text,
             nouls=nouls,
+            expected=raw_expected,
             output_schema=output_schema,
         )
     return catalog
@@ -119,6 +125,14 @@ def get_nouls(key: str) -> tuple[str, ...]:
     return entry.nouls
 
 
+def get_noul_expected(key: str) -> bool:
+    """Return the expected boolean polarity for a decision noul entry (True = needs >0.50, False = needs <0.50)."""
+    entry = load_prompt_catalog()[key]
+    if not entry.nouls:
+        raise ValueError(f"Catalog entry {key!r} has no decision nouls")
+    return entry.expected
+
+
 def detail_instruction(detail: str) -> str:
     """Return per-check length/detail guidance for the configured text detail level."""
     mapped = _DETAIL_KEY_MAP.get(detail.strip().lower(), "detail_standard")
@@ -138,6 +152,34 @@ def _escape_closing_tags(text: str) -> str:
     return text.replace("</", "<\\/")
 
 
+def _format_snapshot_body(snapshot_json: str) -> str:
+    """Foreground observed output or watched variables ahead of call inputs when structured."""
+    try:
+        parsed = json.loads(snapshot_json)
+    except ValueError:
+        return _escape_closing_tags(snapshot_json)
+
+    if isinstance(parsed, dict):
+        keys = set(parsed.keys())
+        if "inputs" in keys and "output" in keys and keys <= {"inputs", "output", "exception"}:
+            sections = [
+                f"Observed Output (under test):\n{json.dumps(parsed['output'], ensure_ascii=False)}"
+            ]
+            if parsed.get("exception") is not None:
+                sections.append(
+                    f"Observed Exception:\n{json.dumps(parsed['exception'], ensure_ascii=False)}"
+                )
+            sections.append(
+                f"Call Inputs (context only):\n{json.dumps(parsed['inputs'], ensure_ascii=False)}"
+            )
+            return _escape_closing_tags("\n\n".join(sections))
+        if keys == {"watched"}:
+            body = f"Watched Variables (under test):\n{json.dumps(parsed['watched'], ensure_ascii=False)}"
+            return _escape_closing_tags(body)
+
+    return _escape_closing_tags(snapshot_json)
+
+
 def format_typesafe_state(
     probe_id: str,
     snapshot_json: str,
@@ -151,7 +193,7 @@ def format_typesafe_state(
         parts.append(f"Domain Context:\n<domain_context>\n{_escape_closing_tags(ctx)}\n</domain_context>")
     if analysis:
         parts.append(f"Analysis:\n<analysis>\n{_escape_closing_tags(analysis)}\n</analysis>")
-    parts.append(f"Runtime Snapshot (JSON):\n<snapshot>\n{_escape_closing_tags(snapshot_json)}\n</snapshot>")
+    parts.append(f"Runtime Snapshot (JSON):\n<snapshot>\n{_format_snapshot_body(snapshot_json)}\n</snapshot>")
     return "\n\n".join(parts)
 
 
@@ -170,7 +212,7 @@ def format_analyze_snapshot_prompts(
     ctx = domain_context.strip()
     if ctx:
         parts.append(f"<domain_context>\n{_escape_closing_tags(ctx)}\n</domain_context>")
-    parts.append(f"<snapshot>\n{_escape_closing_tags(snapshot_json)}\n</snapshot>")
+    parts.append(f"<snapshot>\n{_format_snapshot_body(snapshot_json)}\n</snapshot>")
     return system, "\n\n".join(parts)
 
 
@@ -189,7 +231,7 @@ def format_explain_failure_prompts(
     ctx = domain_context.strip()
     if ctx:
         parts.append(f"<domain_context>\n{_escape_closing_tags(ctx)}\n</domain_context>")
-    parts.append(f"<snapshot>\n{_escape_closing_tags(snapshot_json)}\n</snapshot>")
+    parts.append(f"<snapshot>\n{_format_snapshot_body(snapshot_json)}\n</snapshot>")
     return system, "\n\n".join(parts)
 
 
@@ -287,6 +329,7 @@ __all__ = [
     "format_gate2_analysis_prompts",
     "format_gate3_fixtures_prompts",
     "format_typesafe_state",
+    "get_noul_expected",
     "get_nouls",
     "get_output_schema",
     "get_prompt",

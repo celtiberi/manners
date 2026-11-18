@@ -29,15 +29,15 @@ Both roles are configured once in `config.toml` and can point at cloud APIs or l
 From a GitHub Release wheel (recommended in containers/CI — no `git` binary required):
 
 ```sh
-uv tool install https://github.com/celtiberi/probe/releases/download/v0.3.0/probe-0.3.0-py3-none-any.whl
+uv tool install https://github.com/celtiberi/probe/releases/download/v0.4.0/probe-0.4.0-py3-none-any.whl
 ```
 
 In a project virtual environment (wheel or git):
 
 ```sh
-uv add https://github.com/celtiberi/probe/releases/download/v0.3.0/probe-0.3.0-py3-none-any.whl
+uv add https://github.com/celtiberi/probe/releases/download/v0.4.0/probe-0.4.0-py3-none-any.whl
 # or via pip:
-# pip install https://github.com/celtiberi/probe/releases/download/v0.3.0/probe-0.3.0-py3-none-any.whl
+# pip install https://github.com/celtiberi/probe/releases/download/v0.4.0/probe-0.4.0-py3-none-any.whl
 # or from git main:
 # uv add git+https://github.com/celtiberi/probe.git
 ```
@@ -108,6 +108,12 @@ probe log tutor.opening_turn rag.*
 probe runs
 ```
 
+## Writing Effective Checks & Fixtures
+
+- **Keep `probe.type.decision` checks short and atomic:** A single-pass decision model evaluates each check in parallel without multi-step reasoning. Prefer several short single-fact statements (`max_checks = 12` default) naming `output` or specific watched variables directly over one long compound sentence joining multiple `and`/`without`/`unless` clauses.
+- **Use `kind=probe.type.text` for comparison or reasoning:** When a check requires comparing `output` against multi-turn `inputs` or retrieved context first, use `kind=probe.type.text` so `[models.text]` extracts factual evidence before `[models.decision]` scores the rule.
+- **Add regression fixtures in `.probes/fixtures/<probe_id>.json`:** Place optional JSON files with either a single `"pass"` / `"fail"` snapshot object or lists of historical regression snapshots (`"pass": [{...}, ...]`, `"fail": [{...}, ...]`). `probe check` backtests every listed pass and fail case whenever checks or fixtures change.
+
 ## CLI
 
 | Command | Purpose |
@@ -159,7 +165,7 @@ window_seconds = 10.0
 max_calls_per_run = -1
 
 [check]
-max_checks = 5
+max_checks = 12
 max_check_chars = 200
 require_check = true
 max_workers = 4

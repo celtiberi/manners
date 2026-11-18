@@ -329,7 +329,7 @@ class RateLimitConfig:
 class CheckConfig:
     """Pre-run probe check budgets and lockfile enforcement."""
 
-    max_checks: int = 5
+    max_checks: int = 12
     max_check_chars: int = 200
     require_check: bool = True
     max_workers: int = 4
