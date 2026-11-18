@@ -1,6 +1,6 @@
 # `probe`
 
-Plain-English runtime behavioral checks (`@probe` and `probe.here`) and call-ordered debug logs for Python. See [`SPEC.md`](./SPEC.md) for the full design.
+Plain-English runtime behavioral checks (`@probe` and `probe.here`) and call-ordered debug logs for Python. See [`SPEC.md`](./SPEC.md) for the full design and [`docs/case-study-spanish-tutor.md`](./docs/case-study-spanish-tutor.md) for a real-world multi-stage tutor integration report.
 
 ## Why This Exists
 
