@@ -354,6 +354,8 @@ def test_stage5_prompt_escaping_validation_and_reasoning_effort(tmp_path: Path, 
         assert "USER_CUSTOM_SYSTEM_PROMPT" not in seen_calls[0]["messages"][0]["content"]
         assert "USER_CUSTOM_SYSTEM_PROMPT" not in seen_calls[1]["messages"][0]["content"]
         assert seen_calls[1]["max_tokens"] >= 1200
+        assert seen_calls[1]["response_format"] == {"type": "json_object"}
+        assert "response_format" not in seen_calls[0]
         with pytest.raises(BackendError, match="empty response"):
             tb.analyze_snapshot(probe_id="p", checks=["C"], snapshot_json="{}")
     finally:

@@ -36,7 +36,7 @@
       "Requirements:",
       "1) `passing_snapshot`: write rich, multi-sentence realistic values (never terse 3-word stubs) where `output` (or `watched`) overtly satisfies EVERY clause of EVERY check in `Checks`. Every required action, instruction, request, or grounded fact named in any check must appear explicitly in the text—never left implied—while strictly obeying any negative ('without...' / 'does NOT...') constraint.",
       "2) `failing_snapshot`: a realistic non-empty near-miss of the same return type and domain (never `\"\"`, `null`, or `'ERROR'`) that looks plausible in format while clearly violating at least one check in `Checks`.",
-      "Return strictly JSON with `notes` FIRST: `{\"notes\": \"<for [0], [1], ... state the exact explicit sentence/field in passing_snapshot satisfying every clause, and what failing_snapshot violates>\", \"passing_snapshot\": {...}, \"failing_snapshot\": {...}}`."
+      "Output JSON keys: `notes` (map each check `[0]`, `[1]`, ... to the explicit span/field in `passing_snapshot` satisfying every clause and the rule violated in `failing_snapshot`), `passing_snapshot`, and `failing_snapshot`."
     ]
   },
   "text_analyze_snapshot": {

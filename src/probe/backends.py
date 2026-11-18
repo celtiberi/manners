@@ -540,12 +540,13 @@ class TextBackend:
         *,
         max_tokens: int | None = None,
         include_user_system: bool = True,
+        response_format: dict[str, Any] | None = None,
     ) -> str:
         url = _chat_completions_url(self.endpoint.url)
         full_system = (
             compose_system_prompt(system, self.text_cfg.system_prompt) if include_user_system else system
         )
-        payload = {
+        payload: dict[str, Any] = {
             "model": self.endpoint.model,
             "messages": [
                 {"role": "system", "content": full_system},
@@ -554,6 +555,8 @@ class TextBackend:
             "temperature": 0.0,
             "max_tokens": max_tokens if max_tokens is not None else self.text_cfg.max_tokens,
         }
+        if response_format is not None:
+            payload["response_format"] = response_format
         _apply_reasoning_effort(payload, self.endpoint, url)
         data = _post_json_with_retry(
             self._client,
@@ -645,6 +648,7 @@ class TextBackend:
             user,
             max_tokens=max(1200, self.text_cfg.max_tokens),
             include_user_system=False,
+            response_format={"type": "json_object"},
         )
         parsed = extract_json_object(content)
         passing = parsed.get("passing_snapshot")
