@@ -124,7 +124,7 @@ def _seed_live_project_config(tmp_path: Path, *, skip_lock_require: bool = False
 
     cfg.check = CheckConfig(require_check=not skip_lock_require)
     cfg.runtime = RuntimeConfig(
-        db_path=str(tmp_path / ".probes" / "probes.db"),
+        runs_dir=str(tmp_path / ".probes" / "runs"),
         lock_path=str(tmp_path / ".probes" / "lock.json"),
     )
     return cfg
@@ -316,7 +316,7 @@ def test_live_runtime_decision_text_redaction_and_cli_report(
         reset_for_testing()
 
     assert rt is not None
-    store = ProbeStore(cfg.resolve_db_path(), create=False)
+    store = ProbeStore(cfg.resolve_runs_dir(), create=False)
     try:
         run = store.get_run(rt.run_id)
         events = store.list_events(rt.run_id)
@@ -392,7 +392,7 @@ def test_live_jev_decision_with_local_qwen_text_pipeline(tmp_path: Path, monkeyp
     )
     cfg.check = CheckConfig(require_check=False)
     cfg.runtime = RuntimeConfig(
-        db_path=str(tmp_path / ".probes" / "probes.db"),
+        runs_dir=str(tmp_path / ".probes" / "runs"),
         lock_path=str(tmp_path / ".probes" / "lock.json"),
     )
 
@@ -516,7 +516,7 @@ def test_live_jev_decision_with_local_qwen_text_pipeline(tmp_path: Path, monkeyp
         reset_for_testing()
 
     assert rt is not None
-    store = ProbeStore(cfg.resolve_db_path(), create=False)
+    store = ProbeStore(cfg.resolve_runs_dir(), create=False)
     try:
         run = store.get_run(rt.run_id)
         events = store.list_events(rt.run_id)

@@ -170,7 +170,7 @@ def test_discover_and_gates_with_caching_and_fixtures(tmp_path: Path) -> None:
         text=TextConfig(),
         check=CheckConfig(),
         runtime=RuntimeConfig(
-            db_path=str(tmp_path / ".probes" / "probes.db"),
+            runs_dir=str(tmp_path / ".probes" / "runs"),
             lock_path=str(tmp_path / ".probes" / "lock.json"),
         ),
         project_root=tmp_path,
@@ -220,7 +220,7 @@ def test_gate1_and_gate2_rejections(tmp_path: Path) -> None:
         models_text=ModelEndpointConfig(provider="openai_compat", url="http://mock.local/v1", model="qwen"),
         check=CheckConfig(max_checks=2, max_check_chars=200),
         runtime=RuntimeConfig(
-            db_path=str(tmp_path / ".probes" / "probes.db"),
+            runs_dir=str(tmp_path / ".probes" / "runs"),
             lock_path=str(tmp_path / ".probes" / "lock.json"),
         ),
         project_root=tmp_path,
@@ -276,8 +276,8 @@ def test_cli_list_report_log_runs_clean(tmp_path: Path, monkeypatch) -> None:
     _write_sample_project(tmp_path)
     monkeypatch.chdir(tmp_path)
 
-    db_path = tmp_path / ".probes" / "probes.db"
-    store = ProbeStore(db_path, create=True)
+    runs_dir = tmp_path / ".probes" / "runs"
+    store = ProbeStore(runs_dir, create=True)
     try:
         # Older run + newer run with out-of-order insertion to verify call_seq ASC ordering.
         store.create_run(
@@ -395,9 +395,26 @@ def test_cli_list_report_log_runs_clean(tmp_path: Path, monkeypatch) -> None:
     assert runner.invoke(app, ["runs", "--limit", "0"]).exit_code != 0
     assert runner.invoke(app, ["clean", "--keep", "-1"]).exit_code != 0
 
+    assert (tmp_path / ".probes" / ".gitignore").read_text(encoding="utf-8") == "runs/\n"
+    run_jsonl = runs_dir / f"{run_id}.jsonl"
+    assert run_jsonl.is_file()
+    parsed_lines = [json.loads(line) for line in run_jsonl.read_text(encoding="utf-8").splitlines()]
+    assert parsed_lines[0]["type"] == "run_start"
+    assert parsed_lines[-1]["type"] == "run_finish"
+    assert isinstance(parsed_lines[1]["payload"], dict)
+
+    # Partial trailing JSON lines and traversal run_ids do not crash readers.
+    with run_jsonl.open("a", encoding="utf-8") as fh:
+        fh.write('{"type":"event","partial":')
+    ro_store = ProbeStore(runs_dir, create=False)
+    assert len(ro_store.list_events(run_id)) == 3
+    assert ro_store.get_run("../escape") is None
+    assert ro_store.list_events("../escape") == []
+
     clean_res = runner.invoke(app, ["clean", "--keep", "1"])
     assert clean_res.exit_code == 0
     assert "Removed 1 old run(s)" in clean_res.stdout
+    assert not (runs_dir / "01RUNOLD000000000000000001.jsonl").exists()
     runs_after = runner.invoke(app, ["runs", "--json"])
     remaining = json.loads(runs_after.stdout)["runs"]
     assert len(remaining) == 1 and remaining[0]["id"] == run_id
@@ -512,7 +529,7 @@ def test_auto_derived_ids_zero_imports_gate1_failures_syntax_errors_and_subdir_c
         decision=DecisionConfig(pass_threshold=0.50),
         check=CheckConfig(require_check=True),
         runtime=RuntimeConfig(
-            db_path=str(tmp_path / ".probes" / "probes.db"),
+            runs_dir=str(tmp_path / ".probes" / "runs"),
             lock_path=str(tmp_path / ".probes" / "lock.json"),
         ),
         project_root=tmp_path,

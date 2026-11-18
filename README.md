@@ -89,7 +89,7 @@ PROBES=1 PROBE_NO_PDB=1 pytest
 
 To skip `.probes/lock.json` enforcement during quick local iteration, set `PROBE_SKIP_LOCK=1`. Setting `PROBES=""` or `PROBES=0` in the shell overrides `PROBES=1` in `.env`.
 
-4. Inspect results in call-entry order (works while a server is running too, via SQLite WAL):
+4. Inspect results in call-entry order (works while a server is running too, via per-run JSONL logs):
 
 ```sh
 probe report --all
@@ -106,7 +106,7 @@ probe runs
 | `probe report [--run ID] [--all]` | Show call-ordered summary of failures/errors (or all events with `--all`). |
 | `probe log <probe_id>... [--payload]` | Interleave chronological events across one or more probe IDs or globs. |
 | `probe runs` | List recorded runs and pass/fail/error counts. |
-| `probe clean [--keep N]` | Prune older runs from `.probes/probes.db` (default keeps last 20). |
+| `probe clean [--keep N]` | Prune older run logs from `.probes/runs` (default keeps last 20). |
 
 ## Configuration (`~/.config/probe/config.toml`)
 
@@ -155,7 +155,7 @@ env_files = [".env"]
 extra_keys = []
 
 [runtime]
-db_path = ".probes/probes.db"
+runs_dir = ".probes/runs"
 lock_path = ".probes/lock.json"
 ```
 

@@ -22,11 +22,11 @@ app = typer.Typer(
 )
 
 
-def _open_existing_store(db_path: Path, *, read_only: bool = True) -> ProbeStore:
-    if not db_path.is_file():
-        typer.echo(f"No probe database found at {db_path}. Run with PROBES=1 first.", err=True)
+def _open_existing_store(runs_dir: Path, *, read_only: bool = True) -> ProbeStore:
+    if not runs_dir.is_dir():
+        typer.echo(f"No probe runs found at {runs_dir}. Run with PROBES=1 first.", err=True)
         raise typer.Exit(code=1)
-    return ProbeStore(db_path, create=not read_only)
+    return ProbeStore(runs_dir, create=not read_only)
 
 
 def _run_status_label(run: RunRecord, events: list[EventRecord]) -> str:
@@ -304,12 +304,12 @@ def report_cmd(
 ) -> None:
     """Print call-ordered summary of the latest or specified probe run."""
     cfg = load_config()
-    db_path = cfg.resolve_db_path()
-    store = _open_existing_store(db_path)
+    runs_dir = cfg.resolve_runs_dir()
+    store = _open_existing_store(runs_dir)
     try:
         run = store.get_run(run_id)
         if run is None:
-            typer.echo(f"No matching run found in {db_path}.", err=True)
+            typer.echo(f"No matching run found in {runs_dir}.", err=True)
             raise typer.Exit(code=1)
         events = store.list_events(run.id)
     finally:
@@ -344,12 +344,12 @@ def log_cmd(
         typer.echo("Probe ID or glob pattern must not be empty.", err=True)
         raise typer.Exit(code=1)
     cfg = load_config()
-    db_path = cfg.resolve_db_path()
-    store = _open_existing_store(db_path)
+    runs_dir = cfg.resolve_runs_dir()
+    store = _open_existing_store(runs_dir)
     try:
         run = store.get_run(run_id)
         if run is None:
-            typer.echo(f"No matching run found in {db_path}.", err=True)
+            typer.echo(f"No matching run found in {runs_dir}.", err=True)
             raise typer.Exit(code=1)
         events = store.list_events(run.id, probe_patterns=probe_ids)
     finally:
@@ -427,7 +427,7 @@ def runs_cmd(
 ) -> None:
     """List recent probe runs with timestamps, verdict counts, and status."""
     cfg = load_config()
-    store = _open_existing_store(cfg.resolve_db_path())
+    store = _open_existing_store(cfg.resolve_runs_dir())
     try:
         runs = store.list_runs(limit=limit)
     finally:
@@ -453,9 +453,9 @@ def runs_cmd(
 def clean_cmd(
     keep: int = typer.Option(20, "--keep", min=0, help="Number of newest runs to retain."),
 ) -> None:
-    """Prune old runs from .probes/probes.db and truncate WAL."""
+    """Prune old run logs from .probes/runs."""
     cfg = load_config()
-    store = _open_existing_store(cfg.resolve_db_path(), read_only=False)
+    store = _open_existing_store(cfg.resolve_runs_dir(), read_only=False)
     try:
         deleted = store.clean_runs(keep=keep)
     finally:

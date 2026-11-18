@@ -247,7 +247,7 @@ class RedactConfig:
 class RuntimeConfig:
     """Storage paths, snapshot caps, and strict API handling."""
 
-    db_path: str = ".probes/probes.db"
+    runs_dir: str = ".probes/runs"
     lock_path: str = ".probes/lock.json"
     strict_api: bool = False
     max_depth: int = 4
@@ -283,8 +283,8 @@ class ProbeConfig:
     runtime: RuntimeConfig = field(default_factory=RuntimeConfig)
     project_root: Path = field(default_factory=Path.cwd)
 
-    def resolve_db_path(self) -> Path:
-        path = Path(self.runtime.db_path)
+    def resolve_runs_dir(self) -> Path:
+        path = Path(self.runtime.runs_dir)
         return path if path.is_absolute() else (self.project_root / path)
 
     def resolve_lock_path(self) -> Path:

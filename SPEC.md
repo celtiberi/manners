@@ -113,7 +113,7 @@ When probes are nested (e.g., an outer `@probe` calls an inner `@probe` or `prob
 
 ### 3.2 Secret Redaction (Runtime Secret Collection + Key Masking)
 
-Before a snapshot is written to `.probes/probes.db` or sent to any model:
+Before a snapshot is written to `.probes/runs/<run_id>.jsonl` or sent to any model:
 
 1. **Startup secret collection (exact value scrubbing):** When `PROBES=1`, `probe` collects known secret values once at startup (`len >= 8`, skipping plain booleans, integers, ports, and local file paths) from:
    - Secret-named keys (`*KEY*`, `*TOKEN*`, `*SECRET*`, `*PASS*`, `*AUTH*`, `*DSN*`, `*DATABASE_URL*`, `*PRIVATE*`, `*CRED*`, `*BEARER*`, `*SIGNING*`, `*ENCRYPT*`) and connection/webhook URLs in `.env*` files across project root/working directory plus `[redact].env_files`.
@@ -157,7 +157,7 @@ Every probe ends at `[models.decision]` and produces either `pass` or `fail` (pl
 
 When a probe produces `fail` or `PROBE_MISUSE`:
 
-1. Flush the full event record (`call_seq`, `probe_id`, `probe_type`, `file_line`, redacted payload, per-check scores, `text_analysis`, `stack_excerpt`) to `.probes/probes.db`, mark the run `halted`, and print `[PROBE HALT]` to `stderr`.
+1. Flush the full event record (`call_seq`, `probe_id`, `probe_type`, `file_line`, redacted payload, per-check scores, `text_analysis`, `stack_excerpt`) to `.probes/runs/<run_id>.jsonl`, mark the run `halted`, and print `[PROBE HALT]` to `stderr`.
 2. Set a global `tripped` flag so any further probe call raises `ProbeHaltError`.
 3. Stop directly on the active caller stack frame:
    - In an interactive TTY (`sys.stdin.isatty()` and `sys.stdout.isatty()`, unless `PROBE_NO_PDB=1`), invoke `pdb.Pdb().set_trace(caller_frame)` so locals can be inspected right before the function returns.
@@ -178,7 +178,7 @@ Probes must pass `probe check` before running (and whenever checks, `kind`, or t
 
 ## 5. CLI
 
-SQLite is internal storage. All inspection goes through the `probe` CLI, with events sorted by `call_seq ASC`.
+Per-run JSONL files (`.probes/runs/<run_id>.jsonl`) are append-only plain text; CLI commands sort and summarize events by `call_seq ASC`.
 
 | Command | Purpose |
 |---|---|
@@ -187,7 +187,7 @@ SQLite is internal storage. All inspection goes through the `probe` CLI, with ev
 | `probe report` | Print call-ordered summary of the latest run (`--run <id>`, `--all`, `--format text\|md\|json`). |
 | `probe log <probe_id>...` | Interleave detailed chronological entries (`call_seq ASC`) for one or more probe IDs / glob patterns (e.g., `probe log tutor.opening_turn rag.*`). |
 | `probe runs` | List recent runs with timestamps, command, verdict counts, and status. |
-| `probe clean [--keep N]` | Prune old runs from `.probes/probes.db` (default keeps last `20`). |
+| `probe clean [--keep N]` | Prune older run logs from `.probes/runs` (default keeps last `20`). |
 
 ### Example `probe report --all` Output
 
@@ -281,7 +281,7 @@ env_files = [".env"]             # Dotenv files scanned for secret values (in ad
 extra_keys = []                  # Additional argument/dict key names to mask
 
 [runtime]
-db_path = ".probes/probes.db"
+runs_dir = ".probes/runs"
 lock_path = ".probes/lock.json"
 ```
 
@@ -291,12 +291,15 @@ lock_path = ".probes/lock.json"
 - `PROBE_SKIP_LOCK`: `1` to bypass `.probes/lock.json` during rapid local edits
 - `PROBE_NO_PDB`: `1` to always raise `ProbeHaltError` instead of opening `pdb` in interactive terminals
 
-### 6.2 Internal SQLite Schema (`.probes/probes.db`, WAL mode)
+### 6.2 Per-Run JSONL Log Format (`.probes/runs/<run_id>.jsonl`)
 
-- **`runs`**: `id` (ULID), `started_at`, `finished_at`, `cmd`, `pid`, `status` (`running` | `completed` | `halted`), `halt_call_seq`, `decision_model`, `text_model`
-- **`events`**: `run_id`, `call_seq` (`PRIMARY KEY (run_id, call_seq)`), `elapsed_ms`, `started_at`, `probe_id`, `site` (`decorator` | `here`), `probe_type` (`decision` | `text`), `file_line`, `checks_json`, `payload_json` (redacted snapshot), `check_scores_json` (array of `{check, probability, passed}`), `verdict` (`pass` | `fail` | `error`), `error_code` (`PROBE_MISUSE` | ...), `text_analysis`, `stack_excerpt`, `judged_at`, `latency_ms`
+Each run writes one plain-text JSON Lines file named `<run_id>.jsonl` (`ULID`), sorted chronologically by filename and containing three record types (`"type"`):
 
-Indexes on `(run_id, call_seq)` and `(run_id, probe_id, call_seq)` serve `probe report` and multi-ID `probe log`.
+- **`run_start`**: `id` (ULID), `started_at`, `cmd`, `pid`, `status` (`"running"`), `decision_model`, `text_model`
+- **`event`**: `run_id`, `call_seq`, `elapsed_ms`, `started_at`, `probe_id`, `site` (`decorator` | `here`), `probe_type` (`decision` | `text`), `file_line`, `checks`, `payload` (redacted snapshot object), `check_scores` (array of `{check, probability, passed}`), `verdict` (`pass` | `fail` | `error`), `error_code` (`PROBE_MISUSE` | ...), `text_analysis`, `stack_excerpt`, `judged_at`, `latency_ms`
+- **`run_finish`**: `id`, `status` (`completed` | `halted`), `finished_at`, `halt_call_seq`
+
+Readers sort events per run by `call_seq ASC` and inspect runs directly via `probe report` / `probe log` (or `jq` / `tail -f`).
 
 ### 6.3 Package Layout (`probe/`)
 
@@ -315,7 +318,7 @@ probe/
 │       ├── prompts.py           # Prompt catalog loader + model message builders
 │       ├── backends.py          # Decision providers + Text LLM client
 │       ├── runtime.py           # call_seq tracker, rate guard, inline grading, halt switch
-│       ├── store.py             # SQLite WAL store
+│       ├── store.py             # Per-run JSONL store
 │       ├── check.py             # AST discovery + Gates 1-3 + .probes/lock.json
 │       └── cli.py               # Typer CLI: check, list, report, log <ids...>, runs, clean
 └── tests/

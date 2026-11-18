@@ -201,7 +201,7 @@ def _is_asyncio_internal_frame(frame: FrameType) -> bool:
 
 
 class ProbeRuntime:
-    """Manages SQLite run lifecycle, redaction, rate limiting, inline grading, and halting."""
+    """Manages JSONL run lifecycle, redaction, rate limiting, inline grading, and halting."""
 
     def __init__(
         self,
@@ -215,7 +215,7 @@ class ProbeRuntime:
         self.started_at = utc_now_iso()
         self._start_mono = time.monotonic()
 
-        self.store = ProbeStore(self.config.resolve_db_path(), create=True)
+        self.store = ProbeStore(self.config.resolve_runs_dir(), create=True)
         try:
             cmd = " ".join(shlex.quote(a) for a in sys.argv) if sys.argv else "python"
             self.store.create_run(

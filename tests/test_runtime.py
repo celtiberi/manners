@@ -55,7 +55,7 @@ def _make_config(
         ),
         check=CheckConfig(require_check=require_check),
         runtime=RuntimeConfig(
-            db_path=str(tmp_path / ".probes" / "probes.db"),
+            runs_dir=str(tmp_path / ".probes" / "runs"),
             lock_path=str(tmp_path / ".probes" / "lock.json"),
         ),
         project_root=tmp_path,
@@ -82,7 +82,7 @@ def test_disabled_probes_passes_through_and_enables_dynamically(tmp_path: Path, 
     decorated_async = probe("check async", id="noop.async")(raw_async)
     assert decorated_async.__wrapped__ is raw_async
     assert asyncio.run(decorated_async(3)) == 6
-    assert not (tmp_path / ".probes" / "probes.db").exists()
+    assert not (tmp_path / ".probes" / "runs").exists()
 
     # Enabling PROBES=1 after module import / decoration activates wrapped probes cleanly.
     def handler(request: httpx.Request) -> httpx.Response:
@@ -96,7 +96,7 @@ def test_disabled_probes_passes_through_and_enables_dynamically(tmp_path: Path, 
         rt = probe.flush_for_testing()
         reset_for_testing()
     assert rt is not None
-    store = ProbeStore(cfg.resolve_db_path(), create=False)
+    store = ProbeStore(cfg.resolve_runs_dir(), create=False)
     try:
         events = store.list_events(rt.run_id)
     finally:
@@ -172,7 +172,7 @@ def test_nested_inline_call_entry_ordering_and_entry_snapshot(
     # Execution finished inner -> here -> outer, while call_seq stays entry-ordered 1=outer, 2=inner, 3=here.
     assert eval_order == ["rag.watch", "step.inner", "step.outer"]
 
-    store = ProbeStore(cfg.resolve_db_path(), create=False)
+    store = ProbeStore(cfg.resolve_runs_dir(), create=False)
     try:
         events = store.list_events(rt.run_id)
     finally:
@@ -230,7 +230,7 @@ def test_inline_halt_non_tty_and_mock_tty_pdb(tmp_path: Path, monkeypatch) -> No
     rt = probe.flush_for_testing()
     reset_for_testing()
     assert rt is not None
-    store = ProbeStore(cfg.resolve_db_path(), create=False)
+    store = ProbeStore(cfg.resolve_runs_dir(), create=False)
     try:
         run = store.get_run(rt.run_id)
         events = store.list_events(rt.run_id)
@@ -311,7 +311,7 @@ def test_rate_limit_unlimited_per_run_default_sliding_window_and_lock(
         reset_for_testing()
 
     assert rt is not None
-    store = ProbeStore(cfg.resolve_db_path(), create=False)
+    store = ProbeStore(cfg.resolve_runs_dir(), create=False)
     try:
         events = store.list_events(rt.run_id)
     finally:
@@ -420,18 +420,19 @@ def test_exceptions_descriptors_generators_preexec_guards_and_ro_store(
         reset_for_testing()
 
     assert rt is not None
-    ro_db = cfg.resolve_db_path()
-    ro_db.chmod(0o444)
-    ro_db.parent.chmod(0o555)
+    ro_dir = cfg.resolve_runs_dir()
+    ro_run = ro_dir / f"{rt.run_id}.jsonl"
+    ro_run.chmod(0o444)
+    ro_dir.chmod(0o555)
     try:
-        store = ProbeStore(ro_db, create=False)
+        store = ProbeStore(ro_dir, create=False)
         try:
             events = store.list_events(rt.run_id)
         finally:
             store.close()
     finally:
-        ro_db.parent.chmod(0o755)
-        ro_db.chmod(0o644)
+        ro_dir.chmod(0o755)
+        ro_run.chmod(0o644)
 
     assert events[0].error_code == "TARGET_EXCEPTION"
     assert events[0].verdict == "error"
