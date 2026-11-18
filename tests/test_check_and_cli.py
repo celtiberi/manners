@@ -6,6 +6,7 @@ import importlib.util
 import json
 import sys
 import textwrap
+import threading
 from pathlib import Path
 
 import httpx
@@ -1147,3 +1148,118 @@ def test_stage4_gate3_synthetic_retry_and_manual_fixture_no_retry(tmp_path: Path
     assert gate3_calls[1]["temperature"] == 0.3
     assert "<previous_attempt_error>" in gate3_calls[1]["messages"][1]["content"]
     assert "failed checks" in gate3_calls[1]["messages"][1]["content"]
+
+
+def test_v03_parallel_probe_check_and_no_body_lock_churn(tmp_path: Path, monkeypatch) -> None:
+    target_py = tmp_path / "app_mod.py"
+    target_py.write_text(
+        textwrap.dedent(
+            """
+            from probe import probe
+
+            @probe("First check returns warm greeting", id="par.p1")
+            def p1(name: str) -> str:
+                \"\"\"Greet the learner.\"\"\"
+                return f"GOOD {name}"
+
+            @probe("Second check returns warm farewell", id="par.p2")
+            def p2(name: str) -> str:
+                \"\"\"Farewell message.\"\"\"
+                return f"GOOD {name}"
+
+            def p3_wrap(draft: str) -> str:
+                probe.here("Third check watches draft inline", id="par.p3", draft=draft)
+                return draft
+            """
+        ).strip()
+        + "\n",
+        encoding="utf-8",
+    )
+
+    # Barrier requires 3 uncached Gate 2 calls to arrive concurrently -> would deadlock if sequential!
+    gate2_barrier = threading.Barrier(3, timeout=3.0)
+    http_lock = threading.Lock()
+    http_calls = {"n": 0}
+
+    def parallel_handler(request: httpx.Request) -> httpx.Response:
+        with http_lock:
+            http_calls["n"] += 1
+        resp = _stage3_mock_handler(request)
+        if str(request.url).endswith("/chat/completions"):
+            body = json.loads(request.content.decode("utf-8"))
+            if "passing_snapshot" not in body["messages"][0]["content"]:
+                gate2_barrier.wait()
+        return resp
+
+    cfg = ProbeConfig(
+        models_decision=ModelEndpointConfig(provider="http_decision", url="http://mock.local/decision", model="jev"),
+        models_text=ModelEndpointConfig(provider="openai_compat", url="http://mock.local/v1", model="qwen3.5:9b"),
+        decision=DecisionConfig(pass_threshold=0.50),
+        check=CheckConfig(require_check=True, max_workers=4),
+        runtime=RuntimeConfig(
+            runs_dir=str(tmp_path / ".probes" / "runs"),
+            lock_path=str(tmp_path / ".probes" / "lock.json"),
+        ),
+        project_root=tmp_path,
+    )
+    ok, results = run_probe_check([target_py], config=cfg, transport=httpx.MockTransport(parallel_handler))
+    assert ok is True
+    assert [(r.probe_id, r.status) for r in results] == [
+        ("par.p1", "passed"),
+        ("par.p2", "passed"),
+        ("par.p3", "passed"),
+    ]
+
+    # Edit internal body / logging and surrounding comments without changing signature, docstring, or watched_keys.
+    target_py.write_text(
+        textwrap.dedent(
+            """
+            from probe import probe
+
+            @probe("First check returns warm greeting", id="par.p1")
+            def p1(name: str) -> str:
+                \"\"\"Greet the learner.\"\"\"
+                tmp = name.strip()
+                # unrelated comment and refactor inside body
+                return f"GOOD {tmp}!"
+
+            @probe("Second check returns warm farewell", id="par.p2")
+            def p2(name: str) -> str:
+                \"\"\"Farewell message.\"\"\"
+                return f"GOOD bye {name}"
+
+            def p3_wrap(draft: str) -> str:
+                # extra comment line above probe.here
+                note = draft.strip()
+                probe.here("Third check watches draft inline", id="par.p3", draft=draft)
+                return note
+            """
+        ).strip()
+        + "\n",
+        encoding="utf-8",
+    )
+
+    calls_before = http_calls["n"]
+    ok_cached, res_cached = run_probe_check([target_py], config=cfg, transport=httpx.MockTransport(parallel_handler))
+    assert ok_cached is True
+    assert [r.status for r in res_cached] == ["cached", "cached", "cached"]
+    assert http_calls["n"] == calls_before
+
+    monkeypatch.chdir(tmp_path)
+    runner = CliRunner()
+    list_cached = runner.invoke(app, ["list", "app_mod.py", "--json"])
+    assert list_cached.exit_code == 0
+    assert [p["lock_status"] for p in json.loads(list_cached.stdout)["probes"]] == ["locked", "locked", "locked"]
+
+    # Changing a function signature / docstring marks par.p1 as source_changed and triggers re-calibration.
+    target_py.write_text(
+        target_py.read_text(encoding="utf-8").replace('"""Greet the learner."""', '"""Greet the learner warmly."""'),
+        encoding="utf-8",
+    )
+    list_changed = runner.invoke(app, ["list", "app_mod.py", "--json"])
+    assert list_changed.exit_code == 0
+    assert [p["lock_status"] for p in json.loads(list_changed.stdout)["probes"]] == [
+        "source_changed",
+        "locked",
+        "locked",
+    ]

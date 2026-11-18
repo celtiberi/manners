@@ -3,14 +3,17 @@
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import json
 import pdb
 from pathlib import Path
 
 import httpx
 import pytest
+from typer.testing import CliRunner
 
 from probe import ProbeHaltError, probe, reset_for_testing
+from probe.cli import app
 from probe.config import (
     CheckConfig,
     DecisionConfig,
@@ -681,3 +684,149 @@ def test_truncation_always_halts_and_strict_api_defaults_true(
     captured = capsys.readouterr()
     assert "[PROBE ERROR]" in captured.err
     assert "err.lenient" in captured.err
+
+
+def test_v03_base_exception_thread_disabled_and_soak_mode(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    # 1. ProbeHaltError inherits from BaseException (unwinds past except Exception, runs finally).
+    assert issubclass(ProbeHaltError, BaseException)
+    assert not issubclass(ProbeHaltError, Exception)
+
+    monkeypatch.setenv("PROBES", "1")
+    monkeypatch.setenv("PROBE_NO_PDB", "1")
+
+    def fail_handler(request: httpx.Request) -> httpx.Response:
+        url = str(request.url)
+        if url.endswith("/chat/completions"):
+            return httpx.Response(200, json={"choices": [{"message": {"content": "Diagnostic note."}}]})
+        return httpx.Response(200, json={"probabilities": [0.10]})
+
+    cfg_halt = _make_config(tmp_path)
+    cfg_halt.runtime.runs_dir = str(tmp_path / ".probes" / "runs_base_exc")
+    reset_for_testing(config=cfg_halt, transport=httpx.MockTransport(fail_handler))
+
+    @probe("Fails on purpose", id="exc.base")
+    def bad_call(x: str) -> str:
+        return x
+
+    cleanup_ran = False
+    try:
+        with pytest.raises(ProbeHaltError):
+            try:
+                bad_call("oops")
+            except Exception:  # noqa: BLE001
+                pytest.fail("except Exception must not catch ProbeHaltError")
+            finally:
+                cleanup_ran = True
+        assert cleanup_ran is True
+    finally:
+        probe.flush_for_testing()
+        reset_for_testing()
+
+    # 2. probe.disabled() defaults to process-wide so ThreadPoolExecutor workers skip probes cleanly.
+    worker_calls = {"n": 0}
+
+    def counting_handler(_request: httpx.Request) -> httpx.Response:
+        worker_calls["n"] += 1
+        return httpx.Response(200, json={"probabilities": [0.95]})
+
+    cfg_thread = _make_config(tmp_path)
+    cfg_thread.runtime.runs_dir = str(tmp_path / ".probes" / "runs_threads")
+    reset_for_testing(config=cfg_thread, transport=httpx.MockTransport(counting_handler))
+
+    @probe("Thread worker check", id="thread.fn")
+    def thread_fn(v: int) -> int:
+        probe.here("Worker inline check", id="thread.here", v=v)
+        return v
+
+    try:
+        with probe.disabled():
+            with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+                outs = list(pool.map(thread_fn, [1, 2, 3, 4]))
+        assert outs == [1, 2, 3, 4]
+        assert worker_calls["n"] == 0
+
+        # Invalid disabled scope raises ValueError.
+        with pytest.raises(ValueError, match="Invalid disabled scope"):
+            with probe.disabled(scope="bogus"):
+                pass
+
+        # Context scope stays local to current thread.
+        with probe.disabled(scope="context"):
+            assert thread_fn(9) == 9
+        assert worker_calls["n"] == 0
+    finally:
+        probe.flush_for_testing()
+        reset_for_testing()
+
+    # 3. Soak mode (PROBE_NO_HALT=1) logs all fails & PROBE_MISUSE once without halting; --check exits 1.
+    monkeypatch.setenv("PROBE_NO_HALT", "1")
+
+    def soak_handler(request: httpx.Request) -> httpx.Response:
+        url = str(request.url)
+        body = json.loads(request.content.decode("utf-8"))
+        if url.endswith("/chat/completions"):
+            return httpx.Response(200, json={"choices": [{"message": {"content": "Soak analysis."}}]})
+        ok = "PASS" in body["snapshot"]
+        return httpx.Response(200, json={"probabilities": [0.95 if ok else 0.12]})
+
+    soak_dir = tmp_path / "soak_proj"
+    soak_dir.mkdir()
+    monkeypatch.chdir(soak_dir)
+    cfg_soak = _make_config(soak_dir, max_calls=3, window_seconds=10.0)
+    reset_for_testing(config=cfg_soak, transport=httpx.MockTransport(soak_handler))
+
+    @probe("Output marks PASS", id="soak.turn")
+    def turn_fn(msg: str) -> str:
+        return msg
+
+    @probe("Loop probe", id="soak.loop")
+    def loop_fn(i: int) -> str:
+        return f"PASS {i}"
+
+    capsys.readouterr()
+    try:
+        assert turn_fn("FAIL turn 1") == "FAIL turn 1"
+        assert turn_fn("PASS turn 2") == "PASS turn 2"
+        assert turn_fn("FAIL turn 3") == "FAIL turn 3"
+        # Exceed rate limit max_calls=3: call 4 logs PROBE_MISUSE once; call 5 skips without spamming or halting.
+        assert [loop_fn(i) for i in range(5)] == [f"PASS {i}" for i in range(5)]
+    finally:
+        rt_soak = probe.flush_for_testing()
+        reset_for_testing()
+
+    soak_err = capsys.readouterr().err
+    assert "[PROBE FAIL]" in soak_err
+    assert "[PROBE ERROR]" in soak_err
+    assert rt_soak is not None
+    store = ProbeStore(cfg_soak.resolve_runs_dir(), create=False)
+    try:
+        run, events = store.get_run_with_events(rt_soak.run_id)
+    finally:
+        store.close()
+    assert run is not None
+    assert run.status == "failed"
+    assert run.pass_count == 4  # 1 from turn 2 + 3 from loop calls 0,1,2
+    assert run.fail_count == 2  # turns 1 and 3
+    assert run.error_count == 1  # single PROBE_MISUSE on loop call 3 (call 4 skipped cleanly)
+    assert len(events) == 7
+
+    runner = CliRunner()
+    rep_ok = runner.invoke(app, ["report", "--all"])
+    assert rep_ok.exit_code == 0
+    rep_check = runner.invoke(app, ["report", "--check"])
+    assert rep_check.exit_code == 1
+
+    # Passing soak run exits 0 with `probe report --check`.
+    all_pass_dir = tmp_path / "pass_proj"
+    all_pass_dir.mkdir()
+    monkeypatch.chdir(all_pass_dir)
+    cfg_pass = _make_config(all_pass_dir)
+    reset_for_testing(config=cfg_pass, transport=httpx.MockTransport(soak_handler))
+    try:
+        probe.here("Output marks PASS", id="pass.only", msg="PASS ok")
+    finally:
+        probe.flush_for_testing()
+        reset_for_testing()
+    assert runner.invoke(app, ["report", "--check"]).exit_code == 0

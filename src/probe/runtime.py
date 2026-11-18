@@ -26,6 +26,7 @@ import httpx
 from probe.backends import BackendError, CheckScore, DecisionBackend, ModelTruncatedError, TextBackend
 from probe.config import (
     ProbeConfig,
+    is_no_halt,
     is_no_pdb,
     is_skip_lock,
     load_config,
@@ -46,7 +47,7 @@ class ProbeType(StrEnum):
     text = "text"
 
 
-class ProbeHaltError(RuntimeError):
+class ProbeHaltError(BaseException):
     """Raised when a probe fails, triggers PROBE_MISUSE, or lacks lock approval."""
 
 
@@ -305,9 +306,14 @@ class ProbeRuntime:
 
         self._state_lock = threading.Lock()
         self._tripped = False
+        self._had_failure = False
         self._halt_reason = ""
         self._closed = False
         self._atexit_registered = False
+
+    def should_halt_on_fail(self) -> bool:
+        """Return False when PROBE_NO_HALT=1 or [runtime].halt_on_fail=false runs in audit mode."""
+        return self.config.runtime.halt_on_fail and not is_no_halt(self.cwd)
 
     @property
     def is_tripped(self) -> bool:
@@ -432,14 +438,17 @@ class ProbeRuntime:
         file_line: str,
         payload_json: str,
         caller_frame: FrameType | None = None,
-    ) -> bool:
-        """Enforce sliding-window and optional per-run caps; trip PROBE_MISUSE before calling models."""
+    ) -> tuple[bool, bool]:
+        """Enforce sliding-window and optional per-run caps; return (entered_pdb, skip_grading)."""
         rl = self.config.rate_limit
         now = time.monotonic()
         breach_reason: str | None = None
+        halt_enabled = self.should_halt_on_fail()
 
         with self._rate_lock:
             if probe_id in self._tripped_probes:
+                if not halt_enabled:
+                    return False, True
                 breach_reason = f"PROBE_MISUSE: circuit breaker already tripped for '{probe_id}'"
             else:
                 window = self._call_windows.setdefault(probe_id, collections.deque())
@@ -465,22 +474,51 @@ class ProbeRuntime:
                     )
 
         if breach_reason is not None:
-            return self._record_and_halt_error(
-                probe_id=probe_id,
-                probe_type=probe_type,
-                checks=checks,
+            if halt_enabled:
+                entered = self._record_and_halt_error(
+                    probe_id=probe_id,
+                    probe_type=probe_type,
+                    checks=checks,
+                    call_seq=call_seq,
+                    elapsed_ms=elapsed_ms,
+                    started_at=started_at,
+                    site=site,
+                    file_line=file_line,
+                    payload_json=payload_json,
+                    error_code="PROBE_MISUSE",
+                    analysis=breach_reason,
+                    stack_excerpt=_short_stack_excerpt(caller_frame),
+                    caller_frame=caller_frame,
+                )
+                return entered, True
+            with self._state_lock:
+                self._had_failure = True
+            self.store.insert_event(
+                run_id=self.run_id,
                 call_seq=call_seq,
                 elapsed_ms=elapsed_ms,
                 started_at=started_at,
+                probe_id=probe_id,
                 site=site,
+                probe_type=probe_type.value,
                 file_line=file_line,
+                checks=checks,
                 payload_json=payload_json,
+                check_scores=(),
+                verdict="error",
                 error_code="PROBE_MISUSE",
-                analysis=breach_reason,
+                text_analysis=breach_reason,
                 stack_excerpt=_short_stack_excerpt(caller_frame),
-                caller_frame=caller_frame,
+                latency_ms=0.0,
             )
-        return False
+            print(
+                f"[PROBE ERROR] call #{call_seq:03d} {probe_id} ({file_line}): "
+                f"{breach_reason} (further calls to '{probe_id}' skipped)",
+                file=sys.stderr,
+                flush=True,
+            )
+            return False, True
+        return False, False
 
     def _record_and_halt_error(
         self,
@@ -499,6 +537,8 @@ class ProbeRuntime:
         stack_excerpt: str,
         caller_frame: FrameType | None,
     ) -> bool:
+        with self._state_lock:
+            self._had_failure = True
         self.store.insert_event(
             run_id=self.run_id,
             call_seq=call_seq,
@@ -695,11 +735,16 @@ class ProbeRuntime:
             latency_ms=graded.latency_ms,
         )
 
-        should_halt = (
+        if graded.verdict in {"fail", "error"}:
+            with self._state_lock:
+                self._had_failure = True
+
+        would_halt = (
             graded.verdict == "fail"
             or graded.error_code == "PROBE_TRUNCATED"
             or (graded.verdict == "error" and self.config.runtime.strict_api)
         )
+        should_halt = would_halt and self.should_halt_on_fail()
         if should_halt:
             if graded.verdict == "fail":
                 failed = [s.check for s in graded.scores if not s.passed]
@@ -715,6 +760,14 @@ class ProbeRuntime:
                 file_line=graded.file_line,
                 summary=reason,
                 caller_frame=caller_frame,
+            )
+        elif graded.verdict == "fail":
+            failed = [s.check for s in graded.scores if not s.passed]
+            reason = f"Check(s) failed: {'; '.join(failed)}"
+            print(
+                f"[PROBE FAIL] call #{call_seq:03d} {graded.probe_id} ({graded.file_line}): {reason}",
+                file=sys.stderr,
+                flush=True,
             )
         elif graded.verdict == "error":
             err_detail = graded.analysis_text or graded.error_code or "Backend error"
@@ -805,6 +858,7 @@ class ProbeRuntime:
                 return
             self._closed = True
             tripped = self._tripped
+            had_failure = self._had_failure
             atexit_was_registered = self._atexit_registered
             self._atexit_registered = False
 
@@ -815,7 +869,7 @@ class ProbeRuntime:
             if not tripped:
                 self.store.finish_run(
                     self.run_id,
-                    status="completed",
+                    status="failed" if had_failure else "completed",
                     finished_at=utc_now_iso(),
                 )
         finally:

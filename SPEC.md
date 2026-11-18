@@ -72,7 +72,7 @@ Waitpoints and decorators can also be suppressed inside targeted blocks (such as
 with probe.disabled():  # or `from probe import disabled`
     ...
 ```
-*(Overrides `PROBES=1` inside the active async/thread context without mutating environment variables.)*
+*(Overrides `PROBES=1` across worker threads via `scope="process"` by default; pass `scope="context"` to scope to the active `ContextVar` without mutating environment variables.)*
 
 ### 2.3 `probe.here` Watchpoint
 
@@ -158,18 +158,20 @@ Every probe ends at `[models.decision]` and produces either `pass` or `fail` (pl
 | Verdict | Stored In Report | Runtime Effect |
 |---|---|---|
 | `pass` | Counted in summary; shown in `--all` and `probe log` | Continues normally |
-| `fail` | Shown in `probe report` with per-check `p` and text analysis | **Halts execution (§3.5)** |
-| `error` | Shown in `probe report` | `PROBE_MISUSE`, `PROBE_TRUNCATED`, and (with default `strict_api = true`) `BACKEND_ERROR` **halt execution**; when `strict_api = false`, backend HTTP errors print `[PROBE ERROR]` to `stderr` and log `error` |
+| `fail` | Shown in `probe report` with per-check `p` and text analysis | **Halts execution (§3.5)** unless `PROBE_NO_HALT=1` / `halt_on_fail = false` (soak mode) |
+| `error` | Shown in `probe report` | `PROBE_MISUSE`, `PROBE_TRUNCATED`, and (with default `strict_api = true`) `BACKEND_ERROR` **halt execution**; with `PROBE_NO_HALT=1` / `halt_on_fail = false` (or `strict_api = false` for non-truncation `BACKEND_ERROR`), prints to `stderr`, records `error` (`PROBE_MISUSE` still skips repeat calls for that probe), and marks the run `failed` |
 
-### 3.5 Execution Halt
+### 3.5 Execution Halt (and `PROBE_NO_HALT=1` Soak Mode)
 
-When a probe produces `fail` or `PROBE_MISUSE`:
+By default, when a probe produces `fail`, `PROBE_MISUSE`, `PROBE_TRUNCATED`, or (with `strict_api = true`) `BACKEND_ERROR`:
 
 1. Flush the full event record (`call_seq`, `probe_id`, `probe_type`, `file_line`, redacted payload, per-check scores, `text_analysis`, `stack_excerpt`) to `.probes/runs/<run_id>.jsonl`, mark the run `halted`, and print `[PROBE HALT]` to `stderr`.
-2. Set a global `tripped` flag so any further probe call raises `ProbeHaltError`.
+2. Set a global `tripped` flag so any further probe call raises `ProbeHaltError` *(a `BaseException` subclass, like `KeyboardInterrupt` and `bdb.BdbQuit`, so application `except Exception:` retry/fallback blocks cannot swallow probe halts while `finally:` blocks still run)*.
 3. Stop directly on the active caller stack frame:
    - In an interactive TTY (`sys.stdin.isatty()` and `sys.stdout.isatty()`, unless `PROBE_NO_PDB=1`), invoke `pdb.Pdb().set_trace(caller_frame)` so locals can be inspected right before the function returns.
    - Otherwise raise `ProbeHaltError`.
+
+When `PROBE_NO_HALT=1` or `[runtime].halt_on_fail = false` is set (soak / multi-turn eval mode), `fail` and error events print `[PROBE FAIL]` / `[PROBE ERROR]` to `stderr`, `PROBE_MISUSE` trips the per-probe circuit breaker without halting the rest of the run, the run finishes with status `"failed"`, and `probe report --check` exits `1`.
 
 ---
 
@@ -180,7 +182,7 @@ Probes must pass `probe check` before running (and whenever checks, `kind`, or t
 1. **Static AST scan:** Extracts `@probe(...)` and `probe.here(...)` calls, signatures, and bodies without importing project modules.
 2. **Gate 1 — Budgets & structure:** Checks for duplicate `probe_id`s, `len(checks) <= max_checks` (default `5`), and `len(check) <= max_check_chars` (default `200`).
 3. **Gate 2 — Assert vs. prose audit (`[models.text]` + `[models.decision]`):** `[models.text]` describes factually what each check inspects at runtime, and `[models.decision]` scores the Gate 2 `noul` propositions—rejecting checks that belong as regular Python `assert`s or regexes (math, null checks, regex matches, type/length checks), vague unfalsifiable filler, or checks requiring uncaptured external state.
-4. **Gate 3 — Dry-run calibration:** Skipped when `(probe_id, site, kind, watched_keys, param_names)` and combined `(checks, source, threshold, domain_context, manual fixture)` hashes are unchanged in `.probes/lock.json` (unless `--force`). Uses fixtures from `.probes/fixtures/<probe_id>.json` if present, or asks `[models.text]` for one passing and one failing sample matching the signature (retrying synthetic synthesis up to 1x on transient shape/calibration failures), then verifies the configured evaluator scores the valid sample `pass` and the broken sample `fail`.
+4. **Gate 3 — Dry-run calibration:** Skipped when `(probe_id, site, kind, watched_keys, param_names)` and combined `(checks, source, threshold, domain_context, manual fixture)` hashes are unchanged in `.probes/lock.json` (unless `--force`). For `@probe`, `source_hash` hashes `(signature, docstring)` so editing internal statements/logging does not invalidate `lock.json`; for `probe.here`, `source_hash` hashes `(enclosing_signature, watched_keys)`. Uncached probes run Gates 2–3 in bounded parallel (`[check].max_workers`, default `4`) while returning deterministic order. Uses fixtures from `.probes/fixtures/<probe_id>.json` if present, or asks `[models.text]` for one passing and one failing sample matching the signature (retrying synthetic synthesis up to 1x on transient shape/calibration failures), then verifies the configured evaluator scores the valid sample `pass` and the broken sample `fail`.
 
 ---
 
@@ -192,7 +194,7 @@ Per-run JSONL files (`.probes/runs/<run_id>.jsonl`) are append-only plain text; 
 |---|---|
 | `probe check [paths...]` | Run Gates 1–3 on new or changed probes and update `.probes/lock.json` (`--force`, `--json`). |
 | `probe list [paths...]` | List probes (`id`, `file:line`, `kind`, lock status, `checks`). |
-| `probe report` | Print call-ordered summary of the latest run (`--run <id>`, `--all`, `--format text\|md\|json`). |
+| `probe report` | Print call-ordered summary of the latest run (`--run <id>`, `--all`, `--format text\|md\|json`, `--check`). |
 | `probe log <probe_id>...` | Interleave detailed chronological entries (`call_seq ASC`) for one or more probe IDs / glob patterns (e.g., `probe log tutor.opening_turn rag.*`). |
 | `probe runs` | List recent runs with timestamps, command, verdict counts, and status. |
 | `probe clean [--keep N]` | Prune older run logs from `.probes/runs` (default keeps last `20`). |
@@ -287,6 +289,7 @@ max_calls_per_run = -1           # -1 = unlimited; set >= 0 for a per-run hard c
 max_checks = 5
 max_check_chars = 200
 require_check = true
+max_workers = 4
 
 [redact]
 env_files = [".env"]             # Dotenv files scanned for secret values (in addition to cwd .env*)
@@ -296,6 +299,7 @@ extra_keys = []                  # Additional argument/dict key names to mask
 runs_dir = ".probes/runs"
 lock_path = ".probes/lock.json"
 strict_api = true                # Halt on BACKEND_ERROR; set false for stderr warning + non-halting log
+halt_on_fail = true              # Set false (or PROBE_NO_HALT=1) for non-halting soak/eval runs
 ```
 
 **Environment flags (shell env or `.env`):**
@@ -303,6 +307,7 @@ strict_api = true                # Halt on BACKEND_ERROR; set false for stderr w
 - `PROBE_CONFIG`: Optional path override for `config.toml`
 - `PROBE_SKIP_LOCK`: `1` to bypass `.probes/lock.json` during rapid local edits
 - `PROBE_NO_PDB`: `1` to always raise `ProbeHaltError` instead of opening `pdb` in interactive terminals
+- `PROBE_NO_HALT`: `1` to record all fail/error events across a soak run without halting mid-run (pair with `probe report --check`)
 - `PROBE_TRUST_PROJECT_ENDPOINTS`: `1` to allow project `pyproject.toml` to redirect remote model endpoint origins configured in user `config.toml`
 
 ### 6.2 Per-Run JSONL Log Format (`.probes/runs/<run_id>.jsonl`)
@@ -310,8 +315,8 @@ strict_api = true                # Halt on BACKEND_ERROR; set false for stderr w
 Each run writes one plain-text JSON Lines file named `<run_id>.jsonl` (`ULID`), sorted chronologically by filename and containing three record types (`"type"`):
 
 - **`run_start`**: `id` (ULID), `started_at`, `cmd`, `pid`, `status` (`"running"`), `decision_model`, `text_model`
-- **`event`**: `run_id`, `call_seq`, `elapsed_ms`, `started_at`, `probe_id`, `site` (`decorator` | `here`), `probe_type` (`decision` | `text`), `file_line`, `checks`, `payload` (redacted snapshot object), `check_scores` (array of `{check, probability, passed}`), `verdict` (`pass` | `fail` | `error`), `error_code` (`PROBE_MISUSE` | ...), `text_analysis`, `stack_excerpt`, `judged_at`, `latency_ms`
-- **`run_finish`**: `id`, `status` (`completed` | `halted`), `finished_at`, `halt_call_seq`
+- **`event`**: `run_id`, `call_seq`, `elapsed_ms`, `started_at`, `probe_id`, `site` (`decorator` | `here`), `probe_type` (`decision` | `text`), `file_line`, `checks`, `payload` (redacted snapshot object), `check_scores` (array of `{check, probability, passed}`), `verdict` (`pass` | `fail` | `error`), `error_code` (`PROBE_MISUSE` | `PROBE_TRUNCATED` | `BACKEND_ERROR` | ...), `text_analysis`, `stack_excerpt`, `judged_at`, `latency_ms`
+- **`run_finish`**: `id`, `status` (`completed` | `failed` | `halted`), `finished_at`, `halt_call_seq`
 
 Readers sort events per run by `call_seq ASC` and inspect runs directly via `probe report` / `probe log` (or `jq` / `tail -f`).
 

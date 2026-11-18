@@ -29,15 +29,15 @@ Both roles are configured once in `config.toml` and can point at cloud APIs or l
 From a GitHub Release wheel (recommended in containers/CI — no `git` binary required):
 
 ```sh
-uv tool install https://github.com/celtiberi/probe/releases/download/v0.2.1/probe-0.2.1-py3-none-any.whl
+uv tool install https://github.com/celtiberi/probe/releases/download/v0.3.0/probe-0.3.0-py3-none-any.whl
 ```
 
 In a project virtual environment (wheel or git):
 
 ```sh
-uv add https://github.com/celtiberi/probe/releases/download/v0.2.1/probe-0.2.1-py3-none-any.whl
+uv add https://github.com/celtiberi/probe/releases/download/v0.3.0/probe-0.3.0-py3-none-any.whl
 # or via pip:
-# pip install https://github.com/celtiberi/probe/releases/download/v0.2.1/probe-0.2.1-py3-none-any.whl
+# pip install https://github.com/celtiberi/probe/releases/download/v0.3.0/probe-0.3.0-py3-none-any.whl
 # or from git main:
 # uv add git+https://github.com/celtiberi/probe.git
 ```
@@ -95,12 +95,15 @@ PROBES=1 PROBE_NO_PDB=1 pytest
 
 To skip `.probes/lock.json` enforcement during quick local iteration, set `PROBE_SKIP_LOCK=1`. Setting `PROBES=""` or `PROBES=0` in the shell overrides `PROBES=1` in `.env`.
 
-To temporarily suppress probes inside mocked unit tests when `PROBES=1` is set globally, use `with probe.disabled():` (or `from probe import disabled`).
+To run multi-turn simulations or soak tests without stopping on the first failure, set `PROBE_NO_HALT=1` (or `[runtime].halt_on_fail = false`) and run `probe report --check` at the end to inspect failures and exit `1` if any probe failed.
+
+To temporarily suppress probes inside mocked unit tests (including code using worker threads) when `PROBES=1` is set globally, use `with probe.disabled():` (or `from probe import disabled`).
 
 4. Inspect results in call-entry order (works while a server is running too, via per-run JSONL logs):
 
 ```sh
 probe report --all
+probe report --check
 probe log tutor.opening_turn rag.*
 probe runs
 ```
@@ -111,7 +114,7 @@ probe runs
 |---|---|
 | `probe check [paths...]` | Audit checks (Gate 1–2), run pass/fail calibration (Gate 3), and update `.probes/lock.json`. |
 | `probe list [paths...]` | List discovered `@probe` and `probe.here` sites with lock status. |
-| `probe report [--run ID] [--all]` | Show call-ordered summary of failures/errors (or all events with `--all`). |
+| `probe report [--run ID] [--all] [--check]` | Show call-ordered summary of failures/errors (or all events with `--all`); exit `1` on failures with `--check`. |
 | `probe log <probe_id>... [--payload]` | Interleave chronological events across one or more probe IDs or globs. |
 | `probe runs` | List recorded runs and pass/fail/error counts. |
 | `probe clean [--keep N]` | Prune older run logs from `.probes/runs` (default keeps last 20). |
@@ -159,6 +162,7 @@ max_calls_per_run = -1
 max_checks = 5
 max_check_chars = 200
 require_check = true
+max_workers = 4
 
 [redact]
 env_files = [".env"]
@@ -168,6 +172,7 @@ extra_keys = []
 runs_dir = ".probes/runs"
 lock_path = ".probes/lock.json"
 strict_api = true
+halt_on_fail = true
 ```
 
 ## License

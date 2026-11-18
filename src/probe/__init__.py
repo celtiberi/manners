@@ -21,6 +21,8 @@ from probe.config import (
     _DISABLED_CTX,
     ProbeConfig,
     clear_env_cache,
+    enter_process_disabled,
+    exit_process_disabled,
     is_probes_enabled,
     load_config,
     reset_config_locks_after_fork,
@@ -107,7 +109,7 @@ def _prepare_decorator_call(
     probe_id: str | None,
     probe_type: ProbeType,
     caller_frame: FrameType | None,
-) -> tuple[ProbeRuntime, str, str, int, float, str, dict[str, Any]]:
+) -> tuple[ProbeRuntime, str, str, int, float, str, dict[str, Any], bool]:
     """Validate lock & rate limits and snapshot inputs BEFORE calling wrapped `fn`."""
     rt = _get_runtime()
     rt.ensure_not_tripped()
@@ -141,7 +143,7 @@ def _prepare_decorator_call(
     )
     if entered_pdb_lock or rt.is_tripped:
         raise ProbeHaltError(rt._halt_reason or "Probe halted before target call")
-    entered_pdb_rate = rt.check_rate_limit(
+    entered_pdb_rate, skip_grading = rt.check_rate_limit(
         probe_id=resolved_id,
         probe_type=probe_type,
         checks=checks,
@@ -155,7 +157,7 @@ def _prepare_decorator_call(
     )
     if entered_pdb_rate or rt.is_tripped:
         raise ProbeHaltError(rt._halt_reason or "Probe halted before target call")
-    return rt, resolved_id, file_line, call_seq, elapsed_ms, started_at, inputs_data
+    return rt, resolved_id, file_line, call_seq, elapsed_ms, started_at, inputs_data, skip_grading
 
 
 def _wrap_sync_fn(
@@ -175,15 +177,19 @@ def _wrap_sync_fn(
         del frame
 
         try:
-            rt, resolved_id, file_line, call_seq, elapsed_ms, started_at, inputs_data = _prepare_decorator_call(
-                fn,
-                args,
-                kwargs,
-                checks=checks,
-                probe_id=probe_id,
-                probe_type=probe_type,
-                caller_frame=caller_frame,
+            rt, resolved_id, file_line, call_seq, elapsed_ms, started_at, inputs_data, skip_grading = (
+                _prepare_decorator_call(
+                    fn,
+                    args,
+                    kwargs,
+                    checks=checks,
+                    probe_id=probe_id,
+                    probe_type=probe_type,
+                    caller_frame=caller_frame,
+                )
             )
+            if skip_grading:
+                return fn(*args, **kwargs)
 
             try:
                 result = fn(*args, **kwargs)
@@ -251,17 +257,22 @@ def _wrap_async_fn(
         del frame
 
         try:
-            rt, resolved_id, file_line, call_seq, elapsed_ms, started_at, inputs_data = _prepare_decorator_call(
-                fn,
-                args,
-                kwargs,
-                checks=checks,
-                probe_id=probe_id,
-                probe_type=probe_type,
-                caller_frame=caller_frame,
+            rt, resolved_id, file_line, call_seq, elapsed_ms, started_at, inputs_data, skip_grading = (
+                _prepare_decorator_call(
+                    fn,
+                    args,
+                    kwargs,
+                    checks=checks,
+                    probe_id=probe_id,
+                    probe_type=probe_type,
+                    caller_frame=caller_frame,
+                )
             )
         finally:
             del caller_frame
+
+        if skip_grading:
+            return await fn(*args, **kwargs)
 
         try:
             result = await fn(*args, **kwargs)
@@ -437,7 +448,7 @@ class _ProbeAPI:
             if entered_pdb_lock:
                 return
             rt.ensure_not_tripped()
-            entered_pdb_rate = rt.check_rate_limit(
+            entered_pdb_rate, skip_grading = rt.check_rate_limit(
                 probe_id=resolved_id,
                 probe_type=norm_kind,
                 checks=norm_checks,
@@ -449,7 +460,7 @@ class _ProbeAPI:
                 payload_json=payload_json,
                 caller_frame=caller_frame,
             )
-            if entered_pdb_rate:
+            if entered_pdb_rate or skip_grading:
                 return
             rt.ensure_not_tripped()
             rt.evaluate_event(
@@ -469,13 +480,23 @@ class _ProbeAPI:
 
     @staticmethod
     @contextlib.contextmanager
-    def disabled() -> Iterator[None]:
-        """Temporarily suppress @probe and probe.here instrumentation in the current context."""
-        token = _DISABLED_CTX.set(True)
-        try:
-            yield
-        finally:
-            _DISABLED_CTX.reset(token)
+    def disabled(scope: str = "process") -> Iterator[None]:
+        """Temporarily suppress @probe and probe.here ('process' covers threads; 'context' is ContextVar-local)."""
+        norm_scope = scope.strip().lower()
+        if norm_scope == "process":
+            enter_process_disabled()
+            try:
+                yield
+            finally:
+                exit_process_disabled()
+        elif norm_scope == "context":
+            token = _DISABLED_CTX.set(True)
+            try:
+                yield
+            finally:
+                _DISABLED_CTX.reset(token)
+        else:
+            raise ValueError(f"Invalid disabled scope {scope!r}: expected 'process' or 'context'")
 
     @staticmethod
     def reset_for_testing(

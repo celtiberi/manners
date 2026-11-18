@@ -179,6 +179,14 @@ def _peek_run_start(path: Path) -> str | None:
     return None
 
 
+_STATUS_PRIORITY: dict[str, int] = {
+    "running": 0,
+    "completed": 1,
+    "failed": 2,
+    "halted": 3,
+}
+
+
 def _read_run_file(path: Path) -> tuple[RunRecord | None, list[EventRecord]]:
     if not path.is_file():
         return None, []
@@ -224,7 +232,7 @@ def _read_run_file(path: Path) -> tuple[RunRecord | None, list[EventRecord]]:
                     new_status = rec.get("status")
                     if new_status:
                         new_status_str = str(new_status)
-                        if status != "halted" or new_status_str == "halted":
+                        if _STATUS_PRIORITY.get(new_status_str, 1) >= _STATUS_PRIORITY.get(status, 0):
                             status = new_status_str
                     if rec.get("finished_at"):
                         finished_at = str(rec["finished_at"])

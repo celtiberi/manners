@@ -36,7 +36,7 @@ _LEGACY_JEV_MODELS = frozenset({"", "jev", "typesafe-ai/jev"})
 _RETRY_STATUS_CODES = frozenset({429, 500, 502, 503, 504, 529})
 _MAX_HTTP_ATTEMPTS = 2
 _RETRY_BACKOFF_S = 0.4
-_USER_AGENT = "probe/0.2"
+_USER_AGENT = "probe/0.3"
 
 
 class BackendError(RuntimeError):
