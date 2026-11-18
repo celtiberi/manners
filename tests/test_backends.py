@@ -22,6 +22,7 @@ def test_strip_thinking_and_extract_json() -> None:
 
 
 def test_typesafe_jev_systemone_dialect_and_dotenv_key_resolution(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("PROBE_CONFIG", str(tmp_path / "no_user_config.toml"))
     monkeypatch.delenv("TYPESAFE_API_KEY", raising=False)
     monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
     (tmp_path / ".env").write_text(
@@ -134,10 +135,10 @@ def test_http_decision_provider_and_api_key_header(monkeypatch) -> None:
 def test_logprob_bool_provider_and_missing_logprob_fallback() -> None:
     lp_yes = math.log(0.80)
     lp_no = math.log(0.20)
-    calls = {"n": 0}
+    seen_payloads: list[dict] = []
 
     def handler_logprob(request: httpx.Request) -> httpx.Response:
-        calls["n"] += 1
+        seen_payloads.append(json.loads(request.content.decode("utf-8")))
         return httpx.Response(
             200,
             json={
@@ -180,6 +181,7 @@ def test_logprob_bool_provider_and_missing_logprob_fallback() -> None:
     assert len(scores) == 1
     assert scores[0].passed is True
     assert abs(scores[0].probability - 0.80) < 1e-3
+    assert seen_payloads[0]["reasoning_effort"] == "none"
 
     # Fallback when server returns choices without logprobs.
     def handler_fallback(request: httpx.Request) -> httpx.Response:

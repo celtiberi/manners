@@ -1,4 +1,4 @@
-"""Live end-to-end integration tests against TypeSafe Jev (/v1/systemone) and DeepSeek / Gemini."""
+"""Live end-to-end integration tests against TypeSafe Jev, DeepSeek/Gemini, and local Qwen via Ollama."""
 
 from __future__ import annotations
 
@@ -28,6 +28,8 @@ from probe.store import ProbeStore
 PROBE_ROOT = Path(__file__).resolve().parents[1]
 PROBE_DOTENV = PROBE_ROOT / ".env"
 
+pytestmark = pytest.mark.live
+
 
 def _resolve_live_keys() -> tuple[str, str, str]:
     ts = os.environ.get("TYPESAFE_API_KEY", "").strip()
@@ -43,6 +45,7 @@ def _resolve_live_keys() -> tuple[str, str, str]:
 _TYPESAFE_KEY, _DEEPSEEK_KEY, _GEMINI_KEY = _resolve_live_keys()
 _HAS_LIVE_KEYS = bool(_TYPESAFE_KEY and (_DEEPSEEK_KEY or _GEMINI_KEY))
 _DEEPSEEK_CHECK_CACHE: bool | None = None
+_LOCAL_QWEN_CACHE: bool | None = None
 
 
 def _deepseek_has_balance() -> bool:
@@ -72,13 +75,21 @@ def _deepseek_has_balance() -> bool:
     return _DEEPSEEK_CHECK_CACHE
 
 
-pytestmark = [
-    pytest.mark.live,
-    pytest.mark.skipif(
-        not _HAS_LIVE_KEYS,
-        reason="Requires TYPESAFE_API_KEY and (DEEPSEEK_API_KEY or GEMINI_API_KEY) in env or probe/.env",
-    ),
-]
+def _has_local_qwen() -> bool:
+    global _LOCAL_QWEN_CACHE
+    if _LOCAL_QWEN_CACHE is not None:
+        return _LOCAL_QWEN_CACHE
+    try:
+        resp = httpx.get("http://127.0.0.1:11434/api/tags", timeout=2.0)
+        resp.raise_for_status()
+        models = resp.json().get("models", [])
+        _LOCAL_QWEN_CACHE = any(
+            isinstance(m, dict) and str(m.get("name", "")).startswith("qwen3.5:9b")
+            for m in models
+        )
+    except Exception:
+        _LOCAL_QWEN_CACHE = False
+    return _LOCAL_QWEN_CACHE
 
 
 def _seed_live_project_config(tmp_path: Path, *, skip_lock_require: bool = False) -> ProbeConfig:
@@ -119,7 +130,12 @@ def _seed_live_project_config(tmp_path: Path, *, skip_lock_require: bool = False
     return cfg
 
 
-def test_live_typesafe_jev_spanish_tutor_checks(monkeypatch) -> None:
+@pytest.mark.skipif(
+    not _HAS_LIVE_KEYS,
+    reason="Requires TYPESAFE_API_KEY and (DEEPSEEK_API_KEY or GEMINI_API_KEY) in env or probe/.env",
+)
+def test_live_typesafe_jev_spanish_tutor_checks(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("PROBE_CONFIG", str(tmp_path / "no_user_config.toml"))
     monkeypatch.delenv("TYPESAFE_API_KEY", raising=False)
     monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
     cfg = load_config(cwd=PROBE_ROOT)
@@ -172,9 +188,14 @@ def test_live_typesafe_jev_spanish_tutor_checks(monkeypatch) -> None:
         backend.close()
 
 
+@pytest.mark.skipif(
+    not _HAS_LIVE_KEYS,
+    reason="Requires TYPESAFE_API_KEY and (DEEPSEEK_API_KEY or GEMINI_API_KEY) in env or probe/.env",
+)
 def test_live_probe_check_gates_reject_math_and_calibrate_semantic_probe(
     tmp_path: Path, monkeypatch
 ) -> None:
+    monkeypatch.setenv("PROBE_CONFIG", str(tmp_path / "no_user_config.toml"))
     monkeypatch.delenv("TYPESAFE_API_KEY", raising=False)
     monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
     monkeypatch.delenv("GEMINI_API_KEY", raising=False)
@@ -232,9 +253,14 @@ def test_live_probe_check_gates_reject_math_and_calibrate_semantic_probe(
     assert cfg.resolve_lock_path().is_file()
 
 
+@pytest.mark.skipif(
+    not _HAS_LIVE_KEYS,
+    reason="Requires TYPESAFE_API_KEY and (DEEPSEEK_API_KEY or GEMINI_API_KEY) in env or probe/.env",
+)
 def test_live_runtime_decision_text_redaction_and_cli_report(
     tmp_path: Path, monkeypatch
 ) -> None:
+    monkeypatch.setenv("PROBE_CONFIG", str(tmp_path / "no_user_config.toml"))
     monkeypatch.setenv("PROBES", "1")
     monkeypatch.setenv("PROBE_NO_PDB", "1")
     monkeypatch.setenv("PROBE_SKIP_LOCK", "1")
@@ -326,3 +352,141 @@ def test_live_runtime_decision_text_redaction_and_cli_report(
     assert "tutor.live_turn" in log_res.stdout
     assert "rag.live_draft" in log_res.stdout
     assert "tutor.live_fail" in log_res.stdout
+
+
+@pytest.mark.skipif(
+    not _has_local_qwen(),
+    reason="Requires local Ollama at http://127.0.0.1:11434 with qwen3.5:9b",
+)
+def test_live_local_qwen_full_pipeline(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("PROBE_CONFIG", str(tmp_path / "no_user_config.toml"))
+    monkeypatch.setenv("PROBES", "1")
+    monkeypatch.setenv("PROBE_NO_PDB", "1")
+    monkeypatch.setenv("PROBE_SKIP_LOCK", "1")
+    monkeypatch.chdir(tmp_path)
+
+    (tmp_path / "pyproject.toml").write_text(
+        "[project]\nname = 'local-qwen-check'\nversion = '0.1.0'\n",
+        encoding="utf-8",
+    )
+    cfg = load_config(cwd=tmp_path)
+    cfg.models_decision = ModelEndpointConfig(
+        provider="logprob_bool",
+        url="http://127.0.0.1:11434/v1",
+        model="qwen3.5:9b",
+        timeout_s=60.0,
+    )
+    cfg.models_text = ModelEndpointConfig(
+        provider="openai_compat",
+        url="http://127.0.0.1:11434/v1",
+        model="qwen3.5:9b",
+        timeout_s=60.0,
+    )
+    cfg.check = CheckConfig(require_check=False)
+    cfg.runtime = RuntimeConfig(
+        db_path=str(tmp_path / ".probes" / "probes.db"),
+        lock_path=str(tmp_path / ".probes" / "lock.json"),
+    )
+
+    # 1. Pre-run check: Gate 2 rejects math check; Gates 2-3 pass and calibrate semantic probe.
+    src_dir = tmp_path / "app"
+    src_dir.mkdir(parents=True)
+    (src_dir / "__init__.py").write_text("", encoding="utf-8")
+    target = src_dir / "tutor.py"
+
+    target.write_text(
+        textwrap.dedent(
+            """
+            from probe import probe
+
+            @probe("Return value equals a + b", id="math.add")
+            def add(a: int, b: int) -> int:
+                return a + b
+            """
+        ).strip()
+        + "\n",
+        encoding="utf-8",
+    )
+    ok_math, res_math = run_probe_check([target], config=cfg)
+    assert ok_math is False
+    assert res_math[0].gate == "gate2"
+
+    target.write_text(
+        textwrap.dedent(
+            """
+            from probe import probe
+
+            @probe(
+                [
+                    "Tutor opens with a short Spanish greeting or phrase",
+                    "Tutor prompts student to respond in Spanish without spoiling the exact sentence",
+                ],
+                id="tutor.opening_turn",
+            )
+            def generate_opening_turn(lesson: str) -> str:
+                \"\"\"Generate a brief introductory Spanish tutoring turn.\"\"\"
+                return ""
+            """
+        ).strip()
+        + "\n",
+        encoding="utf-8",
+    )
+    ok_sem, res_sem = run_probe_check([target], config=cfg)
+    assert ok_sem is True, f"Local qwen3.5:9b calibration failed: {res_sem}"
+    assert res_sem[0].status == "passed"
+    assert cfg.resolve_lock_path().is_file()
+
+    # 2. Live runtime: decision pass, text pipeline pass, and decision spoiler halt with explanation.
+    reset_for_testing(config=cfg)
+
+    @probe(
+        [
+            "Output opens with a short Spanish greeting",
+            "Output asks the student to order in Spanish",
+        ],
+        id="tutor.local_pass",
+        kind=probe.type.decision,
+    )
+    def local_good_turn(topic: str) -> str:
+        return (
+            "¡Hola! When ordering breakfast, you can begin politely with 'Quisiera...'. "
+            "Now try asking for eggs and coffee in Spanish!"
+        )
+
+    try:
+        assert "¡Hola!" in local_good_turn("breakfast")
+
+        probe.here(
+            ["Draft states that tier B is excluded instead of saying tier B qualifies"],
+            id="rag.local_draft",
+            kind=probe.type.text,
+            retrieved_chunks=["Policy rule: Tier A qualifies for reimbursement; Tier B is excluded."],
+            draft="Tier B is excluded from reimbursement under this policy.",
+        )
+
+        @probe(
+            ["Tutor does NOT give away the exact complete Spanish sentence for the student to say"],
+            id="tutor.local_fail",
+            kind=probe.type.decision,
+        )
+        def local_bad_turn(topic: str) -> str:
+            return "¡Hola! Say this exact Spanish sentence verbatim: Quiero un café con leche por favor."
+
+        with pytest.raises(ProbeHaltError):
+            local_bad_turn("coffee")
+    finally:
+        rt = probe.flush_for_testing()
+        reset_for_testing()
+
+    assert rt is not None
+    store = ProbeStore(cfg.resolve_db_path(), create=False)
+    try:
+        run = store.get_run(rt.run_id)
+        events = store.list_events(rt.run_id)
+    finally:
+        store.close()
+
+    assert run is not None and run.status == "halted" and run.halt_call_seq == 3
+    assert [(e.call_seq, e.verdict) for e in events] == [(1, "pass"), (2, "pass"), (3, "fail")]
+    assert events[1].text_analysis
+    assert events[2].text_analysis

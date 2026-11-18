@@ -137,7 +137,12 @@ def _apply_reasoning_effort(
     url: str,
 ) -> None:
     effort = (endpoint.reasoning_effort or "").strip()
-    if not effort and "generativelanguage.googleapis.com" in url.lower():
+    if effort.lower() == "off":
+        return
+    if not effort and (
+        "generativelanguage.googleapis.com" in url.lower()
+        or "qwen3" in (endpoint.model or "").lower()
+    ):
         effort = "none"
     if effort:
         payload["reasoning_effort"] = effort
@@ -194,7 +199,10 @@ class DecisionBackend:
     ) -> None:
         self.endpoint = endpoint
         self.pass_threshold = (decision_cfg or DecisionConfig()).pass_threshold
-        self._client = httpx.Client(timeout=endpoint.timeout_s, transport=transport)
+        self._client = httpx.Client(
+            timeout=httpx.Timeout(endpoint.timeout_s, connect=10.0),
+            transport=transport,
+        )
         self._onnx_session: Any = None
         self._onnx_tokenizer: Any = None
 
@@ -356,17 +364,16 @@ class DecisionBackend:
                     "content": _format_eval_context(probe_id, check, snapshot_json, analysis),
                 },
             ]
-            data = self._post_json(
-                url,
-                {
-                    "model": self.endpoint.model,
-                    "messages": messages,
-                    "temperature": 0.0,
-                    "max_tokens": 3,
-                    "logprobs": True,
-                    "top_logprobs": 5,
-                },
-            )
+            req_payload: dict[str, Any] = {
+                "model": self.endpoint.model,
+                "messages": messages,
+                "temperature": 0.0,
+                "max_tokens": 3,
+                "logprobs": True,
+                "top_logprobs": 5,
+            }
+            _apply_reasoning_effort(req_payload, self.endpoint, url)
+            data = self._post_json(url, req_payload)
             p = _extract_yes_no_logprob(data)
             if p is None:
                 # Server/model omitted logprobs; fall back cleanly to JSON probability scoring for remaining checks.
@@ -488,7 +495,10 @@ class TextBackend:
     ) -> None:
         self.endpoint = endpoint
         self.text_cfg = text_cfg or TextConfig()
-        self._client = httpx.Client(timeout=endpoint.timeout_s, transport=transport)
+        self._client = httpx.Client(
+            timeout=httpx.Timeout(endpoint.timeout_s, connect=10.0),
+            transport=transport,
+        )
 
     def close(self) -> None:
         self._client.close()
@@ -562,10 +572,12 @@ class TextBackend:
         """Gate 2 audit: reject checks better written as Python asserts/regexes or unfalsifiable prose."""
         numbered = "\n".join(f"- {c}" for c in checks)
         system = (
-            "You audit @probe checks before deployment. Reject a probe ONLY if any check is trivially "
-            "a deterministic check that belongs in normal Python assert/regex/type checks (math invariants, "
-            "null/None checks, list length, exact regex format) OR is vague and unfalsifiable.\n"
-            'Return strictly JSON: {"approved": true|false, "reason": "<short reason>"}.'
+            "You audit @probe checks that will be evaluated at runtime by an AI judge.\n"
+            "- Set approved=true when checks describe semantic or behavioral qualities of text/data "
+            "(meaning, language choice, tone, grounding, pedagogy, or truthfulness).\n"
+            "- Set approved=false ONLY when a check should just be a deterministic Python assert/regex "
+            "(math like a+b, None checks, len(), types, exact regex) or is empty filler like 'works well'.\n"
+            'Return strictly JSON with reason FIRST: {"reason": "<1 sentence>", "approved": true|false}.'
         )
         user = (
             f"Probe: {probe_id}\n"
@@ -593,9 +605,12 @@ class TextBackend:
             "Generate two synthetic JSON snapshots matching how this probe is serialized at runtime:\n"
             '- For a @probe decorator, each snapshot MUST be {"inputs": {...}, "output": ...}.\n'
             '- For a probe.here(...) watchpoint, each snapshot MUST be {"watched": {...}}.\n'
-            '1) "passing_snapshot": realistic valid runtime data that clearly satisfies ALL checks.\n'
-            '2) "failing_snapshot": realistic broken runtime data that clearly violates at least one check.\n'
-            'Return strictly JSON: {"passing_snapshot": {...}, "failing_snapshot": {...}}.'
+            '1) "passing_snapshot": an unmistakable, complete example that explicitly and obviously '
+            "satisfies EVERY single check in the list.\n"
+            '2) "failing_snapshot": an unmistakable example that clearly violates at least one check.\n'
+            'Return strictly JSON with notes FIRST: '
+            '{"notes": "<1 sentence checking every item is clearly met in passing_snapshot>", '
+            '"passing_snapshot": {...}, "failing_snapshot": {...}}.'
         )
         user = (
             f"Probe: {probe_id}\n"

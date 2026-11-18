@@ -123,15 +123,15 @@ url = "https://api.deepseek.com/v1"
 model = "deepseek-chat"
 api_key_env = "DEEPSEEK_API_KEY"
 
-# Local profile example:
+# Local Ollama profile example (zero API cost):
 # [models.decision]
-# provider = "http_decision"
-# url = "http://<host>.<tailnet>.ts.net:8780/v1/evaluate"
-# model = "local-decision"
+# provider = "logprob_bool"
+# url = "http://127.0.0.1:11434/v1"
+# model = "qwen3.5:9b"
 #
 # [models.text]
 # provider = "openai_compat"
-# url = "http://<host>.<tailnet>.ts.net:11434/v1"
+# url = "http://127.0.0.1:11434/v1"
 # model = "qwen3.5:9b"
 
 [decision]

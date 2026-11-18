@@ -241,21 +241,21 @@ model = "deepseek-chat"
 api_key_env = "DEEPSEEK_API_KEY"
 ```
 
-**Example — Local Profile (local decision endpoint + local `qwen` via Ollama):**
+**Example — Local Profile (local `qwen3.5:9b` via Ollama for both roles):**
 
 ```toml
 [models.decision]
-provider = "http_decision"
-url = "http://<host>.<tailnet>.ts.net:8780/v1/evaluate"
-model = "local-decision"
+provider = "logprob_bool"
+url = "http://127.0.0.1:11434/v1"
+model = "qwen3.5:9b"
 
 [models.text]
 provider = "openai_compat"
-url = "http://<host>.<tailnet>.ts.net:11434/v1"
+url = "http://127.0.0.1:11434/v1"
 model = "qwen3.5:9b"
 ```
 
-*(A `provider = "logprob_bool"` adapter can also wrap an Ollama/OpenAI-compatible endpoint supporting 1-token `YES`/`NO` logprobs as `[models.decision]`.)*
+*(A `provider = "http_decision"` adapter can also point `[models.decision]` at a dedicated local decision classifier service over HTTP.)*
 
 **Shared Settings:**
 
