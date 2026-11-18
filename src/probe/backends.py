@@ -17,13 +17,10 @@ from probe.prompts import (
     compose_system_prompt,
     format_analyze_snapshot_prompts,
     format_explain_failure_prompts,
-    format_gate2_audit_prompts,
+    format_gate2_analysis_prompts,
     format_gate3_fixtures_prompts,
-    format_logprob_eval_user,
-    format_openai_decision_user,
     format_typesafe_state,
-    format_when_check,
-    get_prompt,
+    normalize_when_noul,
 )
 
 _THINK_BLOCK_RE = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
@@ -233,14 +230,14 @@ class DecisionBackend:
             probs = self._eval_typesafe_jev(probe_id, check_list, snapshot_json, analysis)
         elif provider == "http_decision":
             probs = self._eval_http_decision(probe_id, check_list, snapshot_json, analysis)
-        elif provider == "logprob_bool":
-            probs = self._eval_logprob_bool(probe_id, check_list, snapshot_json, analysis)
-        elif provider == "openai_compat":
-            probs = self._eval_openai_compat(probe_id, check_list, snapshot_json, analysis)
         elif provider == "onnx_nli":
             probs = self._eval_onnx_nli(check_list, snapshot_json, analysis)
         else:
-            raise BackendError(f"Unknown decision provider: {self.endpoint.provider!r}")
+            raise BackendError(
+                f"Unsupported decision provider {self.endpoint.provider!r}: "
+                "[models.decision] requires a decision model ('typesafe_jev', 'http_decision', or 'onnx_nli'), "
+                "not a text generation LLM."
+            )
 
         return [
             CheckScore(
@@ -260,10 +257,10 @@ class DecisionBackend:
         analysis: str = "",
     ) -> bool:
         """Evaluate a when="<condition>" expression against the current snapshot."""
-        prompt_check = format_when_check(condition)
+        noul = normalize_when_noul(condition)
         scores = self.evaluate_checks(
             probe_id=f"{probe_id}#when",
-            checks=[prompt_check],
+            checks=[noul],
             snapshot_json=snapshot_json,
             analysis=analysis,
         )
@@ -339,76 +336,6 @@ class DecisionBackend:
 
         data = self._post_json(self.endpoint.url, payload)
         return _parse_probabilities_payload(data, checks)
-
-    def _eval_logprob_bool(
-        self,
-        probe_id: str,
-        checks: list[str],
-        snapshot_json: str,
-        analysis: str,
-    ) -> list[float]:
-        url = _chat_completions_url(self.endpoint.url)
-        system_prompt = get_prompt("decision_logprob_bool")
-        probs: list[float] = []
-        for idx, check in enumerate(checks):
-            messages = [
-                {
-                    "role": "system",
-                    "content": system_prompt,
-                },
-                {
-                    "role": "user",
-                    "content": format_logprob_eval_user(probe_id, check, snapshot_json, analysis),
-                },
-            ]
-            req_payload: dict[str, Any] = {
-                "model": self.endpoint.model,
-                "messages": messages,
-                "temperature": 0.0,
-                "max_tokens": 3,
-                "logprobs": True,
-                "top_logprobs": 5,
-            }
-            _apply_reasoning_effort(req_payload, self.endpoint, url)
-            data = self._post_json(url, req_payload)
-            p = _extract_yes_no_logprob(data)
-            if p is None:
-                # Server/model omitted logprobs; fall back cleanly to JSON probability scoring for remaining checks.
-                fallback = self._eval_openai_compat(probe_id, checks[idx:], snapshot_json, analysis)
-                probs.extend(fallback)
-                return probs
-            probs.append(p)
-        return probs
-
-    def _eval_openai_compat(
-        self,
-        probe_id: str,
-        checks: list[str],
-        snapshot_json: str,
-        analysis: str,
-    ) -> list[float]:
-        url = _chat_completions_url(self.endpoint.url)
-        messages = [
-            {
-                "role": "system",
-                "content": get_prompt("decision_openai_compat"),
-            },
-            {
-                "role": "user",
-                "content": format_openai_decision_user(probe_id, checks, snapshot_json, analysis),
-            },
-        ]
-        chat_payload: dict[str, Any] = {
-            "model": self.endpoint.model,
-            "messages": messages,
-            "temperature": 0.0,
-            "max_tokens": 300,
-        }
-        _apply_reasoning_effort(chat_payload, self.endpoint, url)
-        data = self._post_json(url, chat_payload)
-        content = _extract_chat_content(data)
-        parsed = extract_json_object(content)
-        return _parse_probabilities_payload(parsed, checks)
 
     def _ensure_onnx_loaded(self) -> tuple[Any, Any]:
         if self._onnx_session is not None and self._onnx_tokenizer is not None:
@@ -530,53 +457,55 @@ class TextBackend:
         snapshot_json: str,
     ) -> str:
         """Write failure diagnostic citing failed check(s) and snapshot evidence."""
-        score_lines = [
-            f"- [{'PASS' if s.passed else 'FAIL'} p={s.probability:.2f}] {s.check}"
-            for s in scores
-        ]
+        failed = [s for s in scores if not s.passed] or list(scores)
+        failed_lines = [f"- [FAIL p={s.probability:.2f}] {s.check}" for s in failed]
         system, user = format_explain_failure_prompts(
             probe_id=probe_id,
-            score_lines=score_lines,
+            failed_lines=failed_lines,
             snapshot_json=snapshot_json,
             detail=self.text_cfg.detail,
         )
         return self._chat(system, user)
 
-    def audit_checks_gate2(
+    def analyze_checks_gate2(
         self,
         *,
         probe_id: str,
+        site: str,
         checks: Sequence[str],
         signature: str,
         source_excerpt: str,
-    ) -> tuple[bool, str]:
-        """Gate 2 audit: reject checks better written as Python asserts/regexes or unfalsifiable prose."""
-        system, user = format_gate2_audit_prompts(
+        watched_keys: Sequence[str] = (),
+    ) -> str:
+        """Gate 2 step 1: produce factual analysis of checks before decision noul scoring."""
+        system, user = format_gate2_analysis_prompts(
             probe_id=probe_id,
+            site=site,
             checks=checks,
             signature=signature,
             source_excerpt=source_excerpt,
+            watched_keys=watched_keys,
         )
-        content = self._chat(system, user, max_tokens=max(250, self.text_cfg.max_tokens))
-        parsed = extract_json_object(content)
-        approved = bool(parsed.get("approved", False))
-        reason = str(parsed.get("reason", "")).strip()
-        return approved, reason
+        return self._chat(system, user, max_tokens=max(260, self.text_cfg.max_tokens))
 
     def generate_calibration_fixtures_gate3(
         self,
         *,
         probe_id: str,
+        site: str = "decorator",
         checks: Sequence[str],
         signature: str,
         source_excerpt: str,
+        watched_keys: Sequence[str] = (),
     ) -> tuple[str, str]:
-        """Gate 3 synthesis: create one valid passing snapshot and one clearly broken failing snapshot."""
+        """Gate 3 synthesis: create one valid passing snapshot and one realistic near-miss failing snapshot."""
         system, user = format_gate3_fixtures_prompts(
             probe_id=probe_id,
+            site=site,
             checks=checks,
             signature=signature,
             source_excerpt=source_excerpt,
+            watched_keys=watched_keys,
         )
         content = self._chat(system, user, max_tokens=max(600, self.text_cfg.max_tokens))
         parsed = extract_json_object(content)
@@ -600,53 +529,6 @@ def _extract_chat_content(data: dict[str, Any]) -> str:
     if isinstance(text, str):
         return text
     raise BackendError(f"Missing message content in OpenAI response: {data!r}")
-
-
-def _extract_yes_no_logprob(data: dict[str, Any]) -> float | None:
-    choices = data.get("choices")
-    if not isinstance(choices, list) or not choices:
-        return None
-    choice0 = choices[0] if isinstance(choices[0], dict) else {}
-    logprobs = choice0.get("logprobs")
-    if not isinstance(logprobs, dict):
-        return None
-    content_list = logprobs.get("content")
-    if not isinstance(content_list, list) or not content_list:
-        return None
-    first_tok = content_list[0] if isinstance(content_list[0], dict) else {}
-    top = first_tok.get("top_logprobs")
-    if not isinstance(top, list) or not top:
-        return None
-
-    yes_lp: float | None = None
-    no_lp: float | None = None
-    total_mass = 0.0
-    for item in top:
-        if not isinstance(item, dict):
-            continue
-        tok = str(item.get("token", "")).strip().upper()
-        lp = item.get("logprob")
-        if lp is None:
-            continue
-        lp_val = float(lp)
-        total_mass += math.exp(lp_val)
-        if tok == "YES" and (yes_lp is None or lp_val > yes_lp):
-            yes_lp = lp_val
-        elif tok == "NO" and (no_lp is None or lp_val > no_lp):
-            no_lp = lp_val
-
-    if yes_lp is None and no_lp is None:
-        return None
-    if yes_lp is not None and no_lp is not None:
-        p_y = math.exp(yes_lp)
-        p_n = math.exp(no_lp)
-        return _clamp_prob(p_y / (p_y + p_n))
-    rem = max(1e-6, 1.0 - total_mass)
-    if yes_lp is not None:
-        p_y = math.exp(yes_lp)
-        return _clamp_prob(p_y / (p_y + rem))
-    p_n = math.exp(no_lp)  # type: ignore[arg-type]
-    return _clamp_prob(rem / (p_n + rem))
 
 
 def _parse_probabilities_payload(data: dict[str, Any], checks: list[str]) -> list[float]:

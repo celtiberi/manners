@@ -3,14 +3,20 @@
 from __future__ import annotations
 
 import json
-import math
 from pathlib import Path
 
 import httpx
+import pytest
 
-from probe.backends import CheckScore, DecisionBackend, TextBackend, extract_json_object, strip_thinking
+from probe.backends import BackendError, CheckScore, DecisionBackend, TextBackend, extract_json_object, strip_thinking
 from probe.config import DecisionConfig, ModelEndpointConfig, TextConfig, load_config
-from probe.prompts import compose_system_prompt, format_when_check, get_prompt, load_prompt_catalog
+from probe.prompts import (
+    compose_system_prompt,
+    get_nouls,
+    get_prompt,
+    load_prompt_catalog,
+    normalize_when_noul,
+)
 
 
 def test_strip_thinking_and_extract_json() -> None:
@@ -133,83 +139,51 @@ def test_http_decision_provider_and_api_key_header(monkeypatch) -> None:
     ]
 
 
-def test_logprob_bool_provider_and_missing_logprob_fallback() -> None:
-    lp_yes = math.log(0.80)
-    lp_no = math.log(0.20)
-    seen_payloads: list[dict] = []
-
-    def handler_logprob(request: httpx.Request) -> httpx.Response:
-        seen_payloads.append(json.loads(request.content.decode("utf-8")))
-        return httpx.Response(
-            200,
-            json={
-                "choices": [
-                    {
-                        "message": {"content": "YES"},
-                        "logprobs": {
-                            "content": [
-                                {
-                                    "top_logprobs": [
-                                        {"token": "YES", "logprob": lp_yes},
-                                        {"token": "NO", "logprob": lp_no},
-                                    ]
-                                }
-                            ]
-                        },
-                    }
-                ]
-            },
+def test_decision_backend_rejects_text_llm_providers_and_evaluates_when_noul_directly() -> None:
+    for bad_provider in ("openai_compat", "logprob_bool"):
+        bad_backend = DecisionBackend(
+            ModelEndpointConfig(provider=bad_provider, url="http://127.0.0.1:11434/v1", model="qwen3.5:9b"),
+            DecisionConfig(pass_threshold=0.50),
         )
+        try:
+            with pytest.raises(BackendError, match=r"\[models\.decision\] requires a decision model"):
+                bad_backend.evaluate_checks(
+                    probe_id="p.bad",
+                    checks=["Greeting present"],
+                    snapshot_json='{"output": "Hola!"}',
+                )
+        finally:
+            bad_backend.close()
+
+    captured: list[dict] = []
+
+    def handler_when(request: httpx.Request) -> httpx.Response:
+        captured.append(json.loads(request.content.decode("utf-8")))
+        return httpx.Response(200, json={"probabilities": [0.88]})
 
     backend = DecisionBackend(
-        ModelEndpointConfig(
-            provider="logprob_bool",
-            url="http://localhost:11434/v1",
-            model="qwen3.5:9b",
-        ),
+        ModelEndpointConfig(provider="http_decision", url="http://decision.local/v1/eval", model="local"),
         DecisionConfig(pass_threshold=0.50),
-        transport=httpx.MockTransport(handler_logprob),
+        transport=httpx.MockTransport(handler_when),
     )
     try:
-        scores = backend.evaluate_checks(
-            probe_id="p.bool",
-            checks=["Greeting present"],
-            snapshot_json='{"output": "Hola!"}',
+        triggered = backend.evaluate_condition(
+            probe_id="rag.draft",
+            condition="when draft cites external facts",
+            snapshot_json='{"watched": {"draft": "Chunk 1"}}',
         )
     finally:
         backend.close()
 
-    assert len(scores) == 1
-    assert scores[0].passed is True
-    assert abs(scores[0].probability - 0.80) < 1e-3
-    assert seen_payloads[0]["reasoning_effort"] == "none"
-
-    # Fallback when server returns choices without logprobs.
-    def handler_fallback(request: httpx.Request) -> httpx.Response:
-        body = json.loads(request.content.decode("utf-8"))
-        if body.get("logprobs"):
-            return httpx.Response(200, json={"choices": [{"message": {"content": "YES"}, "logprobs": None}]})
-        return httpx.Response(
-            200,
-            json={"choices": [{"message": {"content": '{"probabilities": [0.15, 0.88]}'}}]},
-        )
-
-    fb_backend = DecisionBackend(
-        ModelEndpointConfig(provider="logprob_bool", url="http://localhost:11434/v1", model="local"),
-        DecisionConfig(pass_threshold=0.50),
-        transport=httpx.MockTransport(handler_fallback),
-    )
-    try:
-        fb_scores = fb_backend.evaluate_checks(
-            probe_id="p.fb",
-            checks=["c1", "c2"],
-            snapshot_json="{}",
-        )
-    finally:
-        fb_backend.close()
-
-    assert [s.passed for s in fb_scores] == [False, True]
-    assert [s.probability for s in fb_scores] == [0.15, 0.88]
+    assert triggered is True
+    assert captured == [
+        {
+            "model": "local",
+            "probe_id": "rag.draft#when",
+            "checks": ["draft cites external facts"],
+            "snapshot": '{"watched": {"draft": "Chunk 1"}}',
+        }
+    ]
 
 
 def test_text_backend_analysis_and_failure_explanation() -> None:
@@ -252,17 +226,17 @@ def test_text_backend_analysis_and_failure_explanation() -> None:
 
 def test_prompts_json_catalog_and_formatting() -> None:
     catalog = load_prompt_catalog()
-    assert len(catalog) == 10
+    assert len(catalog) == 8
     for key, entry in catalog.items():
-        assert entry.role, f"Missing role for {key}"
-        assert entry.provider, f"Missing provider for {key}"
+        assert entry.role in {"models.decision", "models.text"}
         assert entry.stage, f"Missing stage for {key}"
         assert entry.description, f"Missing description for {key}"
-        assert entry.prompt, f"Empty prompt for {key}"
-        assert get_prompt(key) == entry.prompt
+        if entry.role == "models.decision":
+            assert entry.nouls and get_nouls(key) == entry.nouls
+        else:
+            assert entry.prompt and get_prompt(key) == entry.prompt
 
-    assert (
-        format_when_check("when draft cites external facts")
-        == "This condition is currently TRUE: draft cites external facts"
-    )
+    gate2_nouls = get_nouls("check_gate2_nouls")
+    assert len(gate2_nouls) == 3
+    assert normalize_when_noul("when draft cites external facts") == "draft cites external facts"
     assert compose_system_prompt("Base.", "Custom.") == "Custom.\n\nBase."

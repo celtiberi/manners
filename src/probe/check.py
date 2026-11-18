@@ -16,6 +16,7 @@ import httpx
 
 from probe.backends import BackendError, CheckScore, DecisionBackend, TextBackend
 from probe.config import ProbeConfig, load_config, utc_now_iso
+from probe.prompts import get_nouls
 from probe.runtime import ProbeType, compute_checks_hash
 
 _SKIP_DIRS: frozenset[str] = frozenset(
@@ -54,6 +55,7 @@ class DiscoveredProbe:
     checks_hash: str
     source_hash: str
     combined_hash: str
+    watched_keys: tuple[str, ...] = ()
 
 
 @dataclass(slots=True)
@@ -362,6 +364,9 @@ class _ModuleProbeVisitor(ast.NodeVisitor):
             c_hash = compute_checks_hash(kind, checks)
             s_hash = _sha256_text(f"{sig}\n{excerpt}")
             combined = _sha256_text(f"{c_hash}:{s_hash}")
+            watched_keys = tuple(
+                kw.arg for kw in call.keywords if kw.arg and kw.arg not in {"checks", "id", "kind", "when"}
+            )
             self.discovered.append(
                 DiscoveredProbe(
                     probe_id=probe_id,
@@ -378,6 +383,7 @@ class _ModuleProbeVisitor(ast.NodeVisitor):
                     checks_hash=c_hash,
                     source_hash=s_hash,
                     combined_hash=combined,
+                    watched_keys=watched_keys,
                 )
             )
         self.generic_visit(node)
@@ -553,13 +559,30 @@ def run_probe_check(
                 )
                 continue
 
-            # Gate 2: Prose vs deterministic assert/regex audit via [models.text].
+            # Gate 2: Factual analysis via [models.text] + noul approval via [models.decision].
             try:
-                approved, audit_reason = text_backend.audit_checks_gate2(
+                gate2_analysis = text_backend.analyze_checks_gate2(
                     probe_id=item.probe_id,
+                    site=item.site,
                     checks=item.checks,
                     signature=item.signature,
                     source_excerpt=item.source_excerpt,
+                    watched_keys=item.watched_keys,
+                )
+                gate2_state = json.dumps(
+                    {
+                        "site": item.site,
+                        "signature": item.signature,
+                        "watched_keys": list(item.watched_keys),
+                        "checks": list(item.checks),
+                    },
+                    ensure_ascii=False,
+                )
+                gate2_scores = decision_backend.evaluate_checks(
+                    probe_id=f"{item.probe_id}#gate2",
+                    checks=get_nouls("check_gate2_nouls"),
+                    snapshot_json=gate2_state,
+                    analysis=gate2_analysis,
                 )
             except BackendError as exc:
                 locked_probes.pop(item.probe_id, None)
@@ -577,7 +600,14 @@ def run_probe_check(
                 )
                 continue
 
+            approved = bool(gate2_scores) and all(s.passed for s in gate2_scores)
             if not approved:
+                failed_nouls = [s.check for s in gate2_scores if not s.passed]
+                audit_reason = (
+                    f"{gate2_analysis} (failed: {'; '.join(failed_nouls)})".strip()
+                    if gate2_analysis
+                    else "; ".join(failed_nouls)
+                )
                 locked_probes.pop(item.probe_id, None)
                 results.append(
                     ProbeCheckResult(
@@ -592,6 +622,7 @@ def run_probe_check(
                     )
                 )
                 continue
+            audit_reason = "Passed Gate 2 check audit"
 
             # Gate 3: Dry-run calibration against fixture or synthesized samples.
             try:
@@ -602,9 +633,11 @@ def run_probe_check(
                 else:
                     pass_snap, fail_snap = text_backend.generate_calibration_fixtures_gate3(
                         probe_id=item.probe_id,
+                        site=item.site,
                         checks=item.checks,
                         signature=item.signature,
                         source_excerpt=item.source_excerpt,
+                        watched_keys=item.watched_keys,
                     )
                     fixture_source = "synthetic"
 

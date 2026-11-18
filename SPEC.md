@@ -174,7 +174,7 @@ Probes must pass `probe check` before running (and whenever checks, `kind`, or t
 
 1. **Static AST scan:** Extracts `@probe(...)` and `probe.here(...)` calls, signatures, and bodies without importing project modules.
 2. **Gate 1 — Budgets & structure:** Checks for duplicate `probe_id`s, `len(checks) <= max_checks` (default `5`), and `len(check) <= max_check_chars` (default `200`).
-3. **Gate 2 — Assert vs. prose check (`[models.text]`):** Rejects checks that belong as regular Python `assert`s or regexes (math, null checks, regex matches, type checks) and vague unfalsifiable prompts.
+3. **Gate 2 — Assert vs. prose audit (`[models.text]` + `[models.decision]`):** `[models.text]` describes factually what each check inspects at runtime, and `[models.decision]` scores the Gate 2 `noul` propositions—rejecting checks that belong as regular Python `assert`s or regexes (math, null checks, regex matches, type/length checks), vague unfalsifiable filler, or checks requiring uncaptured external state.
 4. **Gate 3 — Dry-run calibration:** Skipped if `(probe_id, check_hash)` is unchanged in `.probes/lock.json` (unless `--force`). Uses fixtures from `.probes/fixtures/<probe_id>.json` if present, or asks `[models.text]` for one passing and one failing sample matching the signature, then verifies the configured evaluator scores the valid sample `pass` and the broken sample `fail`.
 
 ---
@@ -241,13 +241,13 @@ model = "deepseek-chat"
 api_key_env = "DEEPSEEK_API_KEY"
 ```
 
-**Example — Local Profile (local `qwen3.5:9b` via Ollama for both roles):**
+**Example — Local Profile (local decision service + local `qwen3.5:9b` via Ollama):**
 
 ```toml
 [models.decision]
-provider = "logprob_bool"
-url = "http://127.0.0.1:11434/v1"
-model = "qwen3.5:9b"
+provider = "http_decision"
+url = "http://127.0.0.1:8080/v1/evaluate"
+model = "local-decision"
 
 [models.text]
 provider = "openai_compat"
@@ -255,7 +255,7 @@ url = "http://127.0.0.1:11434/v1"
 model = "qwen3.5:9b"
 ```
 
-*(A `provider = "http_decision"` adapter can also point `[models.decision]` at a dedicated local decision classifier service over HTTP.)*
+*(You can also configure `provider = "onnx_nli"` with local ONNX weights or mix cloud `[models.decision]` `typesafe_jev` with local Ollama `[models.text]` `qwen3.5:9b`.)*
 
 **Shared Settings:**
 

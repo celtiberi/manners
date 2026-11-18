@@ -355,26 +355,30 @@ def test_live_runtime_decision_text_redaction_and_cli_report(
 
 
 @pytest.mark.skipif(
-    not _has_local_qwen(),
-    reason="Requires local Ollama at http://127.0.0.1:11434 with qwen3.5:9b",
+    not (_TYPESAFE_KEY and _has_local_qwen()),
+    reason="Requires TYPESAFE_API_KEY and local Ollama at http://127.0.0.1:11434 with qwen3.5:9b",
 )
-def test_live_local_qwen_full_pipeline(tmp_path: Path, monkeypatch) -> None:
+def test_live_jev_decision_with_local_qwen_text_pipeline(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setenv("PROBE_CONFIG", str(tmp_path / "no_user_config.toml"))
     monkeypatch.setenv("PROBES", "1")
     monkeypatch.setenv("PROBE_NO_PDB", "1")
     monkeypatch.setenv("PROBE_SKIP_LOCK", "1")
+    monkeypatch.delenv("TYPESAFE_API_KEY", raising=False)
     monkeypatch.chdir(tmp_path)
 
+    (tmp_path / ".env").write_text(f"TYPESAFE_API_KEY={_TYPESAFE_KEY}\n", encoding="utf-8")
     (tmp_path / "pyproject.toml").write_text(
-        "[project]\nname = 'local-qwen-check'\nversion = '0.1.0'\n",
+        "[project]\nname = 'jev-qwen-check'\nversion = '0.1.0'\n",
         encoding="utf-8",
     )
     cfg = load_config(cwd=tmp_path)
     cfg.models_decision = ModelEndpointConfig(
-        provider="logprob_bool",
-        url="http://127.0.0.1:11434/v1",
-        model="qwen3.5:9b",
-        timeout_s=60.0,
+        provider="typesafe_jev",
+        url="https://api.typesafe.ai/v1/systemone",
+        model="jev-latest",
+        api_key_env="TYPESAFE_API_KEY",
+        env_search_dirs=(tmp_path,),
+        env_files=cfg.redact.env_files,
     )
     cfg.models_text = ModelEndpointConfig(
         provider="openai_compat",
@@ -388,7 +392,7 @@ def test_live_local_qwen_full_pipeline(tmp_path: Path, monkeypatch) -> None:
         lock_path=str(tmp_path / ".probes" / "lock.json"),
     )
 
-    # 1. Pre-run check: Gate 2 rejects math check; Gates 2-3 pass and calibrate semantic probe.
+    # 1. Pre-run check: Gate 2 rejects deterministic math & mixed lists; Gates 2-3 pass semantic @probe + probe.here.
     src_dir = tmp_path / "app"
     src_dir.mkdir(parents=True)
     (src_dir / "__init__.py").write_text("", encoding="utf-8")
@@ -416,6 +420,23 @@ def test_live_local_qwen_full_pipeline(tmp_path: Path, monkeypatch) -> None:
             """
             from probe import probe
 
+            @probe(["Summary captures key risks from filing", "len(output) > 0"], id="summary.mixed")
+            def summarize(filing: str) -> str:
+                return filing
+            """
+        ).strip()
+        + "\n",
+        encoding="utf-8",
+    )
+    ok_mixed, res_mixed = run_probe_check([target], config=cfg)
+    assert ok_mixed is False
+    assert res_mixed[0].gate == "gate2"
+
+    target.write_text(
+        textwrap.dedent(
+            """
+            from probe import probe
+
             @probe(
                 [
                     "Tutor opens with a short Spanish greeting or phrase",
@@ -426,17 +447,29 @@ def test_live_local_qwen_full_pipeline(tmp_path: Path, monkeypatch) -> None:
             def generate_opening_turn(lesson: str) -> str:
                 \"\"\"Generate a brief introductory Spanish tutoring turn.\"\"\"
                 return ""
+
+
+            def check_policy_draft(draft: str) -> str:
+                \"\"\"Verify policy draft stays aligned with source exclusion rules.\"\"\"
+                probe.here(
+                    "Draft stays faithful to source_rule without flipping exclusions",
+                    id="rag.draft",
+                    kind=probe.type.text,
+                    source_rule="Tier B is excluded",
+                    draft=draft,
+                )
+                return draft
             """
         ).strip()
         + "\n",
         encoding="utf-8",
     )
     ok_sem, res_sem = run_probe_check([target], config=cfg)
-    assert ok_sem is True, f"Local qwen3.5:9b calibration failed: {res_sem}"
-    assert res_sem[0].status == "passed"
+    assert ok_sem is True, f"Jev + local qwen3.5:9b calibration failed: {res_sem}"
+    assert [r.status for r in res_sem] == ["passed", "passed"]
     assert cfg.resolve_lock_path().is_file()
 
-    # 2. Live runtime: decision pass, text pipeline pass, and decision spoiler halt with explanation.
+    # 2. Live runtime: decision pass, text pipeline pass, and decision spoiler halt with Qwen explanation.
     reset_for_testing(config=cfg)
 
     @probe(

@@ -107,10 +107,20 @@ def test_discover_and_gates_with_caching_and_fixtures(tmp_path: Path) -> None:
         body = json.loads(request.content.decode("utf-8"))
         if url.endswith("/chat/completions"):
             sys_msg = body["messages"][0]["content"]
-            if "audit @probe checks" in sys_msg:
+            if "audit @probe and probe.here" in sys_msg:
                 return httpx.Response(
                     200,
-                    json={"choices": [{"message": {"content": '{"approved": true, "reason": "semantic check"}'}}]},
+                    json={
+                        "choices": [
+                            {
+                                "message": {
+                                    "content": (
+                                        "Checks inspect Spanish greeting/teaching and grounding in watched variables."
+                                    )
+                                }
+                            }
+                        ]
+                    },
                 )
             if "passing_snapshot" in sys_msg:
                 return httpx.Response(
@@ -135,6 +145,8 @@ def test_discover_and_gates_with_caching_and_fixtures(tmp_path: Path) -> None:
                 json={"choices": [{"message": {"content": f"Analysis of {body['messages'][1]['content'][:80]}"}}]},
             )
         if url.endswith("/decision"):
+            if body["probe_id"].endswith("#gate2"):
+                return httpx.Response(200, json={"probabilities": [0.95 for _ in body["checks"]]})
             snap = body["snapshot"]
             ok = "GOOD" in snap
             probs = [0.95 if ok else 0.10 for _ in body["checks"]]
@@ -223,10 +235,25 @@ def test_gate1_and_gate2_rejections(tmp_path: Path) -> None:
     )
 
     def reject_handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(
-            200,
-            json={"choices": [{"message": {"content": '{"approved": false, "reason": "Use Python assert"}'}}]},
-        )
+        url = str(request.url)
+        if url.endswith("/chat/completions"):
+            return httpx.Response(
+                200,
+                json={
+                    "choices": [
+                        {
+                            "message": {
+                                "content": (
+                                    "Check [0] tests exact Python arithmetic a + b; write a Python assert instead."
+                                )
+                            }
+                        }
+                    ]
+                },
+            )
+        if url.endswith("/decision"):
+            return httpx.Response(200, json={"probabilities": [0.05, 0.95, 0.90]})
+        raise AssertionError(f"Unexpected URL: {url}")
 
     ok_g2, res_g2 = run_probe_check(config=cfg, transport=httpx.MockTransport(reject_handler))
     assert ok_g2 is False

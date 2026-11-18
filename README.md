@@ -123,12 +123,7 @@ url = "https://api.deepseek.com/v1"
 model = "deepseek-chat"
 api_key_env = "DEEPSEEK_API_KEY"
 
-# Local Ollama profile example (zero API cost):
-# [models.decision]
-# provider = "logprob_bool"
-# url = "http://127.0.0.1:11434/v1"
-# model = "qwen3.5:9b"
-#
+# Local text LLM via Ollama (paired with your configured [models.decision]):
 # [models.text]
 # provider = "openai_compat"
 # url = "http://127.0.0.1:11434/v1"

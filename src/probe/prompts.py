@@ -1,4 +1,4 @@
-"""Prompt catalog loader and model message builders backed by prompts.json."""
+"""Prompt catalog loader and message/noul builders backed by prompts.json."""
 
 from __future__ import annotations
 
@@ -11,14 +11,14 @@ from importlib import resources
 
 @dataclass(slots=True, frozen=True)
 class PromptEntry:
-    """Single prompt entry loaded from prompts.json with role/stage metadata."""
+    """Single prompt or noul set loaded from prompts.json with role/stage metadata."""
 
     key: str
     role: str
-    provider: str
     stage: str
     description: str
-    prompt: str
+    prompt: str = ""
+    nouls: tuple[str, ...] = ()
 
 
 _DETAIL_KEY_MAP: dict[str, str] = {
@@ -30,7 +30,7 @@ _DETAIL_KEY_MAP: dict[str, str] = {
 
 @cache
 def load_prompt_catalog() -> dict[str, PromptEntry]:
-    """Load and validate all prompt entries from bundled probe/prompts.json."""
+    """Load and validate all entries from bundled probe/prompts.json."""
     raw = resources.files("probe").joinpath("prompts.json").read_text(encoding="utf-8")
     data = json.loads(raw)
     if not isinstance(data, dict):
@@ -40,29 +40,63 @@ def load_prompt_catalog() -> dict[str, PromptEntry]:
     for key, item in data.items():
         if not isinstance(item, dict):
             raise ValueError(f"Prompt entry {key!r} must be a JSON object")
+
+        role = str(item.get("role", "")).strip()
+        stage = str(item.get("stage", "")).strip()
+        description = str(item.get("description", "")).strip()
+        if not role or not stage or not description:
+            raise ValueError(f"Prompt entry {key!r} must define role, stage, and description")
+
         raw_prompt = item.get("prompt")
         if isinstance(raw_prompt, list):
             prompt_text = "\n".join(str(line) for line in raw_prompt).strip()
+        elif raw_prompt is not None:
+            prompt_text = str(raw_prompt).strip()
         else:
-            prompt_text = str(raw_prompt or "").strip()
+            prompt_text = ""
+
+        raw_nouls = item.get("nouls")
+        if raw_nouls is None:
+            nouls: tuple[str, ...] = ()
+        elif isinstance(raw_nouls, list):
+            nouls = tuple(str(x).strip() for x in raw_nouls if str(x).strip())
+        else:
+            raise ValueError(f"Prompt entry {key!r} field 'nouls' must be a list of strings")
+
+        if role == "models.decision" and not nouls:
+            raise ValueError(f"Decision entry {key!r} must define non-empty 'nouls'")
+        if role == "models.text" and not prompt_text:
+            raise ValueError(f"Text entry {key!r} must define non-empty 'prompt'")
+
         catalog[str(key)] = PromptEntry(
             key=str(key),
-            role=str(item.get("role", "")).strip(),
-            provider=str(item.get("provider", "")).strip(),
-            stage=str(item.get("stage", "")).strip(),
-            description=str(item.get("description", "")).strip(),
+            role=role,
+            stage=stage,
+            description=description,
             prompt=prompt_text,
+            nouls=nouls,
         )
     return catalog
 
 
 def get_prompt(key: str) -> str:
-    """Return the rendered prompt string for a named entry in prompts.json."""
-    return load_prompt_catalog()[key].prompt
+    """Return the rendered text-model prompt string for a named entry in prompts.json."""
+    entry = load_prompt_catalog()[key]
+    if not entry.prompt:
+        raise ValueError(f"Catalog entry {key!r} has no text prompt")
+    return entry.prompt
+
+
+def get_nouls(key: str) -> tuple[str, ...]:
+    """Return the discrete noul proposition tuple for a named entry in prompts.json."""
+    entry = load_prompt_catalog()[key]
+    if not entry.nouls:
+        raise ValueError(f"Catalog entry {key!r} has no decision nouls")
+    return entry.nouls
 
 
 def detail_instruction(detail: str) -> str:
-    """Return length/detail guidance for the configured text detail level."""
+    """Return per-check length/detail guidance for the configured text detail level."""
     mapped = _DETAIL_KEY_MAP.get(detail.strip().lower(), "detail_standard")
     return get_prompt(mapped)
 
@@ -75,12 +109,12 @@ def compose_system_prompt(base_system: str, user_system_prompt: str = "") -> str
     return f"{extra}\n\n{base_system}".strip()
 
 
-def format_when_check(condition: str) -> str:
-    """Convert a `when="..."` condition into a discrete decision check statement."""
+def normalize_when_noul(condition: str) -> str:
+    """Normalize a `when="..."` expression directly into a clean decision noul."""
     cond = condition.strip()
     if cond.lower().startswith("when "):
         cond = cond[5:].strip()
-    return f"{get_prompt('when_condition')} {cond}"
+    return cond
 
 
 def format_typesafe_state(probe_id: str, snapshot_json: str, analysis: str = "") -> str:
@@ -92,32 +126,6 @@ def format_typesafe_state(probe_id: str, snapshot_json: str, analysis: str = "")
     return "\n\n".join(parts)
 
 
-def format_logprob_eval_user(probe_id: str, check: str, snapshot_json: str, analysis: str = "") -> str:
-    """Format the user message for single-check YES/NO logprob verification."""
-    parts = [f"Probe: {probe_id}", f"Snapshot:\n{snapshot_json}"]
-    if analysis:
-        parts.append(f"Analysis:\n{analysis}")
-    parts.append(f"Check: {check}")
-    return "\n\n".join(parts)
-
-
-def format_openai_decision_user(
-    probe_id: str,
-    checks: Sequence[str],
-    snapshot_json: str,
-    analysis: str = "",
-) -> str:
-    """Format the user message for OpenAI-compatible multi-check JSON probability scoring."""
-    numbered = "\n".join(f"{i}: {chk}" for i, chk in enumerate(checks))
-    analysis_block = f"\nPrior analysis:\n{analysis}\n" if analysis else ""
-    return (
-        f"Probe: {probe_id}\n"
-        f"Snapshot:\n{snapshot_json}\n"
-        f"{analysis_block}\n"
-        f"Checks:\n{numbered}"
-    )
-
-
 def format_analyze_snapshot_prompts(
     *,
     probe_id: str,
@@ -125,76 +133,92 @@ def format_analyze_snapshot_prompts(
     snapshot_json: str,
     detail: str = "standard",
 ) -> tuple[str, str]:
-    """Return (system, user) prompts for `probe.type.text` snapshot analysis."""
-    bulleted = "\n".join(f"- {c}" for c in checks)
-    system = f"{get_prompt('text_analyze_snapshot')} {detail_instruction(detail)}"
-    user = f"Probe: {probe_id}\nChecks:\n{bulleted}\n\nSnapshot:\n{snapshot_json}"
+    """Return (system, user) prompts for `probe.type.text` snapshot evidence extraction."""
+    numbered = "\n".join(f"- [{i}] {c}" for i, c in enumerate(checks))
+    system = f"{get_prompt('text_analyze_snapshot')}\n{detail_instruction(detail)}"
+    user = f"Probe: {probe_id}\nChecks:\n{numbered}\n\n<snapshot>\n{snapshot_json}\n</snapshot>"
     return system, user
 
 
 def format_explain_failure_prompts(
     *,
     probe_id: str,
-    score_lines: Sequence[str],
+    failed_lines: Sequence[str],
     snapshot_json: str,
     detail: str = "standard",
 ) -> tuple[str, str]:
-    """Return (system, user) prompts for explaining a failed decision probe."""
-    joined_scores = "\n".join(score_lines)
-    system = f"{get_prompt('text_explain_failure')} {detail_instruction(detail)}"
-    user = f"Probe: {probe_id}\nCheck results:\n{joined_scores}\n\nSnapshot:\n{snapshot_json}"
+    """Return (system, user) prompts for explaining failed decision checks."""
+    joined = "\n".join(failed_lines)
+    system = f"{get_prompt('text_explain_failure')}\n{detail_instruction(detail)}"
+    user = f"Probe: {probe_id}\nFailed check(s):\n{joined}\n\n<snapshot>\n{snapshot_json}\n</snapshot>"
     return system, user
 
 
-def _format_gate_prompts(
-    prompt_key: str,
+def _format_gate_user_message(
     *,
     probe_id: str,
+    site: str,
     checks: Sequence[str],
     signature: str,
     source_excerpt: str,
-) -> tuple[str, str]:
-    bulleted = "\n".join(f"- {c}" for c in checks)
-    user = (
-        f"Probe: {probe_id}\n"
-        f"Signature: {signature}\n"
-        f"Checks:\n{bulleted}\n\n"
-        f"Source excerpt:\n{source_excerpt}"
-    )
-    return get_prompt(prompt_key), user
+    watched_keys: Sequence[str] = (),
+) -> str:
+    numbered = "\n".join(f"- [{i}] {c}" for i, c in enumerate(checks))
+    lines = [
+        f"Probe: {probe_id}",
+        f"Site: {site}",
+        f"Signature: {signature}",
+    ]
+    if site == "here" and watched_keys:
+        lines.append(f"Watched keys: {', '.join(watched_keys)}")
+    lines.append(f"Checks:\n{numbered}")
+    header = "\n".join(lines)
+    return f"{header}\n\n<source_excerpt>\n{source_excerpt}\n</source_excerpt>"
 
 
-def format_gate2_audit_prompts(
+def format_gate2_analysis_prompts(
     *,
     probe_id: str,
+    site: str,
     checks: Sequence[str],
     signature: str,
     source_excerpt: str,
+    watched_keys: Sequence[str] = (),
 ) -> tuple[str, str]:
-    """Return (system, user) prompts for `probe check` Gate 2 assert-vs-prose auditing."""
-    return _format_gate_prompts(
-        "check_gate2_audit",
-        probe_id=probe_id,
-        checks=checks,
-        signature=signature,
-        source_excerpt=source_excerpt,
+    """Return (system, user) prompts for Gate 2 factual analysis before decision noul scoring."""
+    return (
+        get_prompt("check_gate2_analysis"),
+        _format_gate_user_message(
+            probe_id=probe_id,
+            site=site,
+            checks=checks,
+            signature=signature,
+            source_excerpt=source_excerpt,
+            watched_keys=watched_keys,
+        ),
     )
 
 
 def format_gate3_fixtures_prompts(
     *,
     probe_id: str,
+    site: str,
     checks: Sequence[str],
     signature: str,
     source_excerpt: str,
+    watched_keys: Sequence[str] = (),
 ) -> tuple[str, str]:
-    """Return (system, user) prompts for `probe check` Gate 3 fixture synthesis."""
-    return _format_gate_prompts(
-        "check_gate3_fixtures",
-        probe_id=probe_id,
-        checks=checks,
-        signature=signature,
-        source_excerpt=source_excerpt,
+    """Return (system, user) prompts for Gate 3 synthetic pass/fail fixture generation."""
+    return (
+        get_prompt("check_gate3_fixtures"),
+        _format_gate_user_message(
+            probe_id=probe_id,
+            site=site,
+            checks=checks,
+            signature=signature,
+            source_excerpt=source_excerpt,
+            watched_keys=watched_keys,
+        ),
     )
 
 
@@ -204,12 +228,11 @@ __all__ = [
     "detail_instruction",
     "format_analyze_snapshot_prompts",
     "format_explain_failure_prompts",
-    "format_gate2_audit_prompts",
+    "format_gate2_analysis_prompts",
     "format_gate3_fixtures_prompts",
-    "format_logprob_eval_user",
-    "format_openai_decision_user",
     "format_typesafe_state",
-    "format_when_check",
+    "get_nouls",
     "get_prompt",
     "load_prompt_catalog",
+    "normalize_when_noul",
 ]
