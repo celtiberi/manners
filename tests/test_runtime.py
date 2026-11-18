@@ -243,6 +243,7 @@ def test_inline_halt_non_tty_and_mock_tty_pdb(tmp_path: Path, monkeypatch) -> No
 
     # Verify interactive TTY mode opens pdb on the caller's live stack frame.
     pdb_frames: list[object] = []
+    monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
     monkeypatch.setattr("sys.stdin.isatty", lambda: True)
     monkeypatch.setattr("sys.stdout.isatty", lambda: True)
     monkeypatch.setattr(pdb.Pdb, "set_trace", lambda self, frame=None: pdb_frames.append(frame))
@@ -456,3 +457,109 @@ def test_exceptions_descriptors_generators_preexec_guards_and_ro_store(
     finally:
         probe.flush_for_testing()
         reset_for_testing()
+
+
+def test_disabled_context_class_rejection_tty_entry_halt_and_jsonl_hardening(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setenv("PROBES", "1")
+    monkeypatch.setenv("PROBE_NO_PDB", "1")
+    calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        return httpx.Response(200, json={"probabilities": [0.95]})
+
+    cfg = _make_config(tmp_path)
+    reset_for_testing(config=cfg, transport=httpx.MockTransport(handler))
+
+    @probe("Friendly output", id="disabled.sync")
+    def sync_fn(x: str) -> str:
+        probe.here("Non-empty draft", id="disabled.here", x=x)
+        return x
+
+    @probe("Friendly async output", id="disabled.async")
+    async def async_fn(x: str) -> str:
+        return x
+
+    try:
+        with probe.disabled():
+            assert sync_fn("ok") == "ok"
+            assert asyncio.run(async_fn("ok")) == "ok"
+        assert calls["n"] == 0
+        assert sync_fn("checked") == "checked"
+        assert calls["n"] == 2
+    finally:
+        probe.flush_for_testing()
+        reset_for_testing()
+
+    # @probe cannot decorate a class; probe.here rejects missing watched_vars when PROBES=1.
+    with pytest.raises(TypeError, match="not classes"):
+        @probe("Class invariant")
+        class BadTarget:
+            pass
+
+    with pytest.raises(ValueError, match="watched keyword variable"):
+        probe.here("Missing watched")
+
+    # Entry-time UNCHECKED_PROBE with TTY pdb raises ProbeHaltError instead of returning None.
+    monkeypatch.delenv("PROBE_NO_PDB", raising=False)
+    monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+    monkeypatch.setattr("sys.stdout.isatty", lambda: True)
+    monkeypatch.setattr(pdb.Pdb, "set_trace", lambda self, frame=None: None)
+    locked_cfg = _make_config(tmp_path, require_check=True)
+    reset_for_testing(config=locked_cfg, transport=httpx.MockTransport(handler))
+
+    @probe("Locked check", id="entry.pdb.locked")
+    def never_returns_none() -> str:
+        return "real"
+
+    try:
+        with pytest.raises(ProbeHaltError):
+            never_returns_none()
+    finally:
+        probe.flush_for_testing()
+        reset_for_testing()
+
+    # Store hardening: inner runs/.gitignore, torn trailing line repair, halted not overwritten,
+    # and corrupt check_scores skipped gracefully.
+    runs_dir = tmp_path / ".probes" / "hardened_runs"
+    (tmp_path / ".probes").mkdir(exist_ok=True)
+    store = ProbeStore(runs_dir, create=True)
+    assert (runs_dir / ".gitignore").read_text(encoding="utf-8") == "*\n!.gitignore\n"
+    store.create_run(
+        "01HARDENED0000000000000001",
+        started_at="2026-11-18T10:00:00Z",
+        cmd="pytest",
+        pid=1,
+        decision_model="m",
+        text_model="t",
+    )
+    run_file = store.run_path("01HARDENED0000000000000001")
+    with run_file.open("a", encoding="utf-8") as fh:
+        fh.write('{"type":"event","partial":')
+    store.finish_run("01HARDENED0000000000000001", status="halted", halt_call_seq=1)
+    store.finish_run("01HARDENED0000000000000001", status="completed")
+    with run_file.open("a", encoding="utf-8") as fh:
+        fh.write(
+            json.dumps(
+                {
+                    "type": "event",
+                    "call_seq": 99,
+                    "elapsed_ms": 1.0,
+                    "started_at": "t",
+                    "probe_id": "bad",
+                    "site": "here",
+                    "probe_type": "decision",
+                    "file_line": "a:1",
+                    "verdict": "fail",
+                    "check_scores": [{"check": "c", "probability": "bad", "passed": False}],
+                }
+            )
+            + "\n"
+        )
+    run, events = store.get_run_with_events("01HARDENED0000000000000001")
+    assert run is not None and run.status == "halted" and run.halt_call_seq == 1
+    assert events == []
+    assert store.clean_runs(keep=0) == 1

@@ -33,7 +33,7 @@ from probe.config import (
     new_ulid,
     utc_now_iso,
 )
-from probe.redact import SecretRedactor, serialize_call_snapshot
+from probe.redact import SecretRedactor, _scrub_and_truncate, serialize_call_snapshot
 from probe.store import ProbeStore
 
 P = ParamSpec("P")
@@ -299,10 +299,10 @@ class ProbeRuntime:
         payload_json: str,
         caller_frame: FrameType | None = None,
         watched_keys: tuple[str, ...] = (),
-    ) -> None:
+    ) -> bool:
         """Verify probe matches lockfile (checks_hash, site, watched_keys) unless skipped."""
         if not self.config.check.require_check or is_skip_lock(self.cwd):
-            return
+            return False
 
         with self._lock_cache_lock:
             if self._lock_cache is None:
@@ -332,13 +332,13 @@ class ProbeRuntime:
             and site_ok
             and watched_ok
         ):
-            return
+            return False
 
         msg = (
             f"Probe '{probe_id}' failed lock check (.probes/lock.json missing or out of date). "
             "Run `probe check` or set PROBE_SKIP_LOCK=1."
         )
-        self._record_and_halt_error(
+        return self._record_and_halt_error(
             probe_id=probe_id,
             probe_type=probe_type,
             checks=checks,
@@ -367,7 +367,7 @@ class ProbeRuntime:
         file_line: str,
         payload_json: str,
         caller_frame: FrameType | None = None,
-    ) -> None:
+    ) -> bool:
         """Enforce sliding-window and optional per-run caps; trip PROBE_MISUSE before calling models."""
         rl = self.config.rate_limit
         now = time.monotonic()
@@ -400,7 +400,7 @@ class ProbeRuntime:
                     )
 
         if breach_reason is not None:
-            self._record_and_halt_error(
+            return self._record_and_halt_error(
                 probe_id=probe_id,
                 probe_type=probe_type,
                 checks=checks,
@@ -415,6 +415,7 @@ class ProbeRuntime:
                 stack_excerpt=_short_stack_excerpt(caller_frame),
                 caller_frame=caller_frame,
             )
+        return False
 
     def _record_and_halt_error(
         self,
@@ -432,7 +433,7 @@ class ProbeRuntime:
         analysis: str,
         stack_excerpt: str,
         caller_frame: FrameType | None,
-    ) -> None:
+    ) -> bool:
         self.store.insert_event(
             run_id=self.run_id,
             call_seq=call_seq,
@@ -451,7 +452,7 @@ class ProbeRuntime:
             stack_excerpt=stack_excerpt,
             latency_ms=0.0,
         )
-        self._trigger_halt(
+        return self._trigger_halt(
             call_seq=call_seq,
             probe_id=probe_id,
             file_line=file_line,
@@ -477,16 +478,17 @@ class ProbeRuntime:
         """Log an unhandled target-function exception without grading or masking the crash."""
         if self.is_tripped:
             return
+        caps = self.config.runtime
         payload_json = serialize_call_snapshot(
             inputs_data,
             redactor=self.redactor,
             exception=exception,
-            max_depth=self.config.runtime.max_depth,
-            max_items=self.config.runtime.max_items,
-            max_str_bytes=self.config.runtime.max_str_bytes,
+            max_depth=caps.max_depth,
+            max_items=caps.max_items,
+            max_str_bytes=caps.max_str_bytes,
         )
-        summary = self.redactor.scrub_text(f"{type(exception).__name__}: {exception}")
-        clean_tb = self.redactor.scrub_text(exc_traceback.strip())
+        summary = _scrub_and_truncate(f"{type(exception).__name__}: {exception}", self.redactor, caps.max_str_bytes)
+        clean_tb = _scrub_and_truncate(exc_traceback.strip(), self.redactor, max(caps.max_str_bytes, 16384))
         self.store.insert_event(
             run_id=self.run_id,
             call_seq=call_seq,
@@ -516,7 +518,7 @@ class ProbeRuntime:
         checks: tuple[str, ...],
         payload_json: str,
     ) -> GradedEvent:
-        """Execute decision/text model evaluation without mutating DB or halting state."""
+        """Execute decision/text model evaluation without mutating run logs or halting state."""
         t0 = time.perf_counter()
         analysis_text: str | None = None
         scores: list[CheckScore] = []
@@ -558,7 +560,7 @@ class ProbeRuntime:
         except BackendError as exc:
             verdict = "error"
             error_code = "BACKEND_ERROR"
-            analysis_text = self.redactor.scrub_text(str(exc))
+            analysis_text = _scrub_and_truncate(str(exc), self.redactor, self.config.runtime.max_str_bytes)
 
         latency_ms = round((time.perf_counter() - t0) * 1000.0, 3)
         return GradedEvent(
@@ -585,7 +587,8 @@ class ProbeRuntime:
         caller_frame: FrameType | None = None,
         stack_excerpt: str | None = None,
     ) -> None:
-        """Persist a GradedEvent in SQLite and halt on fail or strict_api error."""
+        """Persist a GradedEvent in the JSONL store and halt on fail or strict_api error."""
+        self.ensure_not_tripped()
         final_stack = stack_excerpt
         if graded.verdict in {"fail", "error"} and not final_stack:
             final_stack = _short_stack_excerpt(caller_frame)
@@ -645,7 +648,7 @@ class ProbeRuntime:
         caller_frame: FrameType | None = None,
         stack_excerpt: str | None = None,
     ) -> None:
-        """Run decision/text grading inline for one event, persist to SQLite, and halt on fail."""
+        """Run decision/text grading inline for one event, persist to JSONL, and halt on fail."""
         self.ensure_not_tripped()
         graded = self.grade_event(
             probe_id=probe_id,
@@ -672,15 +675,16 @@ class ProbeRuntime:
         file_line: str,
         summary: str,
         caller_frame: FrameType | None,
-    ) -> None:
+    ) -> bool:
         halt_msg = f"[PROBE HALT] call #{call_seq:03d} {probe_id} ({file_line}): {summary}"
         with self._state_lock:
+            is_closed = self._closed
             first_halt = not self._tripped
             self._tripped = True
             if first_halt:
                 self._halt_reason = halt_msg
 
-        if first_halt:
+        if first_halt and not is_closed:
             self.store.finish_run(
                 self.run_id,
                 status="halted",
@@ -692,6 +696,7 @@ class ProbeRuntime:
         use_pdb = (
             caller_frame is not None
             and threading.current_thread() is threading.main_thread()
+            and "PYTEST_CURRENT_TEST" not in os.environ
             and not is_no_pdb(self.cwd)
             and bool(getattr(sys.stdin, "isatty", lambda: False)())
             and bool(getattr(sys.stdout, "isatty", lambda: False)())
@@ -699,11 +704,11 @@ class ProbeRuntime:
         )
         if use_pdb:
             pdb.Pdb().set_trace(caller_frame)
-            return
+            return True
         raise ProbeHaltError(halt_msg)
 
     def close(self) -> None:
-        """Finalize run status and close model clients and SQLite store on exit."""
+        """Finalize run status and close model clients and store on exit."""
         with self._state_lock:
             if self._closed:
                 return
@@ -715,12 +720,18 @@ class ProbeRuntime:
         if atexit_was_registered:
             atexit.unregister(self.close)
 
-        if not tripped:
-            self.store.finish_run(
-                self.run_id,
-                status="completed",
-                finished_at=utc_now_iso(),
-            )
-        self.decision_backend.close()
-        self.text_backend.close()
-        self.store.close()
+        try:
+            if not tripped:
+                self.store.finish_run(
+                    self.run_id,
+                    status="completed",
+                    finished_at=utc_now_iso(),
+                )
+        finally:
+            try:
+                self.decision_backend.close()
+            finally:
+                try:
+                    self.text_backend.close()
+                finally:
+                    self.store.close()
