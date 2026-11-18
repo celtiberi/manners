@@ -363,17 +363,21 @@ def report_cmd(
     fmt: str = typer.Option("text", "--format", help="Output format: text | md | json."),
 ) -> None:
     """Print call-ordered summary of the latest or specified probe run."""
-    cfg = load_config()
-    runs_dir = cfg.resolve_runs_dir()
-    store = _open_existing_store(runs_dir)
     try:
-        run = store.get_run(run_id)
-        if run is None:
-            typer.echo(f"No matching run found in {runs_dir}.", err=True)
-            raise typer.Exit(code=1)
-        events = store.list_events(run.id)
-    finally:
-        store.close()
+        cfg = load_config()
+        runs_dir = cfg.resolve_runs_dir()
+        store = _open_existing_store(runs_dir)
+        try:
+            run, events = store.get_run_with_events(run_id)
+        finally:
+            store.close()
+    except (BackendError, ValueError, OSError) as exc:
+        typer.echo(f"Error: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+
+    if run is None:
+        typer.echo(f"No matching run found in {runs_dir}.", err=True)
+        raise typer.Exit(code=1)
 
     fmt_norm = fmt.strip().lower()
     if fmt_norm == "json":
@@ -403,17 +407,21 @@ def log_cmd(
     if not probe_ids or any(not pat.strip() for pat in probe_ids):
         typer.echo("Probe ID or glob pattern must not be empty.", err=True)
         raise typer.Exit(code=1)
-    cfg = load_config()
-    runs_dir = cfg.resolve_runs_dir()
-    store = _open_existing_store(runs_dir)
     try:
-        run = store.get_run(run_id)
-        if run is None:
-            typer.echo(f"No matching run found in {runs_dir}.", err=True)
-            raise typer.Exit(code=1)
-        events = store.list_events(run.id, probe_patterns=probe_ids)
-    finally:
-        store.close()
+        cfg = load_config()
+        runs_dir = cfg.resolve_runs_dir()
+        store = _open_existing_store(runs_dir)
+        try:
+            run = store.get_run(run_id)
+            if run is None:
+                typer.echo(f"No matching run found in {runs_dir}.", err=True)
+                raise typer.Exit(code=1)
+            events = store.list_events(run.id, probe_patterns=probe_ids)
+        finally:
+            store.close()
+    except (BackendError, ValueError, OSError) as exc:
+        typer.echo(f"Error: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
 
     fmt_norm = fmt.strip().lower()
     if fmt_norm == "json":
@@ -434,9 +442,10 @@ def log_cmd(
             lines.append("No matching events.")
         for ev in events:
             sec = ev.elapsed_ms / 1000.0
+            halt_note = " **(HALT TRIGGER)**" if run.halt_call_seq == ev.call_seq else ""
             lines.append(
                 f"- `#{ev.call_seq:03d}` `+{sec:.3f}s` **`[{ev.verdict.upper()}]`** "
-                f"`{ev.probe_id}` (`{ev.file_line}`)"
+                f"`{ev.probe_id}` (`{ev.file_line}`) `[kind={ev.probe_type}]`{halt_note}"
             )
             if ev.error_code:
                 lines.append(f"  - error: `{ev.error_code}`")
@@ -486,12 +495,16 @@ def runs_cmd(
     json_out: bool = typer.Option(False, "--json", help="Emit JSON output."),
 ) -> None:
     """List recent probe runs with timestamps, verdict counts, and status."""
-    cfg = load_config()
-    store = _open_existing_store(cfg.resolve_runs_dir())
     try:
-        runs = store.list_runs(limit=limit)
-    finally:
-        store.close()
+        cfg = load_config()
+        store = _open_existing_store(cfg.resolve_runs_dir())
+        try:
+            runs = store.list_runs(limit=limit)
+        finally:
+            store.close()
+    except (BackendError, ValueError, OSError) as exc:
+        typer.echo(f"Error: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
 
     if json_out:
         typer.echo(json.dumps({"runs": [dataclasses.asdict(r) for r in runs]}, indent=2, ensure_ascii=False))
@@ -514,10 +527,14 @@ def clean_cmd(
     keep: int = typer.Option(20, "--keep", min=0, help="Number of newest runs to retain."),
 ) -> None:
     """Prune old run logs from .probes/runs."""
-    cfg = load_config()
-    store = _open_existing_store(cfg.resolve_runs_dir(), read_only=False)
     try:
-        deleted = store.clean_runs(keep=keep)
-    finally:
-        store.close()
+        cfg = load_config()
+        store = _open_existing_store(cfg.resolve_runs_dir(), read_only=False)
+        try:
+            deleted = store.clean_runs(keep=keep)
+        finally:
+            store.close()
+    except (BackendError, ValueError, OSError) as exc:
+        typer.echo(f"Error: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
     typer.echo(f"Removed {deleted} old run(s) (kept newest {keep}).")

@@ -383,9 +383,34 @@ def test_cli_list_report_log_runs_clean(tmp_path: Path, monkeypatch) -> None:
     assert lpos1 < lpos2 < lpos3
     assert "payload:" in log_multi.stdout
 
+    log_md = runner.invoke(app, ["log", "tutor.opening_turn", "rag.*", "--format", "md"])
+    assert log_md.exit_code == 0
+    assert "[kind=text]" in log_md.stdout
+    assert "[kind=decision]**(HALT TRIGGER)**" not in log_md.stdout
+    assert "`[kind=decision]` **(HALT TRIGGER)**" in log_md.stdout
+
     runs_res = runner.invoke(app, ["runs", "--json"])
     assert runs_res.exit_code == 0
     assert len(json.loads(runs_res.stdout)["runs"]) == 2
+
+    # Clean exit code 1 with Error message when config is invalid across CLI subcommands.
+    broken_cfg_project = tmp_path / "bad_cli_cfg"
+    broken_cfg_project.mkdir()
+    (broken_cfg_project / "pyproject.toml").write_text(
+        "[project]\nname = 'bad-cfg'\n[tool.probe.decision]\npass_threshold = 1.0\n",
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(broken_cfg_project)
+    for bad_args in (
+        ["report"],
+        ["log", "tutor.*"],
+        ["runs"],
+        ["clean"],
+    ):
+        err_res = runner.invoke(app, bad_args)
+        assert err_res.exit_code == 1
+        assert "Error:" in err_res.stderr
+    monkeypatch.chdir(tmp_path)
 
     log_no_payload = runner.invoke(app, ["log", "tutor.opening_turn", "--format", "json"])
     assert log_no_payload.exit_code == 0

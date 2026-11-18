@@ -62,9 +62,17 @@ def probe(
 ) -> Callable[[F], F]: ...
 ```
 
-- `checks`: One expectation string or a list of discrete expectations checked against arguments and return value (or exception).
+- `checks`: One expectation string or a list of discrete expectations checked against arguments and return value.
 - `id`: Probe identifier (e.g., `"tutor.opening_turn"`). Defaults to `<module>.<qualname>`.
 - `kind`: `probe.type.decision` *(default)* or `probe.type.text`.
+
+Waitpoints and decorators can also be suppressed inside targeted blocks (such as unit tests with mocked LLM clients when `PROBES=1` is set globally):
+
+```python
+with probe.disabled():  # or `from probe import disabled`
+    ...
+```
+*(Overrides `PROBES=1` inside the active async/thread context without mutating environment variables.)*
 
 ### 2.3 `probe.here` Watchpoint
 
@@ -126,7 +134,7 @@ Before a snapshot is written to `.probes/runs/<run_id>.jsonl` or sent to any mod
 
 To catch probes accidentally placed inside row/item loops without cutting off long-lived local dev servers, `[rate_limit]` applies a sliding-window check per `probe_id`:
 
-- Default: max `5` calls per `10.0` seconds sliding window, with `max_calls_per_run = -1` (unlimited; set a non-negative integer in config to enforce a per-run ceiling).
+- Default: max `20` calls per `10.0` seconds sliding window, with `max_calls_per_run = -1` (unlimited; set a non-negative integer in config to enforce a per-run ceiling).
 - If breached: trip that probe's circuit breaker before making another model call, record `verdict = "error"` (`error_code = "PROBE_MISUSE"`) with caller stack trace, and halt execution (§3.5).
 
 ### 3.4 Verdict Pipeline (`pass` / `fail`)
@@ -172,7 +180,7 @@ Probes must pass `probe check` before running (and whenever checks, `kind`, or t
 1. **Static AST scan:** Extracts `@probe(...)` and `probe.here(...)` calls, signatures, and bodies without importing project modules.
 2. **Gate 1 — Budgets & structure:** Checks for duplicate `probe_id`s, `len(checks) <= max_checks` (default `5`), and `len(check) <= max_check_chars` (default `200`).
 3. **Gate 2 — Assert vs. prose audit (`[models.text]` + `[models.decision]`):** `[models.text]` describes factually what each check inspects at runtime, and `[models.decision]` scores the Gate 2 `noul` propositions—rejecting checks that belong as regular Python `assert`s or regexes (math, null checks, regex matches, type/length checks), vague unfalsifiable filler, or checks requiring uncaptured external state.
-4. **Gate 3 — Dry-run calibration:** Skipped when `(probe_id, site, kind, watched_keys)` and combined `(checks, source, manual fixture)` hashes are unchanged in `.probes/lock.json` (unless `--force`). Uses fixtures from `.probes/fixtures/<probe_id>.json` if present, or asks `[models.text]` for one passing and one failing sample matching the signature, then verifies the configured evaluator scores the valid sample `pass` and the broken sample `fail`.
+4. **Gate 3 — Dry-run calibration:** Skipped when `(probe_id, site, kind, watched_keys, param_names)` and combined `(checks, source, threshold, domain_context, manual fixture)` hashes are unchanged in `.probes/lock.json` (unless `--force`). Uses fixtures from `.probes/fixtures/<probe_id>.json` if present, or asks `[models.text]` for one passing and one failing sample matching the signature (retrying synthetic synthesis up to 1x on transient shape/calibration failures), then verifies the configured evaluator scores the valid sample `pass` and the broken sample `fail`.
 
 ---
 
@@ -220,11 +228,13 @@ Chronological Timeline (ordered by call_seq):
 
 ### 6.1 Configuration (`~/.config/probe/config.toml` + `[tool.probe]`)
 
-Shared user config lives in `~/.config/probe/config.toml`; projects can override individual keys under `[tool.probe]` in `pyproject.toml`.
+Shared user config lives in `~/.config/probe/config.toml`; projects can override individual keys under `[tool.probe]` in `pyproject.toml`. When a user config already defines remote endpoints, external `pyproject.toml` overrides to different remote origins require `PROBE_TRUST_PROJECT_ENDPOINTS=1` (prevents untrusted repos from redirecting API keys).
 
 **Example — Cloud Profile (`typesafe_jev` + `deepseek`):**
 
 ```toml
+domain_context = ""              # Optional short domain conventions shared across Gate 2/3 and runtime
+
 [models.decision]
 provider = "typesafe_jev"
 url = "https://api.typesafe.ai/v1/systemone"
@@ -252,11 +262,13 @@ url = "http://127.0.0.1:11434/v1"
 model = "qwen3.5:9b"
 ```
 
-*(You can also configure `provider = "onnx_nli"` with local ONNX weights — default `max_length = 512`, truncating premise `only_first` — or mix cloud `[models.decision]` `typesafe_jev` with local Ollama `[models.text]` `qwen3.5:9b`.)*
+*(You can also configure `provider = "onnx_nli"` with local ONNX weights — default `max_length = 512`, `onnx_output = "logits"` or `"probabilities"`, optional explicit `entailment_index` / `contradiction_index`, truncating premise `only_first` — or mix cloud `[models.decision]` `typesafe_jev` with local Ollama `[models.text]` `qwen3.5:9b`.)*
 
 **Shared Settings:**
 
 ```toml
+domain_context = ""              # Optional domain conventions (keeps check strings concise)
+
 [decision]
 pass_threshold = 0.50            # Check passes iff p > pass_threshold
 
@@ -267,7 +279,7 @@ explain_decision_failures = true
 system_prompt = ""               # Optional custom instructions for [models.text]
 
 [rate_limit]
-max_calls = 5
+max_calls = 20
 window_seconds = 10.0
 max_calls_per_run = -1           # -1 = unlimited; set >= 0 for a per-run hard cap
 
@@ -290,6 +302,7 @@ lock_path = ".probes/lock.json"
 - `PROBE_CONFIG`: Optional path override for `config.toml`
 - `PROBE_SKIP_LOCK`: `1` to bypass `.probes/lock.json` during rapid local edits
 - `PROBE_NO_PDB`: `1` to always raise `ProbeHaltError` instead of opening `pdb` in interactive terminals
+- `PROBE_TRUST_PROJECT_ENDPOINTS`: `1` to allow project `pyproject.toml` to redirect remote model endpoint origins configured in user `config.toml`
 
 ### 6.2 Per-Run JSONL Log Format (`.probes/runs/<run_id>.jsonl`)
 
