@@ -1,6 +1,27 @@
 # `probe`
 
-Runtime checks and call-ordered debug logs for Python functions and LLM outputs. See [`SPEC.md`](./SPEC.md) for the full design.
+Plain-English runtime behavioral checks (`@probe` and `probe.here`) and call-ordered debug logs for Python. See [`SPEC.md`](./SPEC.md) for the full design.
+
+## Why This Exists
+
+Python `assert`s, type checks, and regexes catch structural bugs (`x is not None`, `len(items) > 0`, valid JSON), and you should keep using them for that. They don't catch behavioral bugs where a function returns a valid string or dict whose content is wrong—especially in code that calls LLMs, formats prompts, or combines retrieved context.
+
+Two examples where normal assertions come up short:
+
+- A tutor function returns `200 OK` and a valid Spanish reply, so tests pass—even though the reply gave away the exact Spanish sentence the student was supposed to try saying themselves.
+- A RAG endpoint returns a clean, grammatical summary that invents a dollar figure or date that wasn't in the retrieved chunks.
+
+Normally you only spot those by manually clicking through your app or reading through raw prompt/response logs later. `probe` lets you put checks right on the function (`@probe`) or mid-function line (`probe.here`) so execution stops on the exact call that broke them.
+
+## How It Works
+
+- **Off by default (`PROBES=0` or unset):** `@probe` returns the original function unwrapped and `probe.here` does nothing. Probes can stay in application code with zero latency or API cost in production.
+- **On when testing or debugging (`PROBES=1` in shell or `.env`):** Start your web server, CLI script, or `pytest` run with `PROBES=1`. When a probed function or `probe.here` line runs, `probe` snapshots inputs, return values, and watched variables, scrubs secrets collected from `.env*` and `os.environ` (plus `password`, `authorization`, and `cookie` fields), and evaluates the checks inline.
+- **Stops on the live frame:** If any check fails (or an optional `when="..."` breakpoint condition holds), `probe` logs the snapshot and per-check scores to `.probes/probes.db` and stops before the function returns—opening `pdb` on that caller frame in an interactive terminal, or raising `ProbeHaltError` in tests and scripts.
+- **Guardrails against misuse and noisy grading:**
+  - **`probe check`:** Run on new or edited probes (approved hashes are saved in `.probes/lock.json`). It rejects checks that belong in regular Python `assert`s or regexes, and dry-runs each probe against a passing and failing sample before running live code.
+  - **Loop protection (`PROBE_MISUSE`):** Each probe is guarded by a sliding-window limit (`5` calls per `10.0` seconds by default) so accidentally calling a probe inside a tight loop halts the process before wasting API calls.
+  - **Two configurable model roles (`decision` + `text`):** `probe.type.decision` (default) uses a decision model (such as TypeSafe Jev or a local endpoint) that scores each check in `0.0–1.0` -> `pass` or `fail`. `probe.type.text` runs a chat LLM first when open-ended analysis is helpful, then sends that analysis to the decision model for the final `pass` or `fail`.
 
 ## Install
 
@@ -65,8 +86,6 @@ PROBES=1 uvicorn app:app --reload
 PROBES=1 pytest
 ```
 
-Each probe checks inputs/outputs inline. On failure (or `when=` match), `probe` opens `pdb` on that caller frame in an interactive terminal or raises `ProbeHaltError`.
-
 4. Inspect results in call-entry order (works while a server is running too, via SQLite WAL):
 
 ```sh
@@ -74,6 +93,17 @@ probe report --all
 probe log tutor.opening_turn rag.*
 probe runs
 ```
+
+## CLI
+
+| Command | Purpose |
+|---|---|
+| `probe check [paths...]` | Audit checks (Gate 1–2), run pass/fail calibration (Gate 3), and update `.probes/lock.json`. |
+| `probe list [paths...]` | List discovered `@probe` and `probe.here` sites with lock status. |
+| `probe report [--run ID] [--all]` | Show call-ordered summary of failures/errors (or all events with `--all`). |
+| `probe log <probe_id>... [--payload]` | Interleave chronological events across one or more probe IDs or globs. |
+| `probe runs` | List recorded runs and pass/fail/error counts. |
+| `probe clean [--keep N]` | Prune older runs from `.probes/probes.db` (default keeps last 20). |
 
 ## Configuration (`~/.config/probe/config.toml`)
 
