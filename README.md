@@ -9,7 +9,7 @@ Python `assert`s, type checks, and regexes catch structural bugs (`x is not None
 Two examples where normal assertions come up short:
 
 - An assistant endpoint returns `200 OK` and a valid reply, so tests pass—even though the reply tells the user an action was completed (like issuing a refund or updating an account) when no tool call actually ran.
-- A RAG endpoint returns a clean, grammatical summary that invents a dollar figure or date that wasn't in the retrieved chunks.
+- A RAG endpoint summarizes a policy doc using the exact words and numbers from the retrieved chunks, yet flips the meaning—telling a user they qualify when the chunk says their tier is excluded.
 
 Normally you only spot those by manually clicking through your app or reading through raw prompt/response logs later. `probe` lets you put checks right on the function (`@probe`) or mid-function line (`probe.here`) so execution stops on the exact call that broke them.
 
@@ -65,7 +65,7 @@ probe.here(
     ],
     id="rag.draft_answer",
     kind=probe.type.text,
-    when="draft cites specific figures or dates absent from retrieved_chunks",
+    when="draft answers confidently even though retrieved_chunks do not cover user_question",
     user_question=question,
     retrieved_chunks=chunks,
     draft=draft_text,

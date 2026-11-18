@@ -75,12 +75,12 @@ Mid-function check for intermediate values such as LLM drafts, prompts, or retri
 ```python
 probe.here(
     [
-        "Draft answer stays strictly grounded in the retrieved chunks without inventing figures or dates",
+        "Draft answer stays faithful to the meaning and conditions of retrieved_chunks",
         "Draft answer directly addresses the user's question",
     ],
     id="rag.draft_answer",
     kind=probe.type.text,
-    when="draft cites specific figures, dates, or policy rules absent from retrieved_chunks",
+    when="draft answers confidently even though retrieved_chunks do not cover user_question",
     user_question=question,
     retrieved_chunks=chunks,
     draft=draft_text,
