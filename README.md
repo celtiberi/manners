@@ -8,7 +8,7 @@ Python `assert`s, type checks, and regexes catch structural bugs (`x is not None
 
 Two examples where normal assertions come up short:
 
-- A tutor function returns `200 OK` and a valid Spanish reply, so tests pass—even though the reply gave away the exact Spanish sentence the student was supposed to try saying themselves.
+- An assistant endpoint returns `200 OK` and a valid reply, so tests pass—even though the reply tells the user an action was completed (like issuing a refund or updating an account) when no tool call actually ran.
 - A RAG endpoint returns a clean, grammatical summary that invents a dollar figure or date that wasn't in the retrieved chunks.
 
 Normally you only spot those by manually clicking through your app or reading through raw prompt/response logs later. `probe` lets you put checks right on the function (`@probe`) or mid-function line (`probe.here`) so execution stops on the exact call that broke them.
