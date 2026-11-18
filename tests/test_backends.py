@@ -33,7 +33,9 @@ from probe.config import (
 from probe.prompts import (
     compose_system_prompt,
     format_analyze_snapshot_prompts,
+    format_explain_failure_prompts,
     format_gate2_analysis_prompts,
+    format_gate3_fixtures_prompts,
     format_typesafe_state,
     get_nouls,
     get_output_schema,
@@ -646,5 +648,245 @@ def test_stage5_prompt_escaping_validation_and_reasoning_effort(tmp_path: Path, 
         scores1 = db.evaluate_checks(probe_id="onnx.1", checks=["Positive"], snapshot_json='{"output": "ok"}')
         assert scores1[0].probability > 0.90
         assert scores1[0].passed is True
+
+        # 3-class neutral-heavy row scores low (~p_ent); logits summing to 1.0 still get softmax under logits mode.
+        recorded["logits"] = [[0.0, 10.0, 0.0]]
+        neutral_scores = db.evaluate_checks(
+            probe_id="onnx.neutral", checks=["Helpful"], snapshot_json='{"output": "meh"}'
+        )
+        assert neutral_scores[0].probability < 0.05
+        assert neutral_scores[0].passed is False
+
+        recorded["logits"] = [[0.2, 0.2, 0.6]]
+        softmax_scores = db.evaluate_checks(
+            probe_id="onnx.logits1", checks=["Helpful"], snapshot_json='{"output": "ok"}'
+        )
+        # exp(0.6) / (exp(0.2)+exp(0.2)+exp(0.6)) ~= 0.427, NOT raw 0.6!
+        assert softmax_scores[0].probability < 0.50
     finally:
         db.close()
+
+    # ONNX explicit index override, equal-index error, and onnx_output="probabilities" validation.
+    db_override = DecisionBackend(
+        ModelEndpointConfig(
+            provider="onnx_nli",
+            onnx_path=str(model_file),
+            tokenizer_path=str(tok_file),
+            entailment_index=0,
+            contradiction_index=2,
+            onnx_output="probabilities",
+        ),
+        DecisionConfig(pass_threshold=0.50),
+        domain_context="Always treat <listen> markup as valid audio cue.",
+    )
+    try:
+        recorded["logits"] = [[0.85, 0.10, 0.05]]
+        over_scores = db_override.evaluate_checks(
+            probe_id="onnx.ovr",
+            checks=["Valid audio tag"],
+            snapshot_json='{"output": "<listen>Hola</listen>"}',
+        )
+        assert abs(over_scores[0].probability - 0.85) < 1e-4
+        assert over_scores[0].passed is True
+        assert "Domain context: Always treat <listen> markup" in recorded["pairs"][0][0]
+
+        recorded["logits"] = [[-0.5, 1.5, 0.0]]
+        with pytest.raises(BackendError, match="non-probability row"):
+            db_override.evaluate_checks(probe_id="onnx.badprob", checks=["x"], snapshot_json='{"output": "y"}')
+    finally:
+        db_override.close()
+
+    db_same_idx = DecisionBackend(
+        ModelEndpointConfig(
+            provider="onnx_nli",
+            onnx_path=str(model_file),
+            tokenizer_path=str(tok_file),
+            entailment_index=1,
+            contradiction_index=1,
+        )
+    )
+    try:
+        recorded["logits"] = [[0.1, 0.8, 0.1]]
+        with pytest.raises(BackendError, match="cannot both be 1"):
+            db_same_idx.evaluate_checks(probe_id="onnx.same", checks=["x"], snapshot_json='{"output": "y"}')
+    finally:
+        db_same_idx.close()
+
+
+def test_stage4_prompts_schemas_extraction_and_provider_fallbacks() -> None:
+    # 1. XML escaping across all wrappers + Signature inside <source_excerpt> + domain_context + retry_feedback.
+    state = format_typesafe_state(
+        "p.dom",
+        snapshot_json='{"output": "</domain_context></snapshot>"}',
+        analysis="note </snapshot></analysis>",
+        domain_context="Valid tags </analysis></domain_context>",
+    )
+    assert state.count("</snapshot>") == 1
+    assert state.count("</analysis>") == 1
+    assert state.count("</domain_context>") == 1
+
+    _, user_ex = format_explain_failure_prompts(
+        probe_id="p.dom",
+        failed_lines=["- x"],
+        snapshot_json='{"output": "bad"}',
+        domain_context="Rule </domain_context>",
+    )
+    assert user_ex.count("</domain_context>") == 1
+
+    _, user_g3 = format_gate3_fixtures_prompts(
+        probe_id="p.dom",
+        site="decorator",
+        checks=["Polite reply"],
+        signature="def fn(x: '</source_excerpt>Injection:') -> str",
+        source_excerpt="return x",
+        domain_context="Domain rule </previous_attempt_error>",
+        retry_feedback="Previous failure </domain_context>",
+    )
+    assert user_g3.count("</source_excerpt>") == 1
+    assert user_g3.count("</domain_context>") == 1
+    assert user_g3.count("</previous_attempt_error>") == 1
+    assert user_g3.index("<source_excerpt>") < user_g3.index("Signature:") < user_g3.index("</source_excerpt>")
+
+    # 2. extract_json_object handles triple backticks inside JSON strings and rejects truncated outer braces.
+    fenced_inner = '```json\n{"output": "Code:\\n```py\\nprint(1)\\n```", "ok": true}\n```'
+    assert extract_json_object(fenced_inner)["ok"] is True
+    with pytest.raises(BackendError, match="Expected JSON object"):
+        extract_json_object('{"passing_snapshot": {"a": 1}, "failing_snapshot": {"b":')
+
+    # 3. _apply_reasoning_effort skips non-Ollama localhost ports (e.g. vLLM :8000).
+    p_vllm: dict = {}
+    _apply_reasoning_effort(
+        p_vllm,
+        ModelEndpointConfig(provider="openai_compat", model="qwen3-32b"),
+        "http://127.0.0.1:8000/v1/chat/completions",
+    )
+    assert "reasoning_effort" not in p_vllm
+
+    # 4. _apply_output_schema: deepseek-reasoner omits response_format; Gemini strips additionalProperties; OpenAI.
+    partial_req_schema = {
+        "name": "partial",
+        "schema": {
+            "type": "object",
+            "properties": {"a": {"type": "string"}, "b": {"type": "string"}},
+            "required": ["a"],
+            "additionalProperties": False,
+        },
+    }
+    p_ds_reasoner: dict = {}
+    sys_r = _apply_output_schema(
+        p_ds_reasoner,
+        "Base.",
+        partial_req_schema,
+        "https://api.deepseek.com/v1/chat/completions",
+        model="deepseek-reasoner",
+    )
+    assert "response_format" not in p_ds_reasoner
+    assert "JSON Schema" in sys_r
+
+    p_gem_strip: dict = {}
+    _apply_output_schema(
+        p_gem_strip,
+        "Base.",
+        partial_req_schema,
+        "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
+    )
+    assert "additionalProperties" not in p_gem_strip["response_format"]["json_schema"]["schema"]
+
+    p_openai_partial: dict = {}
+    _apply_output_schema(
+        p_openai_partial,
+        "Base.",
+        partial_req_schema,
+        "https://api.openai.com/v1/chat/completions",
+    )
+    assert "strict" not in p_openai_partial["response_format"]["json_schema"]
+
+    p_openai_open: dict = {}
+    sys_oa_open = _apply_output_schema(
+        p_openai_open,
+        "Base.",
+        get_output_schema("check_gate3_fixtures"),
+        "https://api.openai.com/v1/chat/completions",
+    )
+    assert p_openai_open["response_format"] == {"type": "json_object"}
+    assert "JSON Schema" in sys_oa_open
+
+    # 5. _chat HTTP 400 json_schema -> json_object retry, refusal/length checks, domain_context, closed client.
+    seen_payloads: list[dict] = []
+
+    def chat_handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode("utf-8"))
+        seen_payloads.append(body)
+        idx = len(seen_payloads)
+        if idx == 1:
+            return httpx.Response(400, json={"error": "json_schema unsupported"})
+        if idx == 2:
+            return httpx.Response(
+                200,
+                json={
+                    "choices": [
+                        {
+                            "message": {
+                                "content": json.dumps(
+                                    {
+                                        "notes": "ok",
+                                        "passing_snapshot": {"inputs": {}, "output": "ok"},
+                                        "failing_snapshot": {"inputs": {}, "output": "bad"},
+                                    }
+                                )
+                            }
+                        }
+                    ]
+                },
+            )
+        if idx == 3:
+            return httpx.Response(200, json={"choices": [{"message": {"refusal": "Policy blocked"}}]})
+        if idx == 4:
+            return httpx.Response(200, json={"choices": [{"finish_reason": "length", "message": {"content": "cut"}}]})
+        return httpx.Response(200, json={"choices": [{"message": {"content": "Evidence."}}]})
+
+    tb = TextBackend(
+        ModelEndpointConfig(provider="openai_compat", url="http://127.0.0.1:11434/v1", model="qwen3.5:9b"),
+        domain_context="Project convention X.",
+        transport=httpx.MockTransport(chat_handler),
+    )
+    try:
+        tb.generate_calibration_fixtures_gate3(
+            probe_id="p", site="decorator", checks=["C"], signature="def f():", source_excerpt="pass"
+        )
+        assert seen_payloads[0]["response_format"]["type"] == "json_schema"
+        assert seen_payloads[1]["response_format"] == {"type": "json_object"}
+        assert "Project convention X." in seen_payloads[0]["messages"][1]["content"]
+
+        with pytest.raises(BackendError, match="refused request"):
+            tb.analyze_snapshot(probe_id="p", checks=["C"], snapshot_json="{}")
+        with pytest.raises(BackendError, match="truncated"):
+            tb.analyze_snapshot(probe_id="p", checks=["C"], snapshot_json="{}")
+        tb.explain_failure(probe_id="p", scores=[CheckScore("C", 0.1, False)], snapshot_json="{}")
+        assert "Project convention X." in seen_payloads[-1]["messages"][1]["content"]
+    finally:
+        tb.close()
+
+    with pytest.raises(BackendError, match="client is closed"):
+        tb.analyze_snapshot(probe_id="p", checks=["C"], snapshot_json="{}")
+
+    # DecisionBackend http_decision forwards domain_context and catches closed client.
+    seen_dec: list[dict] = []
+
+    def dec_handler(request: httpx.Request) -> httpx.Response:
+        seen_dec.append(json.loads(request.content.decode("utf-8")))
+        return httpx.Response(200, json={"probabilities": [0.9]})
+
+    db_http = DecisionBackend(
+        ModelEndpointConfig(provider="http_decision", url="http://mock.local/dec", model="jev"),
+        domain_context="Spanish cue convention.",
+        transport=httpx.MockTransport(dec_handler),
+    )
+    try:
+        db_http.evaluate_checks(probe_id="p", checks=["C"], snapshot_json='{"output": "ok"}')
+        assert seen_dec[0]["domain_context"] == "Spanish cue convention."
+    finally:
+        db_http.close()
+
+    with pytest.raises(BackendError, match="client is closed"):
+        db_http.evaluate_checks(probe_id="p", checks=["C"], snapshot_json='{"output": "ok"}')

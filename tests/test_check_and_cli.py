@@ -1029,3 +1029,96 @@ def test_stage3_pruning_moves_fixtures_list_and_verify_lock(tmp_path: Path, monk
     finally:
         probe.probe.flush_for_testing()
         probe.reset_for_testing()
+
+
+def test_stage4_gate3_synthetic_retry_and_manual_fixture_no_retry(tmp_path: Path) -> None:
+    target_py = tmp_path / "retry_demo.py"
+    target_py.write_text(
+        textwrap.dedent(
+            """
+            from probe import probe
+
+            @probe("Responds warmly in Spanish without leaking answers", id="retry.syn")
+            def syn_fn(topic: str) -> str:
+                return topic
+
+            @probe("Stays grounded in context", id="retry.manual")
+            def manual_fn(topic: str) -> str:
+                return topic
+            """
+        ).strip()
+        + "\n",
+        encoding="utf-8",
+    )
+
+    fixtures_dir = tmp_path / ".probes" / "fixtures"
+    fixtures_dir.mkdir(parents=True)
+    # Manual fixture that fails calibration (both pass & fail look BAD) — must NOT retry!
+    (fixtures_dir / "retry.manual.json").write_text(
+        json.dumps(
+            {
+                "pass": {"inputs": {"topic": "coffee"}, "output": "WEAK_MANUAL"},
+                "fail": {"inputs": {"topic": "coffee"}, "output": "WEAK_FAIL"},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    gate3_calls: list[dict] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        url = str(request.url)
+        body = json.loads(request.content.decode("utf-8"))
+        if url.endswith("/chat/completions"):
+            sys_msg = body["messages"][0]["content"]
+            if "passing_snapshot" in sys_msg:
+                gate3_calls.append(body)
+                if len(gate3_calls) == 1:
+                    # Attempt 1: weak passing_snapshot causes calibration failure.
+                    payload = {
+                        "notes": "attempt 1",
+                        "passing_snapshot": {"inputs": {"topic": "coffee"}, "output": "WEAK_SYN"},
+                        "failing_snapshot": {"inputs": {"topic": "coffee"}, "output": "BAD_SYN"},
+                    }
+                else:
+                    # Attempt 2: fixes calibration after receiving retry_feedback & temperature=0.3.
+                    payload = {
+                        "notes": "attempt 2",
+                        "passing_snapshot": {"inputs": {"topic": "coffee"}, "output": "GOOD Hola!"},
+                        "failing_snapshot": {"inputs": {"topic": "coffee"}, "output": "BAD_SYN"},
+                    }
+                return httpx.Response(200, json={"choices": [{"message": {"content": json.dumps(payload)}}]})
+            return httpx.Response(200, json={"choices": [{"message": {"content": "Factual check audit."}}]})
+        if url.endswith("/decision"):
+            if body["probe_id"].endswith("#gate2"):
+                return httpx.Response(200, json={"probabilities": [0.95 for _ in body["checks"]]})
+            ok = "GOOD" in body["snapshot"]
+            return httpx.Response(200, json={"probabilities": [0.95 if ok else 0.15 for _ in body["checks"]]})
+        raise AssertionError(f"Unexpected URL: {url}")
+
+    cfg = ProbeConfig(
+        models_decision=ModelEndpointConfig(provider="http_decision", url="http://mock.local/decision", model="jev"),
+        models_text=ModelEndpointConfig(provider="openai_compat", url="http://mock.local/v1", model="qwen3.5:9b"),
+        decision=DecisionConfig(pass_threshold=0.50),
+        domain_context="Custom pedagogical tag rules.",
+        check=CheckConfig(require_check=True),
+        runtime=RuntimeConfig(
+            runs_dir=str(tmp_path / ".probes" / "runs"),
+            lock_path=str(tmp_path / ".probes" / "lock.json"),
+        ),
+        project_root=tmp_path,
+    )
+
+    ok, results = run_probe_check([target_py], config=cfg, transport=httpx.MockTransport(handler))
+    assert ok is False  # retry.manual failed as intended
+    by_id = {r.probe_id: r for r in results}
+    assert by_id["retry.syn"].status == "passed"
+    assert by_id["retry.manual"].status == "failed" and by_id["retry.manual"].gate == "gate3"
+    # Exactly 2 Gate 3 synthesis calls: attempt 1 + 1x retry for retry.syn, 0 synthesis calls for retry.manual.
+    assert len(gate3_calls) == 2
+    assert gate3_calls[0]["temperature"] == 0.0
+    assert "<previous_attempt_error>" not in gate3_calls[0]["messages"][1]["content"]
+    assert "<domain_context>" in gate3_calls[0]["messages"][1]["content"]
+    assert gate3_calls[1]["temperature"] == 0.3
+    assert "<previous_attempt_error>" in gate3_calls[1]["messages"][1]["content"]
+    assert "failed checks" in gate3_calls[1]["messages"][1]["content"]

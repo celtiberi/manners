@@ -280,11 +280,13 @@ class ProbeRuntime:
             self.decision_backend = DecisionBackend(
                 self.config.models_decision,
                 self.config.decision,
+                domain_context=self.config.domain_context,
                 transport=transport,
             )
             self.text_backend = TextBackend(
                 self.config.models_text,
                 self.config.text,
+                domain_context=self.config.domain_context,
                 transport=transport,
             )
         except BaseException:

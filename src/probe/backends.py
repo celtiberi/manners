@@ -27,6 +27,7 @@ from probe.prompts import (
 
 _THINK_BLOCK_RE = re.compile(r"\A\s*<think>.*?</think>\s*", re.DOTALL | re.IGNORECASE)
 _UNCLOSED_THINK_RE = re.compile(r"\A\s*<think>[\s\S]*\Z", re.DOTALL | re.IGNORECASE)
+_OUTER_CODE_FENCE_RE = re.compile(r"```(?:json)?\s*([\s\S]*)\s*```", re.IGNORECASE)
 _CODE_FENCE_RE = re.compile(r"```(?:json)?\s*(.*?)\s*```", re.DOTALL | re.IGNORECASE)
 
 _DEFAULT_TYPESAFE_URL = "https://api.typesafe.ai/v1/systemone"
@@ -66,8 +67,13 @@ def strip_thinking(text: str) -> str:
 def extract_json_object(text: str) -> dict[str, Any]:
     """Extract the first JSON object from model text, ignoring leading <think> tags and fences."""
     cleaned = strip_thinking(text)
+    outer_fence = _OUTER_CODE_FENCE_RE.search(cleaned)
     fenced = [match.group(1).strip() for match in _CODE_FENCE_RE.finditer(cleaned)]
-    candidates: list[str] = [*fenced, cleaned]
+    candidates: list[str] = []
+    if outer_fence is not None:
+        candidates.append(outer_fence.group(1).strip())
+    candidates.extend(fenced)
+    candidates.append(cleaned)
 
     for candidate in candidates:
         try:
@@ -148,7 +154,7 @@ def _auth_headers(endpoint: ModelEndpointConfig) -> dict[str, str]:
 
 
 def _is_local_ollama_url(url_lower: str) -> bool:
-    return any(tok in url_lower for tok in ("127.0.0.1", "localhost", "[::1]", "::1", ":11434"))
+    return ":11434" in url_lower or "ollama" in url_lower
 
 
 def _apply_reasoning_effort(
@@ -193,11 +199,72 @@ def _schema_has_open_object(node: Any) -> bool:
     return False
 
 
+def _schema_is_openai_strict_compatible(node: Any) -> bool:
+    """Return True if every object node defines properties, all-required keys, and additionalProperties=False."""
+    if isinstance(node, list):
+        return all(_schema_is_openai_strict_compatible(item) for item in node)
+    if not isinstance(node, dict):
+        return True
+
+    node_type = node.get("type")
+    is_obj = node_type == "object" or (isinstance(node_type, list) and "object" in node_type)
+    if is_obj:
+        props = node.get("properties")
+        req = node.get("required")
+        if (
+            not isinstance(props, dict)
+            or not props
+            or node.get("additionalProperties") is not False
+            or not isinstance(req, list)
+            or set(req) != set(props.keys())
+        ):
+            return False
+
+    for key in ("properties", "$defs", "definitions"):
+        sub = node.get(key)
+        if isinstance(sub, dict) and not all(_schema_is_openai_strict_compatible(v) for v in sub.values()):
+            return False
+    if isinstance(node.get("items"), (dict, list)) and not _schema_is_openai_strict_compatible(node["items"]):
+        return False
+    if isinstance(node.get("additionalProperties"), (dict, list)) and not _schema_is_openai_strict_compatible(
+        node["additionalProperties"]
+    ):
+        return False
+    for key in ("anyOf", "oneOf", "allOf"):
+        if isinstance(node.get(key), list) and not all(
+            _schema_is_openai_strict_compatible(v) for v in node[key]
+        ):
+            return False
+    return True
+
+
+def _strip_additional_properties(node: Any) -> Any:
+    """Return a copy of a JSON Schema with 'additionalProperties' keywords stripped."""
+    if isinstance(node, list):
+        return [_strip_additional_properties(item) for item in node]
+    if not isinstance(node, dict):
+        return node
+    out: dict[str, Any] = {}
+    for key, val in node.items():
+        if key == "additionalProperties":
+            continue
+        if key in ("properties", "$defs", "definitions") and isinstance(val, dict):
+            out[key] = {k: _strip_additional_properties(v) for k, v in val.items()}
+        elif key == "items" and isinstance(val, (dict, list)):
+            out[key] = _strip_additional_properties(val)
+        elif key in ("anyOf", "oneOf", "allOf") and isinstance(val, list):
+            out[key] = [_strip_additional_properties(v) for v in val]
+        else:
+            out[key] = val
+    return out
+
+
 def _apply_output_schema(
     payload: dict[str, Any],
     system_text: str,
     output_schema: dict[str, Any] | None,
     url: str,
+    model: str = "",
 ) -> str:
     """Translate declarative output_schema to the target OpenAI-compat provider format."""
     if output_schema is None:
@@ -205,16 +272,25 @@ def _apply_output_schema(
     name = str(output_schema.get("name") or "response")
     schema = output_schema["schema"]
     url_lower = url.lower()
-    use_json_object_fallback = "deepseek." in url_lower or (
-        "generativelanguage.googleapis.com" in url_lower and _schema_has_open_object(schema)
-    )
-    if use_json_object_fallback:
+    model_lower = (model or "").lower()
+    is_deepseek = "deepseek" in url_lower or "deepseek" in model_lower
+    is_gemini = "generativelanguage.googleapis.com" in url_lower
+    is_openai = "api.openai.com" in url_lower
+
+    if is_deepseek:
+        schema_json = json.dumps(schema, ensure_ascii=False)
+        if "reasoner" not in model_lower:
+            payload["response_format"] = {"type": "json_object"}
+        return f"{system_text}\n\nRespond with a JSON object matching this JSON Schema:\n{schema_json}"
+
+    if (is_gemini or is_openai) and _schema_has_open_object(schema):
         payload["response_format"] = {"type": "json_object"}
         schema_json = json.dumps(schema, ensure_ascii=False)
         return f"{system_text}\n\nRespond with a JSON object matching this JSON Schema:\n{schema_json}"
 
-    json_schema_spec: dict[str, Any] = {"name": name, "schema": schema}
-    if "api.openai.com" in url_lower and not _schema_has_open_object(schema):
+    effective_schema = _strip_additional_properties(schema) if is_gemini else schema
+    json_schema_spec: dict[str, Any] = {"name": name, "schema": effective_schema}
+    if is_openai and _schema_is_openai_strict_compatible(effective_schema):
         json_schema_spec["strict"] = True
     payload["response_format"] = {"type": "json_schema", "json_schema": json_schema_spec}
     return system_text
@@ -234,6 +310,8 @@ def _post_json_with_retry(
             resp = client.post(url, json=payload, headers=headers)
         except httpx.InvalidURL as exc:
             raise BackendError(f"{role_label} invalid URL ({url}): {exc}") from exc
+        except RuntimeError as exc:
+            raise BackendError(f"{role_label} HTTP client is closed ({url}): {exc}") from exc
         except httpx.HTTPError as exc:
             if attempt < _MAX_HTTP_ATTEMPTS:
                 time.sleep(_RETRY_BACKOFF_S)
@@ -269,10 +347,12 @@ class DecisionBackend:
         endpoint: ModelEndpointConfig,
         decision_cfg: DecisionConfig | None = None,
         *,
+        domain_context: str = "",
         transport: httpx.BaseTransport | None = None,
     ) -> None:
         self.endpoint = endpoint
         self.pass_threshold = (decision_cfg or DecisionConfig()).pass_threshold
+        self.domain_context = domain_context.strip()
         self._client = httpx.Client(
             timeout=httpx.Timeout(endpoint.timeout_s, connect=10.0),
             transport=transport,
@@ -348,7 +428,12 @@ class DecisionBackend:
         raw_model = (self.endpoint.model or "").strip()
         eff_model = _DEFAULT_TYPESAFE_MODEL if raw_model in _LEGACY_JEV_MODELS else raw_model
 
-        state_str = format_typesafe_state(probe_id, snapshot_json, analysis)
+        state_str = format_typesafe_state(
+            probe_id,
+            snapshot_json,
+            analysis,
+            domain_context=self.domain_context,
+        )
 
         questions = {
             f"q{i}": {"type": "noul", "instructions": check}
@@ -394,6 +479,8 @@ class DecisionBackend:
         }
         if analysis:
             payload["analysis"] = analysis
+        if self.domain_context:
+            payload["domain_context"] = self.domain_context
 
         data = self._post_json(url, payload)
         return _parse_probabilities_payload(data, checks)
@@ -443,7 +530,7 @@ class DecisionBackend:
 
     def _eval_onnx_nli(self, checks: list[str], snapshot_json: str, analysis: str) -> list[float]:
         sess, tok, np = self._ensure_onnx_loaded()
-        premise = _format_onnx_premise(snapshot_json, analysis)
+        premise = _format_onnx_premise(snapshot_json, analysis, self.domain_context)
         try:
             encs = tok.encode_batch([(premise, check) for check in checks])
             ids = np.array([e.ids for e in encs], dtype=np.int64)
@@ -469,32 +556,49 @@ class DecisionBackend:
                 probs_out.append(_clamp_prob(1.0 / (1.0 + math.exp(-logit))))
             return probs_out
 
-        ent_idx = self._onnx_ent_idx
-        if ent_idx is None:
-            if num_classes >= 3 and self.endpoint.entailment_index == 1 and self.endpoint.contradiction_index == 0:
-                ent_idx = 2
-            else:
-                ent_idx = self.endpoint.entailment_index
-        con_idx = (
-            self._onnx_con_idx if self._onnx_con_idx is not None else self.endpoint.contradiction_index
-        )
+        if self.endpoint.entailment_index is not None:
+            ent_idx = self.endpoint.entailment_index
+        elif self._onnx_ent_idx is not None:
+            ent_idx = self._onnx_ent_idx
+        else:
+            ent_idx = 2 if num_classes >= 3 else 1
+
+        if self.endpoint.contradiction_index is not None:
+            con_idx = self.endpoint.contradiction_index
+        elif self._onnx_con_idx is not None:
+            con_idx = self._onnx_con_idx
+        else:
+            con_idx = 0
+
         if not (0 <= ent_idx < num_classes and 0 <= con_idx < num_classes):
             raise BackendError(
                 f"ONNX label indices ({con_idx}, {ent_idx}) out of range for {num_classes} classes"
             )
+        if ent_idx == con_idx:
+            raise BackendError(
+                f"ONNX entailment_index and contradiction_index cannot both be {ent_idx}"
+            )
 
+        output_mode = (self.endpoint.onnx_output or "logits").strip().lower()
         for row in arr:
-            # Softmax when raw logits (rows not summing near 1 or negative values present).
-            if np.any(row < 0.0) or not math.isclose(float(np.sum(row)), 1.0, abs_tol=0.05):
+            if output_mode == "probabilities":
+                if np.any(row < 0.0) or not math.isclose(float(np.sum(row)), 1.0, abs_tol=0.05):
+                    raise BackendError(
+                        "ONNX model configured with onnx_output='probabilities' returned non-probability row"
+                    )
+                row_probs = row
+            else:
                 shifted = row - np.max(row)
                 exps = np.exp(shifted)
                 row_probs = exps / np.sum(exps)
-            else:
-                row_probs = row
+
             p_ent = float(row_probs[ent_idx])
-            p_con = float(row_probs[con_idx])
-            denom = p_ent + p_con
-            score = (p_ent / denom) if denom > 1e-9 else 0.5
+            if num_classes >= 3:
+                score = p_ent
+            else:
+                p_con = float(row_probs[con_idx])
+                denom = p_ent + p_con
+                score = (p_ent / denom) if denom > 1e-9 else 0.5
             probs_out.append(_clamp_prob(score))
         return probs_out
 
@@ -538,11 +642,14 @@ def _read_onnx_label_indices(onnx_path: str) -> tuple[int | None, int | None]:
     return ent_idx, con_idx
 
 
-def _format_onnx_premise(snapshot_json: str, analysis: str) -> str:
-    """Place analysis and observed outputs/watched vars first so truncation keeps key evidence."""
+def _format_onnx_premise(snapshot_json: str, analysis: str, domain_context: str = "") -> str:
+    """Place analysis, domain context, and observed outputs/watched vars first so truncation keeps key evidence."""
     parts: list[str] = []
     if analysis:
         parts.append(f"Analysis: {analysis}")
+    ctx = domain_context.strip()
+    if ctx:
+        parts.append(f"Domain context: {ctx}")
     try:
         parsed = json.loads(snapshot_json)
     except ValueError:
@@ -570,6 +677,7 @@ class TextBackend:
         endpoint: ModelEndpointConfig,
         text_cfg: TextConfig | None = None,
         *,
+        domain_context: str = "",
         transport: httpx.BaseTransport | None = None,
     ) -> None:
         provider = (endpoint.provider or "").strip().lower()
@@ -579,6 +687,7 @@ class TextBackend:
             )
         self.endpoint = endpoint
         self.text_cfg = text_cfg or TextConfig()
+        self.domain_context = domain_context.strip()
         self._client = httpx.Client(
             timeout=httpx.Timeout(endpoint.timeout_s, connect=10.0),
             transport=transport,
@@ -595,6 +704,7 @@ class TextBackend:
         max_tokens: int | None = None,
         include_user_system: bool = True,
         output_schema: dict[str, Any] | None = None,
+        temperature: float = 0.0,
     ) -> str:
         url = _chat_completions_url(self.endpoint.url)
         full_system = (
@@ -602,22 +712,54 @@ class TextBackend:
         )
         payload: dict[str, Any] = {
             "model": self.endpoint.model,
-            "temperature": 0.0,
+            "temperature": temperature,
             "max_tokens": max_tokens if max_tokens is not None else self.text_cfg.max_tokens,
         }
-        full_system = _apply_output_schema(payload, full_system, output_schema, url)
+        full_system = _apply_output_schema(
+            payload,
+            full_system,
+            output_schema,
+            url,
+            model=self.endpoint.model,
+        )
         payload["messages"] = [
             {"role": "system", "content": full_system},
             {"role": "user", "content": user},
         ]
         _apply_reasoning_effort(payload, self.endpoint, url)
-        data = _post_json_with_retry(
-            self._client,
-            url,
-            payload,
-            self.endpoint,
-            role_label="Text LLM",
-        )
+        try:
+            data = _post_json_with_retry(
+                self._client,
+                url,
+                payload,
+                self.endpoint,
+                role_label="Text LLM",
+            )
+        except BackendError as exc:
+            if (
+                output_schema is not None
+                and payload.get("response_format", {}).get("type") == "json_schema"
+                and "HTTP 400" in str(exc)
+            ):
+                schema_json = json.dumps(output_schema["schema"], ensure_ascii=False)
+                fallback_system = (
+                    f"{full_system}\n\nRespond with a JSON object matching this JSON Schema:\n{schema_json}"
+                )
+                fallback_payload = dict(payload)
+                fallback_payload["response_format"] = {"type": "json_object"}
+                fallback_payload["messages"] = [
+                    {"role": "system", "content": fallback_system},
+                    {"role": "user", "content": user},
+                ]
+                data = _post_json_with_retry(
+                    self._client,
+                    url,
+                    fallback_payload,
+                    self.endpoint,
+                    role_label="Text LLM",
+                )
+            else:
+                raise
         cleaned = strip_thinking(_extract_chat_content(data))
         if not cleaned:
             raise BackendError("Text model returned an empty response")
@@ -630,6 +772,7 @@ class TextBackend:
             checks=checks,
             snapshot_json=snapshot_json,
             detail=self.text_cfg.detail,
+            domain_context=self.domain_context,
         )
         return self._chat(system, user)
 
@@ -648,6 +791,7 @@ class TextBackend:
             failed_lines=failed_lines,
             snapshot_json=snapshot_json,
             detail=self.text_cfg.detail,
+            domain_context=self.domain_context,
         )
         return self._chat(system, user)
 
@@ -669,6 +813,7 @@ class TextBackend:
             signature=signature,
             source_excerpt=source_excerpt,
             watched_keys=watched_keys,
+            domain_context=self.domain_context,
         )
         return self._chat(
             system,
@@ -686,6 +831,8 @@ class TextBackend:
         signature: str,
         source_excerpt: str,
         watched_keys: Sequence[str] = (),
+        temperature: float = 0.0,
+        retry_feedback: str = "",
     ) -> tuple[str, str]:
         """Gate 3 synthesis: create one valid passing snapshot and one realistic near-miss failing snapshot."""
         system, user = format_gate3_fixtures_prompts(
@@ -695,6 +842,8 @@ class TextBackend:
             signature=signature,
             source_excerpt=source_excerpt,
             watched_keys=watched_keys,
+            domain_context=self.domain_context,
+            retry_feedback=retry_feedback,
         )
         content = self._chat(
             system,
@@ -702,6 +851,7 @@ class TextBackend:
             max_tokens=max(1200, self.text_cfg.max_tokens),
             include_user_system=False,
             output_schema=get_output_schema("check_gate3_fixtures"),
+            temperature=temperature,
         )
         parsed = extract_json_object(content)
         passing = parsed.get("passing_snapshot")
@@ -717,10 +867,15 @@ def _extract_chat_content(data: dict[str, Any]) -> str:
     choices = data.get("choices")
     if not isinstance(choices, list) or not choices:
         raise BackendError(f"Missing choices in OpenAI response: {data!r}")
-    msg = choices[0].get("message") if isinstance(choices[0], dict) else None
+    choice0 = choices[0] if isinstance(choices[0], dict) else {}
+    msg = choice0.get("message")
+    if isinstance(msg, dict) and msg.get("refusal"):
+        raise BackendError(f"Text model refused request: {msg['refusal']}")
+    if choice0.get("finish_reason") == "length":
+        raise BackendError("Text model response truncated (finish_reason='length')")
     if isinstance(msg, dict) and isinstance(msg.get("content"), str):
         return msg["content"]
-    text = choices[0].get("text") if isinstance(choices[0], dict) else None
+    text = choice0.get("text")
     if isinstance(text, str):
         return text
     raise BackendError(f"Missing message content in OpenAI response: {data!r}")

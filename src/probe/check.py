@@ -932,19 +932,24 @@ def compute_effective_combined_hash(
     *,
     fixtures_dir: Path,
     pass_threshold: float,
+    domain_context: str = "",
 ) -> tuple[str, tuple[str, str] | None, str | None]:
-    """Compute effective lock hash folding combined_hash, pass_threshold, and any manual fixture."""
+    """Compute effective lock hash folding combined_hash, pass_threshold, domain_context, and any manual fixture."""
     try:
         fixture = _load_manual_fixture(fixtures_dir, item.probe_id)
     except BackendError as exc:
         return "", None, str(exc)
 
     threshold_key = f"{float(pass_threshold)!r}"
+    base = f"{item.combined_hash}:threshold={threshold_key}"
+    ctx = domain_context.strip()
+    if ctx:
+        base = f"{base}:ctx={_sha256_text(ctx)}"
     if fixture is not None:
         fix_digest = _sha256_text(f"{fixture[0]}\n{fixture[1]}")
-        effective_hash = _sha256_text(f"{item.combined_hash}:threshold={threshold_key}:fixture:{fix_digest}")
+        effective_hash = _sha256_text(f"{base}:fixture:{fix_digest}")
     else:
-        effective_hash = _sha256_text(f"{item.combined_hash}:threshold={threshold_key}")
+        effective_hash = _sha256_text(base)
     return effective_hash, fixture, None
 
 
@@ -1129,8 +1134,18 @@ def run_probe_check(
     decision_backend: DecisionBackend | None = None
     text_backend: TextBackend | None = None
     try:
-        decision_backend = DecisionBackend(cfg.models_decision, cfg.decision, transport=transport)
-        text_backend = TextBackend(cfg.models_text, cfg.text, transport=transport)
+        decision_backend = DecisionBackend(
+            cfg.models_decision,
+            cfg.decision,
+            domain_context=cfg.domain_context,
+            transport=transport,
+        )
+        text_backend = TextBackend(
+            cfg.models_text,
+            cfg.text,
+            domain_context=cfg.domain_context,
+            transport=transport,
+        )
 
         for item in discovered:
             # Gate 1: Static literals, budgets, duplicate IDs.
@@ -1172,6 +1187,7 @@ def run_probe_check(
                 item,
                 fixtures_dir=fixtures_dir,
                 pass_threshold=cfg.decision.pass_threshold,
+                domain_context=cfg.domain_context,
             )
             if fixture_error is not None:
                 locked_probes.pop(item.probe_id, None)
@@ -1285,38 +1301,90 @@ def run_probe_check(
                 continue
             audit_reason = "Passed Gate 2 check audit"
 
-            # Gate 3: Dry-run calibration against fixture or synthesized samples.
-            try:
-                if fixture is not None:
-                    pass_snap, fail_snap = fixture
-                    fixture_source = "fixture"
-                else:
-                    pass_snap, fail_snap = text_backend.generate_calibration_fixtures_gate3(
-                        probe_id=item.probe_id,
-                        site=item.site,
-                        checks=item.checks,
-                        signature=item.signature,
-                        source_excerpt=item.source_excerpt,
-                        watched_keys=item.watched_keys,
+            # Gate 3: Dry-run calibration against manual fixture or synthesized samples (1x synthetic retry).
+            fixture_source = "fixture" if fixture is not None else "synthetic"
+            max_attempts = 1 if fixture is not None else 2
+            retry_feedback = ""
+            pass_scores: list[CheckScore] = []
+            fail_scores: list[CheckScore] = []
+            pass_ok = False
+            fail_ok = False
+            gate3_error: str | None = None
+
+            for attempt in range(1, max_attempts + 1):
+                try:
+                    if fixture is not None:
+                        pass_snap, fail_snap = fixture
+                    else:
+                        pass_snap, fail_snap = text_backend.generate_calibration_fixtures_gate3(
+                            probe_id=item.probe_id,
+                            site=item.site,
+                            checks=item.checks,
+                            signature=item.signature,
+                            source_excerpt=item.source_excerpt,
+                            watched_keys=item.watched_keys,
+                            temperature=0.0 if attempt == 1 else 0.3,
+                            retry_feedback=retry_feedback,
+                        )
+                except BackendError as exc:
+                    err_msg = str(exc)
+                    is_shape_err = (
+                        "Gate 3 synthesis missing" in err_msg or "Expected JSON object" in err_msg
                     )
-                    fixture_source = "synthetic"
+                    if fixture is None and attempt == 1 and is_shape_err:
+                        retry_feedback = err_msg
+                        continue
+                    gate3_error = err_msg
+                    break
 
-                pass_snap = _validate_gate3_snapshot(pass_snap, item=item, label="passing_snapshot")
-                fail_snap = _validate_gate3_snapshot(fail_snap, item=item, label="failing_snapshot")
+                try:
+                    pass_snap = _validate_gate3_snapshot(pass_snap, item=item, label="passing_snapshot")
+                    fail_snap = _validate_gate3_snapshot(fail_snap, item=item, label="failing_snapshot")
+                except BackendError as exc:
+                    if fixture is None and attempt == 1:
+                        retry_feedback = str(exc)
+                        continue
+                    gate3_error = str(exc)
+                    break
 
-                pass_scores = _evaluate_sample(
-                    item=item,
-                    snapshot_json=pass_snap,
-                    decision_backend=decision_backend,
-                    text_backend=text_backend,
-                )
-                fail_scores = _evaluate_sample(
-                    item=item,
-                    snapshot_json=fail_snap,
-                    decision_backend=decision_backend,
-                    text_backend=text_backend,
-                )
-            except BackendError as exc:
+                try:
+                    pass_scores = _evaluate_sample(
+                        item=item,
+                        snapshot_json=pass_snap,
+                        decision_backend=decision_backend,
+                        text_backend=text_backend,
+                    )
+                    fail_scores = _evaluate_sample(
+                        item=item,
+                        snapshot_json=fail_snap,
+                        decision_backend=decision_backend,
+                        text_backend=text_backend,
+                    )
+                except BackendError as exc:
+                    gate3_error = str(exc)
+                    break
+
+                pass_ok = bool(pass_scores) and all(s.passed for s in pass_scores)
+                fail_ok = bool(fail_scores) and any(not s.passed for s in fail_scores)
+                if pass_ok and fail_ok:
+                    break
+                if fixture is None and attempt == 1:
+                    fb_parts: list[str] = []
+                    if not pass_ok:
+                        failed_pass = [
+                            f"{s.check!r} (p={s.probability:.2f})"
+                            for s in pass_scores
+                            if not s.passed
+                        ]
+                        fb_parts.append(
+                            f"passing_snapshot failed checks: {', '.join(failed_pass) or 'empty scores'}"
+                        )
+                    if not fail_ok:
+                        fb_parts.append("failing_snapshot did not fail any check")
+                    retry_feedback = "; ".join(fb_parts)
+                    continue
+
+            if gate3_error is not None:
                 locked_probes.pop(item.probe_id, None)
                 results.append(
                     ProbeCheckResult(
@@ -1326,14 +1394,11 @@ def run_probe_check(
                         probe_type=item.probe_type.value,
                         status="failed",
                         gate="gate3",
-                        reason=redactor.scrub_text(str(exc)),
+                        reason=redactor.scrub_text(gate3_error),
                         checks=item.checks,
                     )
                 )
                 continue
-
-            pass_ok = bool(pass_scores) and all(s.passed for s in pass_scores)
-            fail_ok = bool(fail_scores) and any(not s.passed for s in fail_scores)
 
             pass_dicts = [
                 {"check": s.check, "probability": s.probability, "passed": s.passed}

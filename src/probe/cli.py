@@ -302,6 +302,7 @@ def list_cmd(
             item,
             fixtures_dir=fixtures_dir,
             pass_threshold=cfg.decision.pass_threshold,
+            domain_context=cfg.domain_context,
         )
         entry = locked.get(item.probe_id)
         watched_ok = item.site != "here" or (
