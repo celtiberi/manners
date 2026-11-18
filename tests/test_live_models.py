@@ -117,7 +117,6 @@ def _seed_live_project_config(tmp_path: Path, *, skip_lock_require: bool = False
             url="https://generativelanguage.googleapis.com/v1beta/openai",
             model="gemini-3.8-flash",
             api_key_env="GEMINI_API_KEY",
-            reasoning_effort="none",
             env_search_dirs=(tmp_path,),
             env_files=cfg.redact.env_files,
         )

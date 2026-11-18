@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+import collections
 import json
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import NamedTuple
 
@@ -233,3 +234,59 @@ def test_redactor_edge_cases_webhooks_depth_namedtuple_slots_lock_and_subdirs(
     assert parsed["slots"] == {"label": "svc", "access_token": REDACTED}
     assert parsed["ctx"]["password"] == REDACTED
     assert "_thread.lock" in str(parsed["ctx"]["lock"]) or "lock" in str(parsed["ctx"]["lock"]).lower()
+
+    # 1. Secret shrinkage near truncation boundary & multibyte bytes slicing never leak partial secrets.
+    long_secret = "sk_live_" + ("A" * 92)
+    r_shrink = SecretRedactor(secrets=(long_secret,))
+    out_shrink = json.loads(
+        serialize_here_snapshot(
+            {"text": ((long_secret + " ") * 42) + long_secret},
+            r_shrink,
+            max_str_bytes=4096,
+        )
+    )["watched"]["text"]
+    assert "sk_live_" not in out_shrink
+    assert out_shrink.endswith("...[truncated]")
+
+    mb_secret = "SECRET_" + ("秘" * 100) + "!"
+    r_mb = SecretRedactor(secrets=(mb_secret,))
+    out_mb = json.loads(
+        serialize_here_snapshot(
+            {"raw": (b"x" * 4050) + mb_secret.encode("utf-8")},
+            r_mb,
+            max_str_bytes=4096,
+        )
+    )["watched"]["raw"]
+    assert "SECRET_" not in out_mb
+    assert out_mb.endswith("...[truncated]")
+
+    # 2. Passwordless postgres DSN leaves username intact; deque & field(init=False) serialize safely;
+    #    URL-encoded secrets are scrubbed.
+    dsn_env = tmp_path / "dsn"
+    dsn_env.mkdir()
+    (dsn_env / ".env").write_text(
+        "DATABASE_URL=postgres://postgres@localhost:5432/mydb\n"
+        "API_TOKEN=tok+plus/slash=123\n",
+        encoding="utf-8",
+    )
+    r_dsn = SecretRedactor.from_environment(RedactConfig(), cwd=dsn_env)
+    scrub_dsn = r_dsn.scrub_text("postgres q=tok%2Bplus%2Fslash%3D123")
+    assert "postgres" in scrub_dsn
+    assert "tok%2B" not in scrub_dsn
+
+    @dataclass
+    class PartialDataclass:
+        x: int
+        uninit: str = field(init=False)
+
+    snap_cont = json.loads(
+        serialize_here_snapshot(
+            {
+                "history": collections.deque([{"password": "dynamic_secret_pw"}]),
+                "partial": PartialDataclass(x=7),
+            },
+            r_dsn,
+        )
+    )["watched"]
+    assert snap_cont["history"] == [{"password": REDACTED}]
+    assert snap_cont["partial"] == {"x": 7}

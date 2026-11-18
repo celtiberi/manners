@@ -2,18 +2,21 @@
 
 from __future__ import annotations
 
+import collections
 import dataclasses
 import inspect
+import itertools
 import json
 import math
 import os
 import re
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence, Sized, ValuesView
+from collections.abc import Set as AbstractSet
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs, unquote, urlparse
+from urllib.parse import parse_qs, quote, quote_plus, unquote, urlparse
 
-from probe.config import RedactConfig
+from probe.config import RedactConfig, parse_dotenv_file
 
 REDACTED = "[REDACTED]"
 
@@ -127,7 +130,6 @@ _SECRET_QUERY_KEYS: frozenset[str] = frozenset(
 
 _NUMBER_RE = re.compile(r"^[+-]?\d+(?:\.\d+)?$")
 _PATH_PREFIX_RE = re.compile(r"^(?:/|\./|\.\./|~/|[A-Za-z]:\\)")
-_EXPORT_PREFIX_RE = re.compile(r"^export\s+")
 
 
 def _is_secret_env_key(name: str) -> bool:
@@ -155,13 +157,18 @@ def _extract_url_secrets(val: str) -> tuple[bool, list[str]]:
         return False, []
     found: list[str] = []
     has_secret = False
+    userinfo = parsed.netloc.rpartition("@")[0] if "@" in parsed.netloc else ""
     if parsed.password and len(parsed.password) >= 4:
         has_secret = True
         found.append(parsed.password)
         unquoted_pw = unquote(parsed.password)
         if unquoted_pw and unquoted_pw != parsed.password:
             found.append(unquoted_pw)
-    elif parsed.username and len(parsed.username) >= 8:
+    elif (
+        parsed.username
+        and len(parsed.username) >= 8
+        and (":" in userinfo or parsed.scheme.lower() in {"http", "https"})
+    ):
         has_secret = True
         found.append(parsed.username)
         unquoted_user = unquote(parsed.username)
@@ -197,96 +204,6 @@ def _should_keep_secret_value(val: str, *, min_len: int = 8, allow_plain_url: bo
         has_secret, _ = _extract_url_secrets(stripped)
         return has_secret
     return True
-
-
-def _strip_inline_comment(raw: str) -> str:
-    for idx, ch in enumerate(raw):
-        if ch == "#" and idx > 0 and raw[idx - 1].isspace():
-            return raw[:idx].rstrip()
-    return raw.rstrip()
-
-
-def _parse_dotenv_file(path: Path) -> list[tuple[str, str]]:
-    """Parse KEY=VALUE pairs (including multiline quoted values) cleanly without shell execution."""
-    entries: list[tuple[str, str]] = []
-    try:
-        text = path.read_text(encoding="utf-8", errors="ignore")
-    except OSError:
-        return entries
-
-    idx = 0
-    n = len(text)
-    while idx < n:
-        while idx < n and text[idx] in " \t\r\n":
-            idx += 1
-        if idx >= n:
-            break
-        if text[idx] == "#":
-            nl = text.find("\n", idx)
-            idx = n if nl == -1 else nl + 1
-            continue
-
-        nl = text.find("\n", idx)
-        line_end = n if nl == -1 else nl
-        eq = text.find("=", idx)
-        if eq == -1 or eq > line_end:
-            idx = line_end + 1
-            continue
-
-        raw_key = text[idx:eq].strip()
-        key = _EXPORT_PREFIX_RE.sub("", raw_key, count=1).strip()
-        if not key:
-            idx = line_end + 1
-            continue
-
-        p = eq + 1
-        while p < n and text[p] in " \t":
-            p += 1
-
-        if p < n and text[p] in {"'", '"'}:
-            quote = text[p]
-            p += 1
-            if quote == '"':
-                chars: list[str] = []
-                escape = False
-                while p < n:
-                    ch = text[p]
-                    p += 1
-                    if escape:
-                        if ch == "n":
-                            chars.append("\n")
-                        elif ch == "t":
-                            chars.append("\t")
-                        elif ch == "r":
-                            chars.append("\r")
-                        else:
-                            chars.append(ch)
-                        escape = False
-                    elif ch == "\\":
-                        escape = True
-                    elif ch == '"':
-                        break
-                    else:
-                        chars.append(ch)
-                val = "".join(chars)
-                rem_nl = text.find("\n", p)
-                idx = n if rem_nl == -1 else rem_nl + 1
-            else:
-                end_idx = text.find("'", p)
-                if end_idx != -1:
-                    val = text[p:end_idx]
-                    rem_nl = text.find("\n", end_idx + 1)
-                    idx = n if rem_nl == -1 else rem_nl + 1
-                else:
-                    val = text[p:line_end].rstrip("\r")
-                    idx = line_end + 1
-        else:
-            raw_val = text[p:line_end].rstrip("\r")
-            val = _strip_inline_comment(raw_val)
-            idx = line_end + 1
-
-        entries.append((key, val))
-    return entries
 
 
 def _is_example_dotenv(path: Path) -> bool:
@@ -325,9 +242,18 @@ class SecretRedactor:
             escaped = json.dumps(raw_s, ensure_ascii=False)[1:-1]
             if escaped and escaped != raw_s:
                 expanded.add(escaped)
+            if len(raw_s) >= 8:
+                url_q = quote(raw_s, safe="")
+                if url_q and url_q != raw_s:
+                    expanded.add(url_q)
+                url_qp = quote_plus(raw_s)
+                if url_qp and url_qp != raw_s:
+                    expanded.add(url_qp)
         unique_secrets = sorted(expanded, key=len, reverse=True)
         self.secrets: tuple[str, ...] = tuple(unique_secrets)
-        self.max_secret_len: int = len(self.secrets[0]) if self.secrets else 0
+        self.max_secret_chars: int = len(self.secrets[0]) if self.secrets else 0
+        self.max_secret_len: int = self.max_secret_chars
+        self.max_secret_bytes: int = max((len(s.encode("utf-8")) for s in self.secrets), default=0)
         self.mask_keys: frozenset[str] = DEFAULT_MASK_KEYS | frozenset(
             _normalize_key(k) for k in extra_keys if str(k).strip()
         )
@@ -378,7 +304,7 @@ class SecretRedactor:
                         candidate_files.append(p)
 
         for env_file in candidate_files:
-            for key, val in _parse_dotenv_file(env_file):
+            for key, val in parse_dotenv_file(env_file):
                 _collect_env_pair(key, val, collected)
 
         for key, val in os.environ.items():
@@ -415,12 +341,31 @@ def _truncate_utf8(text: str, max_bytes: int, *, force_marker: bool = False) -> 
 
 def _scrub_and_truncate(text: str, redactor: SecretRedactor, max_bytes: int) -> str:
     clean = _sanitize_utf8(text)
-    scan_limit = max_bytes + redactor.max_secret_len + 64
-    pre_clipped = len(clean) > scan_limit
-    if pre_clipped:
-        clean = clean[:scan_limit]
-    scrubbed = redactor.scrub_text(clean)
-    return _truncate_utf8(scrubbed, max_bytes, force_marker=pre_clipped and len(scrubbed.encode("utf-8")) > max_bytes)
+    encoded = clean.encode("utf-8")
+    if len(encoded) <= max_bytes:
+        return _truncate_utf8(redactor.scrub_text(clean), max_bytes)
+
+    safe_prefix = encoded[:max_bytes].decode("utf-8", errors="ignore")
+    safe_end = len(safe_prefix)
+    if redactor._pattern is None:
+        return _truncate_utf8(safe_prefix, max_bytes, force_marker=True)
+
+    window = clean[: safe_end + redactor.max_secret_chars + 64]
+    parts: list[str] = []
+    pos = 0
+    for match in redactor._pattern.finditer(window):
+        start, end = match.span()
+        if start >= safe_end:
+            break
+        if start > pos:
+            parts.append(window[pos:start])
+        parts.append(REDACTED)
+        pos = end
+        if pos >= safe_end:
+            break
+    if pos < safe_end:
+        parts.append(window[pos:safe_end])
+    return _truncate_utf8("".join(parts), max_bytes, force_marker=pos < len(clean))
 
 
 _MISSING = object()
@@ -469,15 +414,23 @@ def _serialize_bounded(
     if isinstance(value, str):
         return _scrub_and_truncate(value, redactor, max_str_bytes)
     if isinstance(value, (bytes, bytearray)):
-        raw_cap = max_str_bytes + redactor.max_secret_len + 64
+        pre_clipped = len(value) > max_str_bytes
+        raw_cap = max_str_bytes + redactor.max_secret_bytes + 64
         decoded = bytes(value[:raw_cap]).decode("utf-8", errors="replace")
-        return _scrub_and_truncate(decoded, redactor, max_str_bytes)
+        scrubbed = _scrub_and_truncate(decoded, redactor, max_str_bytes)
+        if pre_clipped and not scrubbed.endswith("...[truncated]"):
+            return _truncate_utf8(scrubbed, max_str_bytes, force_marker=True)
+        return scrubbed
 
     if depth >= max_depth:
         if isinstance(value, Mapping):
             return f"<dict len={len(value)} max_depth>"
-        if isinstance(value, (list, tuple, set, frozenset)):
-            return f"<{type(value).__name__} len={len(value)} max_depth>"
+        if (
+            isinstance(value, (list, tuple, set, frozenset, collections.deque, Sequence, AbstractSet, ValuesView))
+            and not isinstance(value, (str, bytes, bytearray))
+        ):
+            len_note = f" len={len(value)}" if isinstance(value, Sized) else ""
+            return f"<{type(value).__name__}{len_note} max_depth>"
         return f"<{type(value).__qualname__} max_depth>"
 
     obj_id = id(value)
@@ -520,12 +473,17 @@ def _serialize_bounded(
                 seen=seen,
             )
 
-        if isinstance(value, (list, tuple, set, frozenset)):
+        if (
+            isinstance(value, (list, tuple, set, frozenset, collections.deque, Sequence, AbstractSet, ValuesView))
+            and not isinstance(value, (str, bytes, bytearray))
+        ):
             items: list[Any] = []
-            seq = list(value)
-            for idx, item in enumerate(seq):
+            for idx, item in enumerate(itertools.islice(value, max_items + 1)):
                 if idx >= max_items:
-                    items.append(f"...[{len(seq) - max_items} more items]")
+                    if isinstance(value, Sized):
+                        items.append(f"...[{max(0, len(value) - max_items)} more items]")
+                    else:
+                        items.append("...[more items]")
                     break
                 items.append(
                     _serialize_bounded(
@@ -541,7 +499,11 @@ def _serialize_bounded(
             return items
 
         if dataclasses.is_dataclass(value) and not isinstance(value, type):
-            dc_fields = {f.name: getattr(value, f.name) for f in dataclasses.fields(value)}
+            dc_fields: dict[str, Any] = {}
+            for f in dataclasses.fields(value):
+                field_val = getattr(value, f.name, _MISSING)
+                if field_val is not _MISSING:
+                    dc_fields[f.name] = field_val
             return _serialize_bounded(
                 dc_fields,
                 redactor,

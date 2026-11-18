@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import math
 import os
+import re
 import threading
 import time
 import tomllib
+from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -19,7 +21,20 @@ _LAST_MS = 0
 _LAST_RAND = 0
 
 _DEFAULT_USER_CONFIG_PATH = Path.home() / ".config" / "probe" / "config.toml"
-_EXPORT_PREFIX_RE = ("export ", "export\t")
+_EXPORT_PREFIX_RE = re.compile(r"^export\s+")
+_DISABLED_CTX: ContextVar[bool] = ContextVar("probe_disabled", default=False)
+_TRUSTED_DEFAULT_HOSTS = frozenset(
+    {
+        "api.typesafe.ai",
+        "api.deepseek.com",
+        "api.openai.com",
+        "generativelanguage.googleapis.com",
+    }
+)
+_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
+_OPTIONAL_INT_FIELDS = frozenset({"entailment_index", "contradiction_index"})
+_ALLOWED_TEXT_DETAILS = frozenset({"concise", "standard", "detailed"})
+_ALLOWED_ONNX_OUTPUTS = frozenset({"logits", "probabilities"})
 
 
 def _strip_inline_comment(raw: str) -> str:
@@ -29,52 +44,96 @@ def _strip_inline_comment(raw: str) -> str:
     return raw.rstrip()
 
 
-def _parse_dotenv_key(env_path: Path, key_name: str) -> str:
-    """Return value for key_name from a dotenv file, or empty string if absent."""
+def parse_dotenv_file(path: Path) -> list[tuple[str, str]]:
+    """Parse KEY=VALUE pairs (including multiline quoted values) safely without shell execution."""
+    entries: list[tuple[str, str]] = []
     try:
-        text = env_path.read_text(encoding="utf-8", errors="ignore")
+        text = path.read_text(encoding="utf-8", errors="ignore")
     except OSError:
-        return ""
+        return entries
 
-    for raw_line in text.splitlines():
-        line = raw_line.strip()
-        if not line or line.startswith("#"):
+    idx = 0
+    n = len(text)
+    while idx < n:
+        while idx < n and text[idx] in " \t\r\n":
+            idx += 1
+        if idx >= n:
+            break
+        if text[idx] == "#":
+            nl = text.find("\n", idx)
+            idx = n if nl == -1 else nl + 1
             continue
-        for prefix in _EXPORT_PREFIX_RE:
-            if line.startswith(prefix):
-                line = line[len(prefix) :].lstrip()
-                break
-        if "=" not in line:
+
+        nl = text.find("\n", idx)
+        line_end = n if nl == -1 else nl
+        eq = text.find("=", idx)
+        if eq == -1 or eq > line_end:
+            idx = line_end + 1
             continue
-        k, _, raw_val = line.partition("=")
-        if k.strip() != key_name:
+
+        raw_key = text[idx:eq].strip()
+        key = _EXPORT_PREFIX_RE.sub("", raw_key, count=1).strip()
+        if not key:
+            idx = line_end + 1
             continue
-        val = raw_val.strip()
-        if val and val[0] in {"'", '"'}:
-            quote = val[0]
+
+        p = eq + 1
+        while p < n and text[p] in " \t":
+            p += 1
+
+        if p < n and text[p] in {"'", '"'}:
+            quote = text[p]
+            p += 1
             if quote == '"':
                 chars: list[str] = []
                 escape = False
-                for ch in val[1:]:
+                while p < n:
+                    ch = text[p]
+                    p += 1
                     if escape:
                         if ch == "n":
                             chars.append("\n")
                         elif ch == "t":
                             chars.append("\t")
+                        elif ch == "r":
+                            chars.append("\r")
                         else:
                             chars.append(ch)
                         escape = False
                     elif ch == "\\":
                         escape = True
-                    elif ch == quote:
+                    elif ch == '"':
                         break
                     else:
                         chars.append(ch)
-                return "".join(chars).strip()
-            end_idx = val.find("'", 1)
-            return (val[1:end_idx] if end_idx != -1 else val[1:]).strip()
-        return _strip_inline_comment(val).strip()
-    return ""
+                val = "".join(chars)
+                rem_nl = text.find("\n", p)
+                idx = n if rem_nl == -1 else rem_nl + 1
+            else:
+                end_idx = text.find("'", p)
+                if end_idx != -1:
+                    val = text[p:end_idx]
+                    rem_nl = text.find("\n", end_idx + 1)
+                    idx = n if rem_nl == -1 else rem_nl + 1
+                else:
+                    val = text[p:line_end].rstrip("\r")
+                    idx = line_end + 1
+        else:
+            raw_val = text[p:line_end].rstrip("\r")
+            val = _strip_inline_comment(raw_val)
+            idx = line_end + 1
+
+        entries.append((key, val))
+    return entries
+
+
+def _parse_dotenv_key(env_path: Path, key_name: str) -> str:
+    """Return value for key_name from a dotenv file, or empty string if absent."""
+    matched = ""
+    for k, val in parse_dotenv_file(env_path):
+        if k == key_name:
+            matched = val.strip()
+    return matched
 
 
 def _encode_base32(value: int, length: int) -> str:
@@ -107,11 +166,17 @@ def utc_now_iso() -> str:
     return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
 
 
-_ENV_FLAG_CACHE: dict[tuple[str, str], tuple[float, str]] = {}
+_ENV_FLAG_CACHE: dict[tuple[str, str], tuple[tuple[int, int, int] | None, str]] = {}
 _ENV_FLAG_CACHE_LOCK = threading.Lock()
-_ENV_FLAG_TTL_S = 0.5
 _TRUE_VALUES = frozenset({"1", "true", "yes", "on"})
 _FALSE_VALUES = frozenset({"0", "false", "no", "off"})
+
+
+def reset_config_locks_after_fork() -> None:
+    """Reinitialize module locks in a forked child process to prevent deadlocks."""
+    global _ULID_LOCK, _ENV_FLAG_CACHE_LOCK
+    _ULID_LOCK = threading.Lock()
+    _ENV_FLAG_CACHE_LOCK = threading.Lock()
 
 
 def clear_env_cache() -> None:
@@ -125,23 +190,30 @@ def _read_env_flag(var_name: str, cwd: Path | None = None) -> str:
         return os.environ[var_name].strip()
 
     base_str = str(cwd) if cwd is not None else os.getcwd()
-    cache_key = (base_str, var_name)
-    now = time.monotonic()
-    with _ENV_FLAG_CACHE_LOCK:
-        cached = _ENV_FLAG_CACHE.get(cache_key)
-        if cached is not None and now < cached[0]:
-            return cached[1]
-
     root = find_project_root(Path(base_str))
     env_path = root / ".env"
-    parsed = _parse_dotenv_key(env_path, var_name) if env_path.is_file() else ""
+    try:
+        st = env_path.stat()
+        sig: tuple[int, int, int] | None = (st.st_mtime_ns, st.st_size, st.st_ino)
+    except OSError:
+        sig = None
+
+    cache_key = (str(env_path), var_name)
     with _ENV_FLAG_CACHE_LOCK:
-        _ENV_FLAG_CACHE[cache_key] = (now + _ENV_FLAG_TTL_S, parsed)
+        cached = _ENV_FLAG_CACHE.get(cache_key)
+        if cached is not None and cached[0] == sig:
+            return cached[1]
+
+    parsed = _parse_dotenv_key(env_path, var_name) if sig is not None else ""
+    with _ENV_FLAG_CACHE_LOCK:
+        _ENV_FLAG_CACHE[cache_key] = (sig, parsed)
     return parsed
 
 
 def is_probes_enabled(cwd: Path | None = None) -> bool:
-    """Return True when PROBES is enabled in os.environ or project .env."""
+    """Return True when PROBES is enabled in os.environ or project .env (unless disabled in context)."""
+    if _DISABLED_CTX.get():
+        return False
     return _read_env_flag("PROBES", cwd).lower() in _TRUE_VALUES
 
 
@@ -167,8 +239,9 @@ class ModelEndpointConfig:
     timeout_s: float = 30.0
     onnx_path: str = ""
     tokenizer_path: str = ""
-    entailment_index: int = 1
-    contradiction_index: int = 0
+    entailment_index: int | None = None
+    contradiction_index: int | None = None
+    onnx_output: str = "logits"
     max_length: int = 512
     reasoning_effort: str = ""
     env_search_dirs: tuple[Path, ...] = ()
@@ -186,11 +259,14 @@ class ModelEndpointConfig:
 
         seen: set[Path] = set()
         for base_dir in self.env_search_dirs:
+            resolved_base = base_dir.resolve()
             for raw_name in self.env_files:
                 candidate = Path(raw_name).expanduser()
                 if not candidate.is_absolute():
-                    candidate = base_dir / candidate
+                    candidate = resolved_base / candidate
                 resolved = candidate.resolve()
+                if not resolved.is_relative_to(resolved_base):
+                    continue
                 if resolved in seen or not candidate.is_file():
                     continue
                 seen.add(resolved)
@@ -221,7 +297,7 @@ class TextConfig:
 class RateLimitConfig:
     """Per-probe sliding-window and optional per-run call caps (-1 = unlimited)."""
 
-    max_calls: int = 5
+    max_calls: int = 20
     window_seconds: float = 10.0
     max_calls_per_run: int = -1
 
@@ -281,6 +357,7 @@ class ProbeConfig:
     check: CheckConfig = field(default_factory=CheckConfig)
     redact: RedactConfig = field(default_factory=RedactConfig)
     runtime: RuntimeConfig = field(default_factory=RuntimeConfig)
+    domain_context: str = ""
     project_root: Path = field(default_factory=Path.cwd)
 
     def resolve_runs_dir(self) -> Path:
@@ -340,10 +417,22 @@ def _apply_dataclass_dict(obj: Any, data: dict[str, Any]) -> None:
     for key, val in data.items():
         if key in {"env_search_dirs", "env_files"} and isinstance(obj, ModelEndpointConfig):
             continue
-        if not hasattr(obj, key):
+        if key == "db_path" and isinstance(obj, RuntimeConfig):
             continue
+        if not hasattr(obj, key):
+            raise ValueError(f"Unknown config key {key!r} in {type(obj).__name__}")
         current = getattr(obj, key)
-        if isinstance(current, tuple):
+        if key in _OPTIONAL_INT_FIELDS and isinstance(obj, ModelEndpointConfig):
+            if val is None:
+                setattr(obj, key, None)
+            elif isinstance(val, (bool, float)):
+                raise ValueError(f"Config key {key!r} must be an integer, got {type(val).__name__} {val!r}")
+            else:
+                try:
+                    setattr(obj, key, int(val))
+                except (TypeError, ValueError) as exc:
+                    raise ValueError(f"Config key {key!r} must be an integer, got {val!r}") from exc
+        elif isinstance(current, tuple):
             if isinstance(val, str):
                 items: Any = [val]
             elif isinstance(val, (list, tuple)):
@@ -354,8 +443,8 @@ def _apply_dataclass_dict(obj: Any, data: dict[str, Any]) -> None:
         elif isinstance(current, bool):
             setattr(obj, key, _parse_bool_config(key, val))
         elif isinstance(current, int):
-            if isinstance(val, bool):
-                raise ValueError(f"Config key {key!r} must be an integer, got bool {val!r}")
+            if isinstance(val, (bool, float)):
+                raise ValueError(f"Config key {key!r} must be an integer, got {type(val).__name__} {val!r}")
             try:
                 setattr(obj, key, int(val))
             except (TypeError, ValueError) as exc:
@@ -374,14 +463,29 @@ def _apply_dataclass_dict(obj: Any, data: dict[str, Any]) -> None:
             setattr(obj, key, str(val))
 
 
+def _url_origin(url: str) -> tuple[str, str, str]:
+    stripped = (url or "").strip()
+    if not stripped:
+        return ("", "", "")
+    try:
+        parsed = urlparse(stripped)
+    except ValueError as exc:
+        raise ValueError(f"Invalid endpoint URL {url!r}: {exc}") from exc
+    if parsed.scheme and not parsed.netloc:
+        raise ValueError(f"Invalid endpoint URL {url!r}: missing host")
+    return (parsed.scheme.lower(), parsed.netloc.lower(), (parsed.hostname or "").lower())
+
+
 def _merge_endpoint_config(
     default_ep: ModelEndpointConfig,
     user_dict: dict[str, Any],
     proj_dict: dict[str, Any],
 ) -> ModelEndpointConfig:
-    """Merge user and project endpoint dicts while isolating credentials across provider/host swaps."""
+    """Merge user and project endpoint dicts while isolating credentials across provider/origin swaps."""
     ep = replace(default_ep)
-    for layer in (user_dict, proj_dict):
+    user_host = _url_origin(str(user_dict["url"]))[2] if "url" in user_dict else ""
+
+    for is_proj, layer in ((False, user_dict), (True, proj_dict)):
         if not layer:
             continue
         new_provider = str(layer["provider"]).strip().lower() if "provider" in layer else None
@@ -389,20 +493,41 @@ def _merge_endpoint_config(
         provider_changed = new_provider is not None and new_provider != prev_provider
 
         new_url = str(layer["url"]).strip() if "url" in layer else None
-        prev_host = urlparse(ep.url).netloc.lower() if ep.url else ""
-        new_host = urlparse(new_url).netloc.lower() if new_url else ""
-        url_changed = new_url is not None and new_host != prev_host
+        prev_origin = _url_origin(ep.url)[:2]
+        new_origin = _url_origin(new_url)[:2] if new_url is not None else prev_origin
+        url_changed = new_url is not None and new_origin != prev_origin
 
         if provider_changed or url_changed:
-            if "api_key" not in layer and "api_key_env" not in layer:
+            if "api_key" not in layer:
                 ep.api_key = ""
+            if "api_key_env" not in layer:
                 ep.api_key_env = ""
+            if "reasoning_effort" not in layer:
+                ep.reasoning_effort = ""
+            eff_provider = new_provider if new_provider is not None else prev_provider
+            if "model" not in layer and not (not provider_changed and eff_provider == "typesafe_jev"):
+                ep.model = ""
             if provider_changed and "url" not in layer:
                 ep.url = ""
-            if provider_changed and "model" not in layer:
-                ep.model = ""
+        elif "api_key_env" in layer and "api_key" not in layer:
+            ep.api_key = ""
 
         _apply_dataclass_dict(ep, layer)
+
+        if is_proj and "url" in layer:
+            _, _, proj_hostname = _url_origin(ep.url)
+            trusted_hosts = _TRUSTED_DEFAULT_HOSTS | _LOOPBACK_HOSTS | ({user_host} if user_host else set())
+            if (
+                proj_hostname
+                and proj_hostname not in trusted_hosts
+                and (ep.api_key or ep.api_key_env)
+                and os.environ.get("PROBE_TRUST_PROJECT_ENDPOINTS", "").strip().lower() not in _TRUE_VALUES
+            ):
+                raise ValueError(
+                    f"Refusing to attach credentials (api_key/api_key_env) to project-defined "
+                    f"endpoint host {proj_hostname!r} in pyproject.toml; configure it in "
+                    "~/.config/probe/config.toml or set PROBE_TRUST_PROJECT_ENDPOINTS=1."
+                )
     return ep
 
 
@@ -411,6 +536,20 @@ def _load_toml_file(path: Path) -> dict[str, Any]:
         return tomllib.loads(path.read_text(encoding="utf-8"))
     except tomllib.TOMLDecodeError as exc:
         raise ValueError(f"Invalid TOML in {path}: {exc}") from exc
+
+
+def _validate_top_level_keys(data: dict[str, Any], source_label: str) -> None:
+    allowed_top = {"models", "decision", "text", "rate_limit", "check", "redact", "runtime", "domain_context"}
+    for k in data:
+        if k not in allowed_top:
+            raise ValueError(f"Unknown config section/key {k!r} in {source_label}")
+    models = data.get("models")
+    if models is not None:
+        if not isinstance(models, dict):
+            raise ValueError(f"[models] must be a table in {source_label}")
+        for mk in models:
+            if mk not in {"decision", "text"}:
+                raise ValueError(f"Unknown [models.{mk}] section in {source_label}")
 
 
 def load_config(cwd: Path | None = None, config_path: Path | None = None) -> ProbeConfig:
@@ -424,6 +563,7 @@ def load_config(cwd: Path | None = None, config_path: Path | None = None) -> Pro
     user_path = config_path or (Path(env_cfg).expanduser() if env_cfg else _DEFAULT_USER_CONFIG_PATH)
     if user_path.is_file():
         raw_user = _load_toml_file(user_path)
+        _validate_top_level_keys(raw_user, str(user_path))
 
     raw_proj: dict[str, Any] = {}
     pyproject = _find_pyproject(work_dir)
@@ -431,6 +571,7 @@ def load_config(cwd: Path | None = None, config_path: Path | None = None) -> Pro
         parsed = _load_toml_file(pyproject)
         tool_probe = parsed.get("tool", {}).get("probe")
         if isinstance(tool_probe, dict):
+            _validate_top_level_keys(tool_probe, str(pyproject))
             raw_proj = tool_probe
 
     user_models = raw_user.get("models") if isinstance(raw_user.get("models"), dict) else {}
@@ -453,20 +594,48 @@ def load_config(cwd: Path | None = None, config_path: Path | None = None) -> Pro
         ("runtime", cfg.runtime),
     ):
         section = merged.get(section_name)
-        if isinstance(section, dict):
+        if section is not None:
+            if not isinstance(section, dict):
+                raise ValueError(f"[{section_name}] must be a TOML table")
             _apply_dataclass_dict(target, section)
+
+    if "domain_context" in merged and merged["domain_context"] is not None:
+        if not isinstance(merged["domain_context"], str):
+            raise ValueError(f"domain_context must be a string, got {type(merged['domain_context']).__name__}")
+        cfg.domain_context = merged["domain_context"].strip()
 
     cfg.models_decision.env_search_dirs = (project_root,)
     cfg.models_decision.env_files = cfg.redact.env_files
     cfg.models_text.env_search_dirs = (project_root,)
     cfg.models_text.env_files = cfg.redact.env_files
 
+    for role_name, ep in (("models.decision", cfg.models_decision), ("models.text", cfg.models_text)):
+        if not math.isfinite(ep.timeout_s) or ep.timeout_s <= 0.0:
+            raise ValueError(f"[{role_name}].timeout_s must be > 0, got {ep.timeout_s!r}")
+        if ep.max_length < 8:
+            raise ValueError(f"[{role_name}].max_length must be >= 8, got {ep.max_length!r}")
+        if ep.onnx_output.strip().lower() not in _ALLOWED_ONNX_OUTPUTS:
+            raise ValueError(
+                f"[{role_name}].onnx_output must be 'logits' or 'probabilities', got {ep.onnx_output!r}"
+            )
+        _url_origin(ep.url)
+
+    if cfg.text.detail.strip().lower() not in _ALLOWED_TEXT_DETAILS:
+        raise ValueError(f"[text].detail must be concise, standard, or detailed; got {cfg.text.detail!r}")
+    if cfg.text.max_tokens < 1:
+        raise ValueError(f"[text].max_tokens must be >= 1, got {cfg.text.max_tokens!r}")
     if not math.isfinite(cfg.decision.pass_threshold) or not (0.0 <= cfg.decision.pass_threshold < 1.0):
         raise ValueError(f"[decision].pass_threshold must be in [0.0, 1.0), got {cfg.decision.pass_threshold!r}")
     if cfg.rate_limit.max_calls < 1:
         raise ValueError(f"[rate_limit].max_calls must be >= 1, got {cfg.rate_limit.max_calls!r}")
     if not math.isfinite(cfg.rate_limit.window_seconds) or cfg.rate_limit.window_seconds <= 0.0:
         raise ValueError(f"[rate_limit].window_seconds must be > 0, got {cfg.rate_limit.window_seconds!r}")
+    if cfg.rate_limit.max_calls_per_run < -1:
+        raise ValueError(
+            f"[rate_limit].max_calls_per_run must be >= -1, got {cfg.rate_limit.max_calls_per_run!r}"
+        )
+    if cfg.check.max_checks < 1 or cfg.check.max_check_chars < 1:
+        raise ValueError("Invalid [check] bounds: max_checks >= 1 and max_check_chars >= 1 required")
     if cfg.runtime.max_depth < 1 or cfg.runtime.max_items < 1 or cfg.runtime.max_str_bytes < 64:
         raise ValueError("Invalid [runtime] bounds: max_depth >= 1, max_items >= 1, max_str_bytes >= 64 required")
 

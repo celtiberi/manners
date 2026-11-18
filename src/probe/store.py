@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import json
+import math
+import os
+import re
 import threading
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -12,6 +15,8 @@ from typing import Any
 
 from probe.backends import CheckScore
 from probe.config import utc_now_iso
+
+_RUN_ID_RE = re.compile(r"[A-Za-z0-9._-]+")
 
 
 @dataclass(slots=True, frozen=True)
@@ -58,17 +63,43 @@ class EventRecord:
 
 def _ensure_probes_gitignore(runs_dir: Path) -> None:
     runs_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        os.chmod(runs_dir, 0o700)
+    except OSError:
+        pass
+    inner_gi = runs_dir / ".gitignore"
+    if not inner_gi.exists():
+        try:
+            inner_gi.write_text("*\n!.gitignore\n", encoding="utf-8")
+        except OSError:
+            pass
     parent = runs_dir.parent
     if parent.name == ".probes":
         gi = parent / ".gitignore"
         if not gi.exists():
-            gi.write_text("runs/\n", encoding="utf-8")
+            try:
+                gi.write_text("runs/\n", encoding="utf-8")
+            except OSError:
+                pass
+
+
+def _finite_float(val: Any, default: float | None = None) -> float:
+    if isinstance(val, bool):
+        raise ValueError(f"Expected numeric float, got bool {val!r}")
+    if val is None:
+        if default is None:
+            raise ValueError("Missing required numeric value")
+        return default
+    fval = float(val)
+    if not math.isfinite(fval):
+        raise ValueError(f"Non-finite float value: {val!r}")
+    return fval
 
 
 def _parse_event_record(rec: dict[str, Any], default_run_id: str) -> EventRecord | None:
     try:
         call_seq = int(rec["call_seq"])
-        elapsed_ms = float(rec["elapsed_ms"])
+        elapsed_ms = _finite_float(rec["elapsed_ms"])
         started_at = str(rec["started_at"])
         probe_id = str(rec["probe_id"])
         site = str(rec["site"])
@@ -76,7 +107,22 @@ def _parse_event_record(rec: dict[str, Any], default_run_id: str) -> EventRecord
         file_line = str(rec["file_line"])
         verdict = str(rec["verdict"])
         judged_at = str(rec.get("judged_at") or started_at)
-        latency_ms = float(rec.get("latency_ms") or 0.0)
+        latency_ms = _finite_float(rec.get("latency_ms"), default=0.0)
+
+        raw_scores = rec.get("check_scores")
+        scores_list: list[CheckScore] = []
+        if isinstance(raw_scores, list):
+            for item in raw_scores:
+                if not isinstance(item, dict):
+                    continue
+                scores_list.append(
+                    CheckScore(
+                        check=str(item.get("check", "")),
+                        probability=_finite_float(item.get("probability"), default=0.0),
+                        passed=bool(item.get("passed", False)),
+                    )
+                )
+        scores = tuple(scores_list)
     except (KeyError, TypeError, ValueError):
         return None
 
@@ -88,26 +134,11 @@ def _parse_event_record(rec: dict[str, Any], default_run_id: str) -> EventRecord
     else:
         payload_json = json.dumps(rec.get("payload"), ensure_ascii=False)
 
-    raw_scores = rec.get("check_scores")
-    scores = (
-        tuple(
-            CheckScore(
-                check=str(item.get("check", "")),
-                probability=float(item.get("probability", 0.0)),
-                passed=bool(item.get("passed", False)),
-            )
-            for item in raw_scores
-            if isinstance(item, dict)
-        )
-        if isinstance(raw_scores, list)
-        else ()
-    )
-
     err_val = rec.get("error_code")
     text_val = rec.get("text_analysis")
     stack_val = rec.get("stack_excerpt")
     return EventRecord(
-        run_id=str(rec.get("run_id") or default_run_id),
+        run_id=default_run_id,
         call_seq=call_seq,
         elapsed_ms=elapsed_ms,
         started_at=started_at,
@@ -127,12 +158,29 @@ def _parse_event_record(rec: dict[str, Any], default_run_id: str) -> EventRecord
     )
 
 
+def _peek_run_start(path: Path) -> str | None:
+    """Read just the run_start timestamp from a run file without parsing event payloads."""
+    if not path.is_file():
+        return None
+    try:
+        with path.open("r", encoding="utf-8") as fh:
+            for line in fh:
+                stripped = line.strip()
+                if not stripped:
+                    continue
+                try:
+                    rec = json.loads(stripped)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(rec, dict) and rec.get("type") == "run_start":
+                    return str(rec.get("started_at") or "")
+    except (OSError, UnicodeDecodeError):
+        return None
+    return None
+
+
 def _read_run_file(path: Path) -> tuple[RunRecord | None, list[EventRecord]]:
     if not path.is_file():
-        return None, []
-    try:
-        lines = path.read_text(encoding="utf-8").splitlines()
-    except (OSError, UnicodeDecodeError):
         return None, []
 
     run_id = path.stem
@@ -147,44 +195,50 @@ def _read_run_file(path: Path) -> tuple[RunRecord | None, list[EventRecord]]:
     has_start = False
     events_by_seq: dict[int, EventRecord] = {}
 
-    for line in lines:
-        stripped = line.strip()
-        if not stripped:
-            continue
-        try:
-            rec = json.loads(stripped)
-        except json.JSONDecodeError:
-            continue
-        if not isinstance(rec, dict):
-            continue
-
-        rec_type = rec.get("type")
-        if rec_type == "run_start":
-            has_start = True
-            run_id = str(rec.get("id") or run_id)
-            started_at = str(rec.get("started_at") or "")
-            cmd = str(rec.get("cmd") or "")
-            try:
-                pid = int(rec.get("pid") or 0)
-            except (TypeError, ValueError):
-                pid = 0
-            status = str(rec.get("status") or "running")
-            decision_model = str(rec.get("decision_model") or "")
-            text_model = str(rec.get("text_model") or "")
-        elif rec_type == "run_finish":
-            if rec.get("status"):
-                status = str(rec["status"])
-            if rec.get("finished_at"):
-                finished_at = str(rec["finished_at"])
-            if halt_call_seq is None and rec.get("halt_call_seq") is not None:
+    try:
+        with path.open("r", encoding="utf-8") as fh:
+            for line in fh:
+                stripped = line.strip()
+                if not stripped:
+                    continue
                 try:
-                    halt_call_seq = int(rec["halt_call_seq"])
-                except (TypeError, ValueError):
-                    pass
-        elif rec_type == "event":
-            ev = _parse_event_record(rec, run_id)
-            if ev is not None:
-                events_by_seq[ev.call_seq] = ev
+                    rec = json.loads(stripped)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(rec, dict):
+                    continue
+
+                rec_type = rec.get("type")
+                if rec_type == "run_start":
+                    has_start = True
+                    started_at = str(rec.get("started_at") or "")
+                    cmd = str(rec.get("cmd") or "")
+                    try:
+                        pid = int(rec.get("pid") or 0)
+                    except (TypeError, ValueError):
+                        pid = 0
+                    status = str(rec.get("status") or "running")
+                    decision_model = str(rec.get("decision_model") or "")
+                    text_model = str(rec.get("text_model") or "")
+                elif rec_type == "run_finish":
+                    new_status = rec.get("status")
+                    if new_status:
+                        new_status_str = str(new_status)
+                        if status != "halted" or new_status_str == "halted":
+                            status = new_status_str
+                    if rec.get("finished_at"):
+                        finished_at = str(rec["finished_at"])
+                    if halt_call_seq is None and rec.get("halt_call_seq") is not None:
+                        try:
+                            halt_call_seq = int(rec["halt_call_seq"])
+                        except (TypeError, ValueError):
+                            pass
+                elif rec_type == "event":
+                    ev = _parse_event_record(rec, run_id)
+                    if ev is not None:
+                        events_by_seq[ev.call_seq] = ev
+    except (OSError, UnicodeDecodeError):
+        return None, []
 
     if not has_start:
         return None, []
@@ -226,17 +280,44 @@ class ProbeStore:
         return None
 
     def run_path(self, run_id: str) -> Path:
-        if not run_id or not run_id.strip() or "/" in run_id or "\\" in run_id or ".." in run_id:
+        if (
+            not run_id
+            or not _RUN_ID_RE.fullmatch(run_id)
+            or ".." in run_id
+        ):
             raise ValueError(f"Invalid run_id: {run_id!r}")
-        return self.runs_dir / f"{run_id}.jsonl"
+        candidate = self.runs_dir / f"{run_id}.jsonl"
+        if candidate.resolve().parent != self.runs_dir.resolve():
+            raise ValueError(f"Invalid run_id: {run_id!r}")
+        return candidate
 
     def _append_record(self, run_id: str, record: dict[str, Any]) -> None:
         path = self.run_path(run_id)
-        line = json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n"
+        data = (json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8")
         with self._lock:
-            with path.open("a", encoding="utf-8") as fh:
-                fh.write(line)
-                fh.flush()
+            needs_leading_newline = False
+            try:
+                if path.exists() and path.stat().st_size > 0:
+                    with path.open("rb") as rfh:
+                        rfh.seek(-1, os.SEEK_END)
+                        needs_leading_newline = rfh.read(1) != b"\n"
+            except OSError:
+                pass
+            if needs_leading_newline:
+                data = b"\n" + data
+
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+            try:
+                try:
+                    os.fchmod(fd, 0o600)
+                except OSError:
+                    pass
+                view = memoryview(data)
+                written = 0
+                while written < len(data):
+                    written += os.write(fd, view[written:])
+            finally:
+                os.close(fd)
 
     def create_run(
         self,
@@ -340,30 +421,49 @@ class ProbeStore:
             rec["payload_is_raw"] = True
         self._append_record(run_id, rec)
 
-    def _iter_runs_sorted(self) -> list[tuple[RunRecord, Path]]:
+    def _ordered_run_files(self) -> tuple[list[tuple[str, str, Path]], list[Path]]:
         if not self.runs_dir.is_dir():
-            return []
-        found: list[tuple[RunRecord, Path]] = []
+            return [], []
+        valid: list[tuple[str, str, Path]] = []
+        orphans: list[Path] = []
         for fp in sorted(self.runs_dir.glob("*.jsonl")):
-            run, _ = _read_run_file(fp)
-            if run is not None:
-                found.append((run, fp))
-        found.sort(key=lambda item: (item[0].started_at, item[0].id), reverse=True)
-        return found
+            started_at = _peek_run_start(fp)
+            if started_at is None:
+                orphans.append(fp)
+            else:
+                valid.append((started_at, fp.stem, fp))
+        valid.sort(key=lambda item: (item[0], item[1]), reverse=True)
+        return valid, orphans
 
-    def get_run(self, run_id: str | None = None) -> RunRecord | None:
+    def get_run_with_events(self, run_id: str | None = None) -> tuple[RunRecord | None, list[EventRecord]]:
         if run_id:
             try:
                 path = self.run_path(run_id)
             except ValueError:
-                return None
-            run, _ = _read_run_file(path)
-            return run
-        runs = self.list_runs(limit=1)
-        return runs[0] if runs else None
+                return None, []
+            return _read_run_file(path)
+        valid, _ = self._ordered_run_files()
+        for _, _, fp in valid:
+            run, events = _read_run_file(fp)
+            if run is not None:
+                return run, events
+        return None, []
+
+    def get_run(self, run_id: str | None = None) -> RunRecord | None:
+        run, _ = self.get_run_with_events(run_id)
+        return run
 
     def list_runs(self, limit: int = 20) -> list[RunRecord]:
-        return [run for run, _ in self._iter_runs_sorted()[: max(1, limit)]]
+        valid, _ = self._ordered_run_files()
+        out: list[RunRecord] = []
+        cap = max(1, limit)
+        for _, _, fp in valid:
+            if len(out) >= cap:
+                break
+            run, _ = _read_run_file(fp)
+            if run is not None:
+                out.append(run)
+        return out
 
     def list_events(
         self,
@@ -385,12 +485,11 @@ class ProbeStore:
     def clean_runs(self, keep: int = 20) -> int:
         """Delete run logs older than the most recent `keep` runs."""
         keep_n = max(0, keep)
-        ordered = self._iter_runs_sorted()
+        valid, orphans = self._ordered_run_files()
+        to_delete = [fp for _, _, fp in valid[keep_n:]] + orphans
         deleted = 0
-        for _, path in ordered[keep_n:]:
-            try:
-                path.unlink(missing_ok=True)
+        for path in to_delete:
+            if path.exists():
+                path.unlink()
                 deleted += 1
-            except OSError:
-                pass
         return deleted

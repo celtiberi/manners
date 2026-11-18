@@ -26,14 +26,20 @@ Both roles are configured once in `config.toml` and can point at cloud APIs or l
 
 ## Install
 
+From a GitHub Release wheel (recommended in containers/CI — no `git` binary required):
+
 ```sh
-uv tool install git+https://github.com/celtiberi/probe.git
+uv tool install https://github.com/celtiberi/probe/releases/download/v0.2.0/probe-0.2.0-py3-none-any.whl
 ```
 
-In a project virtual environment:
+In a project virtual environment (wheel or git):
 
 ```sh
-uv add git+https://github.com/celtiberi/probe.git
+uv add https://github.com/celtiberi/probe/releases/download/v0.2.0/probe-0.2.0-py3-none-any.whl
+# or via pip:
+# pip install https://github.com/celtiberi/probe/releases/download/v0.2.0/probe-0.2.0-py3-none-any.whl
+# or from git main:
+# uv add git+https://github.com/celtiberi/probe.git
 ```
 
 ## Quick Start
@@ -89,6 +95,8 @@ PROBES=1 PROBE_NO_PDB=1 pytest
 
 To skip `.probes/lock.json` enforcement during quick local iteration, set `PROBE_SKIP_LOCK=1`. Setting `PROBES=""` or `PROBES=0` in the shell overrides `PROBES=1` in `.env`.
 
+To temporarily suppress probes inside mocked unit tests when `PROBES=1` is set globally, use `with probe.disabled():` (or `from probe import disabled`).
+
 4. Inspect results in call-entry order (works while a server is running too, via per-run JSONL logs):
 
 ```sh
@@ -110,9 +118,11 @@ probe runs
 
 ## Configuration (`~/.config/probe/config.toml`)
 
-Project overrides can also be placed under `[tool.probe]` in `pyproject.toml`.
+Project overrides can also be placed under `[tool.probe]` in `pyproject.toml`. (If `~/.config/probe/config.toml` already configures remote endpoints, overriding them to different remote hosts from `pyproject.toml` requires `PROBE_TRUST_PROJECT_ENDPOINTS=1`.)
 
 ```toml
+domain_context = ""              # Optional domain conventions (passed to Gate 2/3 & runtime checks)
+
 [models.decision]
 provider = "typesafe_jev"
 url = "https://api.typesafe.ai/v1/systemone"
@@ -141,7 +151,7 @@ explain_decision_failures = true
 system_prompt = ""
 
 [rate_limit]
-max_calls = 5
+max_calls = 20
 window_seconds = 10.0
 max_calls_per_run = -1
 

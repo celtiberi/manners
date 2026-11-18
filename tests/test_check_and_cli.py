@@ -13,8 +13,9 @@ import pytest
 from typer.testing import CliRunner
 
 import probe
+from probe import ProbeHaltError
 from probe.backends import BackendError, CheckScore
-from probe.check import _load_manual_fixture, discover_probes, run_probe_check
+from probe.check import _load_manual_fixture, _sha256_text, _validate_gate3_snapshot, discover_probes, run_probe_check
 from probe.cli import app
 from probe.config import (
     CheckConfig,
@@ -24,6 +25,7 @@ from probe.config import (
     RuntimeConfig,
     TextConfig,
 )
+from probe.runtime import ProbeType, resolve_module_name
 from probe.store import ProbeStore
 
 
@@ -381,9 +383,34 @@ def test_cli_list_report_log_runs_clean(tmp_path: Path, monkeypatch) -> None:
     assert lpos1 < lpos2 < lpos3
     assert "payload:" in log_multi.stdout
 
+    log_md = runner.invoke(app, ["log", "tutor.opening_turn", "rag.*", "--format", "md"])
+    assert log_md.exit_code == 0
+    assert "[kind=text]" in log_md.stdout
+    assert "[kind=decision]**(HALT TRIGGER)**" not in log_md.stdout
+    assert "`[kind=decision]` **(HALT TRIGGER)**" in log_md.stdout
+
     runs_res = runner.invoke(app, ["runs", "--json"])
     assert runs_res.exit_code == 0
     assert len(json.loads(runs_res.stdout)["runs"]) == 2
+
+    # Clean exit code 1 with Error message when config is invalid across CLI subcommands.
+    broken_cfg_project = tmp_path / "bad_cli_cfg"
+    broken_cfg_project.mkdir()
+    (broken_cfg_project / "pyproject.toml").write_text(
+        "[project]\nname = 'bad-cfg'\n[tool.probe.decision]\npass_threshold = 1.0\n",
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(broken_cfg_project)
+    for bad_args in (
+        ["report"],
+        ["log", "tutor.*"],
+        ["runs"],
+        ["clean"],
+    ):
+        err_res = runner.invoke(app, bad_args)
+        assert err_res.exit_code == 1
+        assert "Error:" in err_res.stderr
+    monkeypatch.chdir(tmp_path)
 
     log_no_payload = runner.invoke(app, ["log", "tutor.opening_turn", "--format", "json"])
     assert log_no_payload.exit_code == 0
@@ -490,31 +517,26 @@ def test_auto_derived_ids_zero_imports_gate1_failures_syntax_errors_and_subdir_c
         if url.endswith("/chat/completions"):
             sys_msg = body["messages"][0]["content"]
             if "passing_snapshot" in sys_msg:
-                return httpx.Response(
-                    200,
-                    json={
-                        "choices": [
-                            {
-                                "message": {
-                                    "content": json.dumps(
-                                        {
-                                            "passing_snapshot": {
-                                                "inputs": {"name": "Ana", "inner": "Ana"},
-                                                "output": "GOOD Hello Ana",
-                                                "watched": {"msg": "GOOD Hello Ana"},
-                                            },
-                                            "failing_snapshot": {
-                                                "inputs": {"name": "Ana", "inner": "Ana"},
-                                                "output": "BAD",
-                                                "watched": {"msg": "BAD"},
-                                            },
-                                        }
-                                    )
-                                }
-                            }
-                        ]
-                    },
-                )
+                user_msg = body["messages"][1]["content"]
+                if "Site: here" in user_msg:
+                    payload = {
+                        "notes": "ok",
+                        "passing_snapshot": {"watched": {"msg": "GOOD Hello Ana"}},
+                        "failing_snapshot": {"watched": {"msg": "BAD"}},
+                    }
+                else:
+                    payload = {
+                        "notes": "ok",
+                        "passing_snapshot": {
+                            "inputs": {"name": "Ana", "inner": "Ana"},
+                            "output": "GOOD Hello Ana",
+                        },
+                        "failing_snapshot": {
+                            "inputs": {"name": "Ana", "inner": "Ana"},
+                            "output": "BAD",
+                        },
+                    }
+                return httpx.Response(200, json={"choices": [{"message": {"content": json.dumps(payload)}}]})
             return httpx.Response(200, json={"choices": [{"message": {"content": "Factual check audit."}}]})
         if url.endswith("/decision"):
             if body["probe_id"].endswith("#gate2"):
@@ -607,3 +629,521 @@ def test_auto_derived_ids_zero_imports_gate1_failures_syntax_errors_and_subdir_c
     # Path traversal in manual fixture names is rejected.
     with pytest.raises(BackendError, match="path separators"):
         _load_manual_fixture(tmp_path / ".probes" / "fixtures", "../secret")
+
+
+def _stage3_mock_handler(request: httpx.Request) -> httpx.Response:
+    url = str(request.url)
+    body = json.loads(request.content.decode("utf-8"))
+    if url.endswith("/chat/completions"):
+        sys_msg = body["messages"][0]["content"]
+        if "passing_snapshot" in sys_msg:
+            user_msg = body["messages"][1]["content"]
+            if "Site: here" in user_msg:
+                wk_line = next((ln for ln in user_msg.splitlines() if ln.startswith("Watched keys:")), "")
+                keys = [k.strip() for k in wk_line.split(":", 1)[1].split(",") if k.strip()] if ":" in wk_line else []
+                payload = {
+                    "notes": "ok",
+                    "passing_snapshot": {"watched": {k: "GOOD ok" for k in keys}},
+                    "failing_snapshot": {"watched": {k: "BAD" for k in keys}},
+                }
+            else:
+                # Extract parameter names from Signature line when present.
+                sig_line = next((ln for ln in user_msg.splitlines() if ln.startswith("Signature:")), "")
+                params_str = sig_line.split("(", 1)[1].rsplit(")", 1)[0] if "(" in sig_line and ")" in sig_line else ""
+                inputs = {}
+                for chunk in params_str.split(","):
+                    pname = chunk.strip().split(":", 1)[0].split("=", 1)[0].strip().lstrip("*")
+                    if pname:
+                        inputs[pname] = "Ana"
+                payload = {
+                    "notes": "ok",
+                    "passing_snapshot": {"inputs": inputs, "output": "GOOD ok"},
+                    "failing_snapshot": {"inputs": inputs, "output": "BAD"},
+                }
+            return httpx.Response(200, json={"choices": [{"message": {"content": json.dumps(payload)}}]})
+        return httpx.Response(200, json={"choices": [{"message": {"content": "Factual check audit."}}]})
+    if url.endswith("/decision"):
+        if body["probe_id"].endswith("#gate2"):
+            return httpx.Response(200, json={"probabilities": [0.95 for _ in body["checks"]]})
+        ok = "GOOD" in body["snapshot"]
+        return httpx.Response(200, json={"probabilities": [0.95 if ok else 0.10 for _ in body["checks"]]})
+    raise AssertionError(f"Unexpected URL: {url}")
+
+
+def test_stage3_discovery_scoping_namespace_and_stacking(tmp_path: Path, monkeypatch) -> None:
+    # 1. PEP 420 namespace package (src/acme/tutor/turn.py with zero __init__.py).
+    turn_py = tmp_path / "src" / "acme" / "tutor" / "turn.py"
+    turn_py.parent.mkdir(parents=True)
+    turn_py.write_text(
+        textwrap.dedent(
+            """
+            from probe import probe
+
+            @probe("Responds warmly in Spanish")
+            def greet(name: str) -> str:
+                return f"Hola {name}"
+            """
+        ).strip()
+        + "\n",
+        encoding="utf-8",
+    )
+    assert resolve_module_name(turn_py, tmp_path) == "acme.tutor.turn"
+    ns_discovered = discover_probes([turn_py], root=tmp_path)
+    assert [(d.probe_id, d.file_line, d.param_names) for d in ns_discovered] == [
+        ("acme.tutor.turn.greet", "src/acme/tutor/turn.py:4", ("name",))
+    ]
+
+    # 2. Stacked decorators under __main__ + generator expression scope isolation.
+    stacked_py = tmp_path / "stacked_main.py"
+    stacked_py.write_text(
+        textwrap.dedent(
+            """
+            import functools
+            from probe import probe
+
+            @probe("Greets cleanly without leaking system tokens")
+            @functools.lru_cache(maxsize=4)
+            def cached_greet(name: str) -> str:
+                gen = (probe.here("Non-empty greeting value", val=f"GOOD {ch}") for ch in [name])
+                list(gen)
+                return f"GOOD {name}"
+            """
+        ).strip()
+        + "\n",
+        encoding="utf-8",
+    )
+    disc_stacked = discover_probes([stacked_py], root=tmp_path)
+    assert [d.probe_id for d in disc_stacked] == [
+        "stacked_main.cached_greet",
+        "stacked_main.cached_greet.<locals>.<genexpr>:L7",
+    ]
+    assert disc_stacked[0].param_names == ("name",)
+    assert disc_stacked[0].signature == "def cached_greet(name: str) -> str"
+
+    cfg = ProbeConfig(
+        models_decision=ModelEndpointConfig(provider="http_decision", url="http://mock.local/decision", model="jev"),
+        models_text=ModelEndpointConfig(provider="openai_compat", url="http://mock.local/v1", model="qwen3.5:9b"),
+        decision=DecisionConfig(pass_threshold=0.50),
+        check=CheckConfig(require_check=True),
+        runtime=RuntimeConfig(
+            runs_dir=str(tmp_path / ".probes" / "runs"),
+            lock_path=str(tmp_path / ".probes" / "lock.json"),
+        ),
+        project_root=tmp_path,
+    )
+    ok_st, _ = run_probe_check([stacked_py], config=cfg, transport=httpx.MockTransport(_stage3_mock_handler))
+    assert ok_st is True
+
+    monkeypatch.setenv("PROBES", "1")
+    monkeypatch.delenv("PROBE_SKIP_LOCK", raising=False)
+    monkeypatch.setenv("PROBE_NO_PDB", "1")
+    spec = importlib.util.spec_from_file_location("__main__", stacked_py)
+    assert spec is not None and spec.loader is not None
+    mod = importlib.util.module_from_spec(spec)
+    old_main = sys.modules.get("__main__")
+    sys.modules["__main__"] = mod
+    spec.loader.exec_module(mod)
+    probe.reset_for_testing(config=cfg, transport=httpx.MockTransport(_stage3_mock_handler))
+    try:
+        assert mod.cached_greet("Ana") == "GOOD Ana"
+    finally:
+        probe.probe.flush_for_testing()
+        probe.reset_for_testing()
+        if old_main is not None:
+            sys.modules["__main__"] = old_main
+
+    # 3. Lexical shadowing ignores non-probe decorators; @probe on class fails; id=None ok; literal before dup ID.
+    scope_py = tmp_path / "scoping_cases.py"
+    scope_py.write_text(
+        textwrap.dedent(
+            """
+            from probe import probe
+
+            def outer():
+                probe = lambda *a, **kw: (lambda fn: fn)
+                @probe("Shadowed local decorator")
+                def shadowed_fn(x: str) -> str:
+                    return x
+
+            @probe("Class decorators are rejected")
+            class BadClass:
+                pass
+
+            @probe("Explicit None id uses auto-derived ID", id=None)
+            def none_id_fn(topic: str) -> str:
+                return topic
+
+            @probe(123, id="dup.case")
+            def bad_lit_dup(x: str) -> str:
+                return x
+
+            @probe("Valid semantic rule", id="dup.case")
+            def good_dup(x: str) -> str:
+                return x
+            """
+        ).strip()
+        + "\n",
+        encoding="utf-8",
+    )
+    ok_sc, res_sc = run_probe_check([scope_py], config=cfg, transport=httpx.MockTransport(_stage3_mock_handler))
+    assert ok_sc is False
+    by_id = {r.probe_id: r for r in res_sc}
+    assert "scoping_cases.outer.<locals>.shadowed_fn" not in by_id
+    assert by_id["scoping_cases.BadClass"].gate == "gate1"
+    assert "classes" in by_id["scoping_cases.BadClass"].reason
+    assert by_id["scoping_cases.none_id_fn"].status == "passed"
+    dup_res = [r for r in res_sc if r.probe_id == "dup.case"]
+    assert len(dup_res) == 2
+    assert any("literal" in r.reason or "string literal" in r.reason for r in dup_res)
+    assert any("Duplicate probe_id" in r.reason for r in dup_res)
+
+
+def test_stage3_pruning_moves_fixtures_list_and_verify_lock(tmp_path: Path, monkeypatch) -> None:
+    (tmp_path / "pyproject.toml").write_text(
+        "\n".join(
+            [
+                "[project]",
+                'name = "stage3-app"',
+                "",
+                "[tool.probe.models.decision]",
+                'provider = "http_decision"',
+                'url = "http://mock.local/decision"',
+                'model = "jev"',
+                "",
+                "[tool.probe.models.text]",
+                'provider = "openai_compat"',
+                'url = "http://mock.local/v1"',
+                'model = "qwen3.5:9b"',
+                "",
+                "[tool.probe.check]",
+                "require_check = true",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    pkg = tmp_path / "pkg"
+    other = tmp_path / "other"
+    pkg.mkdir()
+    other.mkdir()
+    a_py = pkg / "a.py"
+    old_py = pkg / "old.py"
+    keep_py = other / "keep.py"
+    a_py.write_text(
+        'from probe import probe\n'
+        '@probe("Responds politely", id="p.a")\n'
+        'def fa(x: str) -> str:\n    return "GOOD " + x\n',
+        encoding="utf-8",
+    )
+    old_py.write_text(
+        'from probe import probe\n'
+        '@probe("Responds politely", id="p.old")\n'
+        'def fold(x: str) -> str:\n    return "GOOD " + x\n',
+        encoding="utf-8",
+    )
+    keep_py.write_text(
+        'from probe import probe\n'
+        '@probe("Responds politely", id="p.keep")\n'
+        'def fkeep(x: str) -> str:\n    return "GOOD " + x\n',
+        encoding="utf-8",
+    )
+
+    cfg = ProbeConfig(
+        models_decision=ModelEndpointConfig(provider="http_decision", url="http://mock.local/decision", model="jev"),
+        models_text=ModelEndpointConfig(provider="openai_compat", url="http://mock.local/v1", model="qwen3.5:9b"),
+        decision=DecisionConfig(pass_threshold=0.50),
+        check=CheckConfig(require_check=True),
+        runtime=RuntimeConfig(
+            runs_dir=str(tmp_path / ".probes" / "runs"),
+            lock_path=str(tmp_path / ".probes" / "lock.json"),
+        ),
+        project_root=tmp_path,
+    )
+    lock_path = cfg.resolve_lock_path()
+    transport = httpx.MockTransport(_stage3_mock_handler)
+    ok_all, _ = run_probe_check(config=cfg, transport=transport)
+    assert ok_all is True
+
+    # 1. Directory scan prunes deleted pkg/old.py while keeping other/keep.py.
+    old_py.unlink()
+    ok_dir, _ = run_probe_check([pkg], config=cfg, transport=transport)
+    assert ok_dir is True
+    locks = json.loads(lock_path.read_text(encoding="utf-8"))["probes"]
+    assert "p.old" not in locks and "p.a" in locks and "p.keep" in locks
+    assert locks["p.a"]["param_names"] == ["x"]
+
+    # 2. Explicit CLI check on deleted locked file prunes it; non-existent untracked file still exits 1.
+    temp_py = pkg / "temp_del.py"
+    temp_py.write_text(
+        'from probe import probe\n@probe("Responds politely", id="p.temp")\ndef ftmp(x: str) -> str:\n    return x\n',
+        encoding="utf-8",
+    )
+    assert run_probe_check([temp_py], config=cfg, transport=transport)[0] is True
+    assert "p.temp" in json.loads(lock_path.read_text(encoding="utf-8"))["probes"]
+    temp_py.unlink()
+    monkeypatch.chdir(tmp_path)
+    runner = CliRunner()
+    del_res = runner.invoke(app, ["check", "pkg/temp_del.py"])
+    assert del_res.exit_code == 0, del_res.stdout + del_res.stderr
+    assert "p.temp" not in json.loads(lock_path.read_text(encoding="utf-8"))["probes"]
+    assert runner.invoke(app, ["check", "never_existed.py"]).exit_code == 1
+
+    # 3. Parse-error file protects its locked entry against both pruning and cross-file theft.
+    a_py.write_text("def broken(:\n", encoding="utf-8")
+    ok_err, _ = run_probe_check(config=cfg, transport=transport)
+    assert ok_err is False
+    assert "p.a" in json.loads(lock_path.read_text(encoding="utf-8"))["probes"]
+    a_py.write_text(
+        'from probe import probe\n'
+        '@probe("Responds politely", id="p.a")\n'
+        'def fa(x: str) -> str:\n    return "GOOD " + x\n',
+        encoding="utf-8",
+    )
+
+    # 4. Partial scan allows moving p.keep from existing other/keep.py -> pkg/a.py, but still blocks true duplicates.
+    keep_py.write_text("# moved out\n", encoding="utf-8")
+    a_py.write_text(
+        textwrap.dedent(
+            """
+            from probe import probe
+
+            @probe("Responds politely", id="p.a")
+            def fa(x: str) -> str:
+                return "GOOD " + x
+
+            @probe("Responds politely", id="p.keep")
+            def moved_keep(x: str) -> str:
+                return "GOOD " + x
+            """
+        ).strip()
+        + "\n",
+        encoding="utf-8",
+    )
+    ok_move, _ = run_probe_check([a_py], config=cfg, transport=transport)
+    assert ok_move is True
+    locks_after_move = json.loads(lock_path.read_text(encoding="utf-8"))["probes"]
+    assert locks_after_move["p.keep"]["file_line"].startswith("pkg/a.py:")
+
+    # Duplicate probe_id in existing keep_py blocks checking keep_py against a_py.
+    keep_py.write_text(
+        'from probe import probe\n'
+        '@probe("Responds politely", id="p.keep")\n'
+        'def dup_keep(x: str) -> str:\n    return x\n',
+        encoding="utf-8",
+    )
+    ok_dup_partial, res_dup_partial = run_probe_check([keep_py], config=cfg, transport=transport)
+    assert ok_dup_partial is False
+    assert res_dup_partial[0].gate == "gate1"
+    assert "already locked" in res_dup_partial[0].reason
+    keep_py.write_text("# clean again\n", encoding="utf-8")
+
+    # 5. Manual fixture hash disambiguation, wrong probe_id rejection, and strict Gate 3 snapshot validation.
+    fixtures_dir = tmp_path / ".probes" / "fixtures"
+    fixtures_dir.mkdir(parents=True, exist_ok=True)
+    hashed_name = f"pkg_colon-{_sha256_text('pkg:colon')[:6]}.json"
+    (fixtures_dir / hashed_name).write_text(
+        json.dumps(
+            {
+                "probe_id": "pkg:colon",
+                "pass": {"inputs": {"x": "hi"}, "output": "GOOD hi"},
+                "fail": {"inputs": {"x": "hi"}, "output": "BAD"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    assert _load_manual_fixture(fixtures_dir, "pkg:colon") is not None
+    (fixtures_dir / "wrong_pid.json").write_text(
+        json.dumps(
+            {
+                "probe_id": "other.id",
+                "pass": {"inputs": {"x": "hi"}, "output": "GOOD"},
+                "fail": {"inputs": {"x": "hi"}, "output": "BAD"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(BackendError, match="does not match"):
+        _load_manual_fixture(fixtures_dir, "wrong_pid")
+
+    dec_item = discover_probes([a_py], root=tmp_path)[0]
+    with pytest.raises(BackendError, match="must not use 'exception'"):
+        _validate_gate3_snapshot('{"inputs": {"x": "a"}, "exception": "boom"}', item=dec_item, label="pass")
+    with pytest.raises(BackendError, match="missing required input"):
+        _validate_gate3_snapshot('{"inputs": {}, "output": "GOOD"}', item=dec_item, label="pass")
+
+    here_py = tmp_path / "here_item.py"
+    here_py.write_text(
+        'from probe import probe\ndef f(a, b):\n    probe.here("Warm reply", id="h.val", a=a, b=b)\n',
+        encoding="utf-8",
+    )
+    here_item = discover_probes([here_py], root=tmp_path)[0]
+    with pytest.raises(BackendError, match="must not include 'output'"):
+        _validate_gate3_snapshot('{"watched": {"a": 1, "b": 2}, "output": "no"}', item=here_item, label="pass")
+    with pytest.raises(BackendError, match="unexpected watched key"):
+        _validate_gate3_snapshot('{"watched": {"a": 1, "b": 2, "c": 3}}', item=here_item, label="pass")
+
+    # 6. probe list: invalid status, threshold change invalidation, and SyntaxError exit 1.
+    list_ok = runner.invoke(app, ["list", "pkg/a.py", "--json"])
+    assert list_ok.exit_code == 0
+    rows = json.loads(list_ok.stdout)["probes"]
+    assert all(r["lock_status"] == "locked" for r in rows)
+
+    (tmp_path / "pyproject.toml").write_text(
+        (tmp_path / "pyproject.toml").read_text(encoding="utf-8") + "\n[tool.probe.decision]\npass_threshold = 0.65\n",
+        encoding="utf-8",
+    )
+    list_thresh = runner.invoke(app, ["list", "pkg/a.py", "--json"])
+    assert list_thresh.exit_code == 0
+    assert all(r["lock_status"] != "locked" for r in json.loads(list_thresh.stdout)["probes"])
+
+    dup_file = tmp_path / "dups.py"
+    dup_file.write_text(
+        'from probe import probe\n@probe(123, id="d1")\ndef f1(): pass\n@probe("ok", id="d1")\ndef f2(): pass\n',
+        encoding="utf-8",
+    )
+    list_inv = runner.invoke(app, ["list", "dups.py", "--json"])
+    assert list_inv.exit_code == 0
+    assert [r["lock_status"] for r in json.loads(list_inv.stdout)["probes"]] == ["invalid", "invalid"]
+
+    syn_file = tmp_path / "syn_bad.py"
+    syn_file.write_text("def x(:\n", encoding="utf-8")
+    assert runner.invoke(app, ["list", "syn_bad.py"]).exit_code == 1
+
+    # 7. Runtime verify_lock rejects param_names mismatch and wrong-file spoofing.
+    monkeypatch.setenv("PROBES", "1")
+    monkeypatch.delenv("PROBE_SKIP_LOCK", raising=False)
+    monkeypatch.setenv("PROBE_NO_PDB", "1")
+    probe.reset_for_testing(config=cfg, transport=transport)
+    try:
+        rt = probe._get_runtime()
+        with pytest.raises(ProbeHaltError):
+            rt.verify_lock(
+                probe_id="p.a",
+                probe_type=ProbeType.decision,
+                checks=("Responds politely",),
+                call_seq=1,
+                elapsed_ms=1.0,
+                started_at="2026-11-18T10:00:00Z",
+                site="decorator",
+                file_line="pkg/a.py:3",
+                payload_json="{}",
+                watched_keys=(),
+                param_names=("renamed_param",),
+            )
+    finally:
+        probe.probe.flush_for_testing()
+        probe.reset_for_testing()
+
+    probe.reset_for_testing(config=cfg, transport=transport)
+    try:
+        rt2 = probe._get_runtime()
+        with pytest.raises(ProbeHaltError):
+            rt2.verify_lock(
+                probe_id="p.a",
+                probe_type=ProbeType.decision,
+                checks=("Responds politely",),
+                call_seq=1,
+                elapsed_ms=1.0,
+                started_at="2026-11-18T10:00:00Z",
+                site="decorator",
+                file_line="other/spoof.py:99",
+                payload_json="{}",
+                watched_keys=(),
+                param_names=("x",),
+            )
+    finally:
+        probe.probe.flush_for_testing()
+        probe.reset_for_testing()
+
+
+def test_stage4_gate3_synthetic_retry_and_manual_fixture_no_retry(tmp_path: Path) -> None:
+    target_py = tmp_path / "retry_demo.py"
+    target_py.write_text(
+        textwrap.dedent(
+            """
+            from probe import probe
+
+            @probe("Responds warmly in Spanish without leaking answers", id="retry.syn")
+            def syn_fn(topic: str) -> str:
+                return topic
+
+            @probe("Stays grounded in context", id="retry.manual")
+            def manual_fn(topic: str) -> str:
+                return topic
+            """
+        ).strip()
+        + "\n",
+        encoding="utf-8",
+    )
+
+    fixtures_dir = tmp_path / ".probes" / "fixtures"
+    fixtures_dir.mkdir(parents=True)
+    # Manual fixture that fails calibration (both pass & fail look BAD) — must NOT retry!
+    (fixtures_dir / "retry.manual.json").write_text(
+        json.dumps(
+            {
+                "pass": {"inputs": {"topic": "coffee"}, "output": "WEAK_MANUAL"},
+                "fail": {"inputs": {"topic": "coffee"}, "output": "WEAK_FAIL"},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    gate3_calls: list[dict] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        url = str(request.url)
+        body = json.loads(request.content.decode("utf-8"))
+        if url.endswith("/chat/completions"):
+            sys_msg = body["messages"][0]["content"]
+            if "passing_snapshot" in sys_msg:
+                gate3_calls.append(body)
+                if len(gate3_calls) == 1:
+                    # Attempt 1: weak passing_snapshot causes calibration failure.
+                    payload = {
+                        "notes": "attempt 1",
+                        "passing_snapshot": {"inputs": {"topic": "coffee"}, "output": "WEAK_SYN"},
+                        "failing_snapshot": {"inputs": {"topic": "coffee"}, "output": "BAD_SYN"},
+                    }
+                else:
+                    # Attempt 2: fixes calibration after receiving retry_feedback & temperature=0.3.
+                    payload = {
+                        "notes": "attempt 2",
+                        "passing_snapshot": {"inputs": {"topic": "coffee"}, "output": "GOOD Hola!"},
+                        "failing_snapshot": {"inputs": {"topic": "coffee"}, "output": "BAD_SYN"},
+                    }
+                return httpx.Response(200, json={"choices": [{"message": {"content": json.dumps(payload)}}]})
+            return httpx.Response(200, json={"choices": [{"message": {"content": "Factual check audit."}}]})
+        if url.endswith("/decision"):
+            if body["probe_id"].endswith("#gate2"):
+                return httpx.Response(200, json={"probabilities": [0.95 for _ in body["checks"]]})
+            ok = "GOOD" in body["snapshot"]
+            return httpx.Response(200, json={"probabilities": [0.95 if ok else 0.15 for _ in body["checks"]]})
+        raise AssertionError(f"Unexpected URL: {url}")
+
+    cfg = ProbeConfig(
+        models_decision=ModelEndpointConfig(provider="http_decision", url="http://mock.local/decision", model="jev"),
+        models_text=ModelEndpointConfig(provider="openai_compat", url="http://mock.local/v1", model="qwen3.5:9b"),
+        decision=DecisionConfig(pass_threshold=0.50),
+        domain_context="Custom pedagogical tag rules.",
+        check=CheckConfig(require_check=True),
+        runtime=RuntimeConfig(
+            runs_dir=str(tmp_path / ".probes" / "runs"),
+            lock_path=str(tmp_path / ".probes" / "lock.json"),
+        ),
+        project_root=tmp_path,
+    )
+
+    ok, results = run_probe_check([target_py], config=cfg, transport=httpx.MockTransport(handler))
+    assert ok is False  # retry.manual failed as intended
+    by_id = {r.probe_id: r for r in results}
+    assert by_id["retry.syn"].status == "passed"
+    assert by_id["retry.manual"].status == "failed" and by_id["retry.manual"].gate == "gate3"
+    # Exactly 2 Gate 3 synthesis calls: attempt 1 + 1x retry for retry.syn, 0 synthesis calls for retry.manual.
+    assert len(gate3_calls) == 2
+    assert gate3_calls[0]["temperature"] == 0.0
+    assert "<previous_attempt_error>" not in gate3_calls[0]["messages"][1]["content"]
+    assert "<domain_context>" in gate3_calls[0]["messages"][1]["content"]
+    assert gate3_calls[1]["temperature"] == 0.3
+    assert "<previous_attempt_error>" in gate3_calls[1]["messages"][1]["content"]
+    assert "failed checks" in gate3_calls[1]["messages"][1]["content"]

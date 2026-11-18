@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import copy
 import json
-import re
 from collections.abc import Sequence
 from dataclasses import dataclass
 from functools import cache
@@ -134,24 +133,25 @@ def compose_system_prompt(base_system: str, user_system_prompt: str = "") -> str
     return f"{extra}\n\n{base_system}".strip()
 
 
-def _escape_json_closing_tags(snapshot_json: str) -> str:
-    """Escape `</` inside JSON text so string values cannot close XML wrapper tags."""
-    return snapshot_json.replace("</", "<\\/")
+def _escape_closing_tags(text: str) -> str:
+    """Escape any `</` sequences inside untrusted blocks so wrapper XML tags cannot be closed early."""
+    return text.replace("</", "<\\/")
 
 
-def _escape_xml_closing_tag(text: str, tag: str) -> str:
-    """Escape closing `</tag>` occurrences in free text/code so wrappers stay balanced."""
-    return re.sub(rf"</({re.escape(tag)})\s*>", r"<\/\1>", text, flags=re.IGNORECASE)
-
-
-def format_typesafe_state(probe_id: str, snapshot_json: str, analysis: str = "") -> str:
+def format_typesafe_state(
+    probe_id: str,
+    snapshot_json: str,
+    analysis: str = "",
+    domain_context: str = "",
+) -> str:
     """Format the serialized state string sent to TypeSafe Jev /v1/systemone."""
     parts = [f"Probe: {probe_id}"]
+    ctx = domain_context.strip()
+    if ctx:
+        parts.append(f"Domain Context:\n<domain_context>\n{_escape_closing_tags(ctx)}\n</domain_context>")
     if analysis:
-        safe_analysis = _escape_xml_closing_tag(analysis, "analysis")
-        parts.append(f"Analysis:\n<analysis>\n{safe_analysis}\n</analysis>")
-    safe_snapshot = _escape_json_closing_tags(snapshot_json)
-    parts.append(f"Runtime Snapshot (JSON):\n<snapshot>\n{safe_snapshot}\n</snapshot>")
+        parts.append(f"Analysis:\n<analysis>\n{_escape_closing_tags(analysis)}\n</analysis>")
+    parts.append(f"Runtime Snapshot (JSON):\n<snapshot>\n{_escape_closing_tags(snapshot_json)}\n</snapshot>")
     return "\n\n".join(parts)
 
 
@@ -161,13 +161,17 @@ def format_analyze_snapshot_prompts(
     checks: Sequence[str],
     snapshot_json: str,
     detail: str = "standard",
+    domain_context: str = "",
 ) -> tuple[str, str]:
     """Return (system, user) prompts for `probe.type.text` snapshot evidence extraction."""
     numbered = "\n".join(f"- [{i}] {c}" for i, c in enumerate(checks))
     system = f"{get_prompt('text_analyze_snapshot')}\n{detail_instruction(detail)}"
-    safe_snapshot = _escape_json_closing_tags(snapshot_json)
-    user = f"Probe: {probe_id}\nChecks:\n{numbered}\n\n<snapshot>\n{safe_snapshot}\n</snapshot>"
-    return system, user
+    parts = [f"Probe: {probe_id}", f"Checks:\n{numbered}"]
+    ctx = domain_context.strip()
+    if ctx:
+        parts.append(f"<domain_context>\n{_escape_closing_tags(ctx)}\n</domain_context>")
+    parts.append(f"<snapshot>\n{_escape_closing_tags(snapshot_json)}\n</snapshot>")
+    return system, "\n\n".join(parts)
 
 
 def format_explain_failure_prompts(
@@ -176,13 +180,17 @@ def format_explain_failure_prompts(
     failed_lines: Sequence[str],
     snapshot_json: str,
     detail: str = "standard",
+    domain_context: str = "",
 ) -> tuple[str, str]:
     """Return (system, user) prompts for explaining failed decision checks."""
     joined = "\n".join(failed_lines)
     system = f"{get_prompt('text_explain_failure')}\n{detail_instruction(detail)}"
-    safe_snapshot = _escape_json_closing_tags(snapshot_json)
-    user = f"Probe: {probe_id}\nFailed check(s):\n{joined}\n\n<snapshot>\n{safe_snapshot}\n</snapshot>"
-    return system, user
+    parts = [f"Probe: {probe_id}", f"Failed check(s):\n{joined}"]
+    ctx = domain_context.strip()
+    if ctx:
+        parts.append(f"<domain_context>\n{_escape_closing_tags(ctx)}\n</domain_context>")
+    parts.append(f"<snapshot>\n{_escape_closing_tags(snapshot_json)}\n</snapshot>")
+    return system, "\n\n".join(parts)
 
 
 def _format_gate_user_message(
@@ -193,19 +201,29 @@ def _format_gate_user_message(
     signature: str,
     source_excerpt: str,
     watched_keys: Sequence[str] = (),
+    domain_context: str = "",
+    retry_feedback: str = "",
 ) -> str:
     numbered = "\n".join(f"- [{i}] {c}" for i, c in enumerate(checks))
     lines = [
         f"Probe: {probe_id}",
         f"Site: {site}",
-        f"Signature: {signature}",
     ]
     if site == "here" and watched_keys:
         lines.append(f"Watched keys: {', '.join(watched_keys)}")
     lines.append(f"Checks:\n{numbered}")
     header = "\n".join(lines)
-    safe_excerpt = _escape_xml_closing_tag(source_excerpt, "source_excerpt")
-    return f"{header}\n\n<source_excerpt>\n{safe_excerpt}\n</source_excerpt>"
+    safe_sig = _escape_closing_tags(signature)
+    safe_excerpt = _escape_closing_tags(source_excerpt)
+    parts = [header]
+    ctx = domain_context.strip()
+    if ctx:
+        parts.append(f"<domain_context>\n{_escape_closing_tags(ctx)}\n</domain_context>")
+    fb = retry_feedback.strip()
+    if fb:
+        parts.append(f"<previous_attempt_error>\n{_escape_closing_tags(fb)}\n</previous_attempt_error>")
+    parts.append(f"<source_excerpt>\nSignature: {safe_sig}\n{safe_excerpt}\n</source_excerpt>")
+    return "\n\n".join(parts)
 
 
 def format_gate2_analysis_prompts(
@@ -216,6 +234,7 @@ def format_gate2_analysis_prompts(
     signature: str,
     source_excerpt: str,
     watched_keys: Sequence[str] = (),
+    domain_context: str = "",
 ) -> tuple[str, str]:
     """Return (system, user) prompts for Gate 2 factual analysis before decision noul scoring."""
     return (
@@ -227,6 +246,7 @@ def format_gate2_analysis_prompts(
             signature=signature,
             source_excerpt=source_excerpt,
             watched_keys=watched_keys,
+            domain_context=domain_context,
         ),
     )
 
@@ -239,6 +259,8 @@ def format_gate3_fixtures_prompts(
     signature: str,
     source_excerpt: str,
     watched_keys: Sequence[str] = (),
+    domain_context: str = "",
+    retry_feedback: str = "",
 ) -> tuple[str, str]:
     """Return (system, user) prompts for Gate 3 synthetic pass/fail fixture generation."""
     return (
@@ -250,6 +272,8 @@ def format_gate3_fixtures_prompts(
             signature=signature,
             source_excerpt=source_excerpt,
             watched_keys=watched_keys,
+            domain_context=domain_context,
+            retry_feedback=retry_feedback,
         ),
     )
 

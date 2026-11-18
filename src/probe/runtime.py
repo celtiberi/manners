@@ -9,7 +9,6 @@ import inspect
 import json
 import os
 import pdb
-import re
 import shlex
 import sys
 import threading
@@ -33,7 +32,7 @@ from probe.config import (
     new_ulid,
     utc_now_iso,
 )
-from probe.redact import SecretRedactor, serialize_call_snapshot
+from probe.redact import SecretRedactor, _scrub_and_truncate, serialize_call_snapshot
 from probe.store import ProbeStore
 
 P = ParamSpec("P")
@@ -82,18 +81,19 @@ def compute_checks_hash(kind: ProbeType | str, checks: Sequence[str]) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
-_COMP_SCOPE_RE = re.compile(r"\.<locals>\.<(?:list|dict|set)comp>")
-
-
 def resolve_module_name(file_path: Path, root: Path | None = None) -> str:
-    """Resolve dotted Python module name matching importable package layout."""
+    """Resolve dotted Python module name matching importable package & PEP 420 namespace layouts."""
     resolved_file = file_path.resolve()
     resolved_root = root.resolve() if root is not None else None
 
     pkg_parts: list[str] = []
     cur = resolved_file.parent
+    reached_root = False
     while True:
         if resolved_root is not None and cur == resolved_root:
+            if (cur / "__init__.py").is_file():
+                pkg_parts.append(cur.name)
+            reached_root = True
             break
         if not (cur / "__init__.py").is_file():
             break
@@ -102,6 +102,19 @@ def resolve_module_name(file_path: Path, root: Path | None = None) -> str:
             break
         cur = cur.parent
     pkg_parts.reverse()
+
+    if resolved_root is not None and not reached_root:
+        src_dir = (resolved_root / "src").resolve()
+        ns_base: Path | None = None
+        if (resolved_root / "src").is_dir() and resolved_file.is_relative_to(src_dir):
+            ns_base = src_dir
+        elif resolved_file.is_relative_to(resolved_root):
+            ns_base = resolved_root
+        if ns_base is not None:
+            rel = resolved_file.relative_to(ns_base)
+            dir_parts = rel.parent.parts
+            if dir_parts and all(part.isidentifier() for part in dir_parts):
+                pkg_parts = list(dir_parts)
 
     if resolved_file.stem == "__init__":
         return ".".join(pkg_parts) if pkg_parts else resolved_file.stem
@@ -127,14 +140,39 @@ def _resolve_runtime_module(
     return mod_name or "__main__"
 
 
+def _normalize_here_qualname(raw_qual: str) -> str:
+    parts = [p for p in str(raw_qual).split(".") if p and p not in {"<listcomp>", "<dictcomp>", "<setcomp>"}]
+    cleaned: list[str] = []
+    for part in parts:
+        if part == "<locals>" and cleaned and cleaned[-1] == "<locals>":
+            continue
+        cleaned.append(part)
+    while cleaned and cleaned[-1] == "<locals>":
+        cleaned.pop()
+    if not cleaned:
+        return "<module>"
+    return ".".join(cleaned)
+
+
+def _rel_file_line(src_file: str, lineno: int, project_root: Path | None = None) -> str:
+    if project_root is not None and src_file and src_file != "unknown":
+        try:
+            rel = Path(src_file).resolve().relative_to(project_root.resolve())
+            return f"{rel.as_posix()}:{lineno}"
+        except (OSError, ValueError):
+            pass
+    return f"{src_file}:{lineno}"
+
+
 def _derive_decorator_id(fn: Callable[..., Any], *, project_root: Path | None = None) -> str:
-    raw_mod = getattr(fn, "__module__", "") or getattr(type(fn), "__module__", "") or "__main__"
-    qual = getattr(fn, "__qualname__", getattr(fn, "__name__", "")) or type(fn).__qualname__
+    target = inspect.unwrap(fn)
+    raw_mod = getattr(target, "__module__", "") or getattr(type(target), "__module__", "") or "__main__"
+    qual = getattr(target, "__qualname__", getattr(target, "__name__", "")) or type(target).__qualname__
     src_file: str | None = None
     try:
-        src_file = inspect.getsourcefile(fn)
+        src_file = inspect.getsourcefile(target)
     except Exception:
-        code = getattr(fn, "__code__", None)
+        code = getattr(target, "__code__", None)
         src_file = code.co_filename if code is not None else None
     mod = _resolve_runtime_module(str(raw_mod), src_file, project_root)
     return f"{mod}.{qual}"
@@ -147,28 +185,35 @@ def _derive_here_id(frame: FrameType | None, *, project_root: Path | None = None
     code = frame.f_code
     mod = _resolve_runtime_module(raw_mod, code.co_filename, project_root)
     raw_qual = getattr(code, "co_qualname", None) or code.co_name
-    qual = _COMP_SCOPE_RE.sub("", str(raw_qual))
+    qual = _normalize_here_qualname(str(raw_qual))
     if qual == "<module>":
         return f"{mod}:L{frame.f_lineno}"
     return f"{mod}.{qual}:L{frame.f_lineno}"
 
 
-def _decorator_file_line(fn: Callable[..., Any]) -> str:
+def _decorator_file_line(fn: Callable[..., Any], *, project_root: Path | None = None) -> str:
+    target = inspect.unwrap(fn)
+    code = getattr(target, "__code__", None)
     try:
-        src_file = inspect.getsourcefile(fn) or fn.__code__.co_filename
-        _, lineno = inspect.getsourcelines(fn)
-        return f"{src_file}:{lineno}"
+        src_file = inspect.getsourcefile(target) or (code.co_filename if code is not None else None)
     except Exception:
-        code = getattr(fn, "__code__", None)
-        if code is not None:
-            return f"{code.co_filename}:{code.co_firstlineno}"
-        return "unknown:0"
+        src_file = code.co_filename if code is not None else None
+    if code is not None and src_file:
+        return _rel_file_line(src_file, code.co_firstlineno, project_root)
+    try:
+        resolved_file = inspect.getsourcefile(target)
+        _, lineno = inspect.getsourcelines(target)
+        if resolved_file:
+            return _rel_file_line(resolved_file, lineno, project_root)
+    except Exception:
+        pass
+    return "unknown:0"
 
 
-def _here_file_line(frame: FrameType | None) -> str:
+def _here_file_line(frame: FrameType | None, *, project_root: Path | None = None) -> str:
     if frame is None:
         return "unknown:0"
-    return f"{frame.f_code.co_filename}:{frame.f_lineno}"
+    return _rel_file_line(frame.f_code.co_filename, frame.f_lineno, project_root)
 
 
 @dataclass(slots=True, frozen=True)
@@ -235,11 +280,13 @@ class ProbeRuntime:
             self.decision_backend = DecisionBackend(
                 self.config.models_decision,
                 self.config.decision,
+                domain_context=self.config.domain_context,
                 transport=transport,
             )
             self.text_backend = TextBackend(
                 self.config.models_text,
                 self.config.text,
+                domain_context=self.config.domain_context,
                 transport=transport,
             )
         except BaseException:
@@ -299,10 +346,11 @@ class ProbeRuntime:
         payload_json: str,
         caller_frame: FrameType | None = None,
         watched_keys: tuple[str, ...] = (),
-    ) -> None:
-        """Verify probe matches lockfile (checks_hash, site, watched_keys) unless skipped."""
+        param_names: tuple[str, ...] | None = None,
+    ) -> bool:
+        """Verify probe matches lockfile (checks_hash, site, params/watched_keys, file) unless skipped."""
         if not self.config.check.require_check or is_skip_lock(self.cwd):
-            return
+            return False
 
         with self._lock_cache_lock:
             if self._lock_cache is None:
@@ -326,19 +374,36 @@ class ProbeRuntime:
             locked_keys = entry.get("watched_keys")
             watched_ok = isinstance(locked_keys, list) and {str(k) for k in locked_keys} == set(watched_keys)
 
+        params_ok = True
+        if site == "decorator" and param_names is not None and isinstance(entry, dict):
+            locked_params = entry.get("param_names")
+            if isinstance(locked_params, list):
+                params_ok = [str(k) for k in locked_params] == list(param_names)
+
+        file_ok = True
+        if isinstance(entry, dict) and isinstance(entry.get("file_line"), str):
+            entry_fl = entry["file_line"]
+            if ":" in entry_fl and ":" in file_line:
+                entry_file = entry_fl.rsplit(":", 1)[0]
+                runtime_file = file_line.rsplit(":", 1)[0]
+                if not Path(runtime_file).is_absolute() and not Path(entry_file).is_absolute():
+                    file_ok = entry_file == runtime_file
+
         if (
             isinstance(entry, dict)
             and entry.get("checks_hash") == expected_hash
             and site_ok
             and watched_ok
+            and params_ok
+            and file_ok
         ):
-            return
+            return False
 
         msg = (
             f"Probe '{probe_id}' failed lock check (.probes/lock.json missing or out of date). "
             "Run `probe check` or set PROBE_SKIP_LOCK=1."
         )
-        self._record_and_halt_error(
+        return self._record_and_halt_error(
             probe_id=probe_id,
             probe_type=probe_type,
             checks=checks,
@@ -367,7 +432,7 @@ class ProbeRuntime:
         file_line: str,
         payload_json: str,
         caller_frame: FrameType | None = None,
-    ) -> None:
+    ) -> bool:
         """Enforce sliding-window and optional per-run caps; trip PROBE_MISUSE before calling models."""
         rl = self.config.rate_limit
         now = time.monotonic()
@@ -400,7 +465,7 @@ class ProbeRuntime:
                     )
 
         if breach_reason is not None:
-            self._record_and_halt_error(
+            return self._record_and_halt_error(
                 probe_id=probe_id,
                 probe_type=probe_type,
                 checks=checks,
@@ -415,6 +480,7 @@ class ProbeRuntime:
                 stack_excerpt=_short_stack_excerpt(caller_frame),
                 caller_frame=caller_frame,
             )
+        return False
 
     def _record_and_halt_error(
         self,
@@ -432,7 +498,7 @@ class ProbeRuntime:
         analysis: str,
         stack_excerpt: str,
         caller_frame: FrameType | None,
-    ) -> None:
+    ) -> bool:
         self.store.insert_event(
             run_id=self.run_id,
             call_seq=call_seq,
@@ -451,7 +517,7 @@ class ProbeRuntime:
             stack_excerpt=stack_excerpt,
             latency_ms=0.0,
         )
-        self._trigger_halt(
+        return self._trigger_halt(
             call_seq=call_seq,
             probe_id=probe_id,
             file_line=file_line,
@@ -477,16 +543,17 @@ class ProbeRuntime:
         """Log an unhandled target-function exception without grading or masking the crash."""
         if self.is_tripped:
             return
+        caps = self.config.runtime
         payload_json = serialize_call_snapshot(
             inputs_data,
             redactor=self.redactor,
             exception=exception,
-            max_depth=self.config.runtime.max_depth,
-            max_items=self.config.runtime.max_items,
-            max_str_bytes=self.config.runtime.max_str_bytes,
+            max_depth=caps.max_depth,
+            max_items=caps.max_items,
+            max_str_bytes=caps.max_str_bytes,
         )
-        summary = self.redactor.scrub_text(f"{type(exception).__name__}: {exception}")
-        clean_tb = self.redactor.scrub_text(exc_traceback.strip())
+        summary = _scrub_and_truncate(f"{type(exception).__name__}: {exception}", self.redactor, caps.max_str_bytes)
+        clean_tb = _scrub_and_truncate(exc_traceback.strip(), self.redactor, max(caps.max_str_bytes, 16384))
         self.store.insert_event(
             run_id=self.run_id,
             call_seq=call_seq,
@@ -516,7 +583,7 @@ class ProbeRuntime:
         checks: tuple[str, ...],
         payload_json: str,
     ) -> GradedEvent:
-        """Execute decision/text model evaluation without mutating DB or halting state."""
+        """Execute decision/text model evaluation without mutating run logs or halting state."""
         t0 = time.perf_counter()
         analysis_text: str | None = None
         scores: list[CheckScore] = []
@@ -558,7 +625,7 @@ class ProbeRuntime:
         except BackendError as exc:
             verdict = "error"
             error_code = "BACKEND_ERROR"
-            analysis_text = self.redactor.scrub_text(str(exc))
+            analysis_text = _scrub_and_truncate(str(exc), self.redactor, self.config.runtime.max_str_bytes)
 
         latency_ms = round((time.perf_counter() - t0) * 1000.0, 3)
         return GradedEvent(
@@ -585,7 +652,8 @@ class ProbeRuntime:
         caller_frame: FrameType | None = None,
         stack_excerpt: str | None = None,
     ) -> None:
-        """Persist a GradedEvent in SQLite and halt on fail or strict_api error."""
+        """Persist a GradedEvent in the JSONL store and halt on fail or strict_api error."""
+        self.ensure_not_tripped()
         final_stack = stack_excerpt
         if graded.verdict in {"fail", "error"} and not final_stack:
             final_stack = _short_stack_excerpt(caller_frame)
@@ -645,7 +713,7 @@ class ProbeRuntime:
         caller_frame: FrameType | None = None,
         stack_excerpt: str | None = None,
     ) -> None:
-        """Run decision/text grading inline for one event, persist to SQLite, and halt on fail."""
+        """Run decision/text grading inline for one event, persist to JSONL, and halt on fail."""
         self.ensure_not_tripped()
         graded = self.grade_event(
             probe_id=probe_id,
@@ -672,15 +740,16 @@ class ProbeRuntime:
         file_line: str,
         summary: str,
         caller_frame: FrameType | None,
-    ) -> None:
+    ) -> bool:
         halt_msg = f"[PROBE HALT] call #{call_seq:03d} {probe_id} ({file_line}): {summary}"
         with self._state_lock:
+            is_closed = self._closed
             first_halt = not self._tripped
             self._tripped = True
             if first_halt:
                 self._halt_reason = halt_msg
 
-        if first_halt:
+        if first_halt and not is_closed:
             self.store.finish_run(
                 self.run_id,
                 status="halted",
@@ -692,6 +761,7 @@ class ProbeRuntime:
         use_pdb = (
             caller_frame is not None
             and threading.current_thread() is threading.main_thread()
+            and "PYTEST_CURRENT_TEST" not in os.environ
             and not is_no_pdb(self.cwd)
             and bool(getattr(sys.stdin, "isatty", lambda: False)())
             and bool(getattr(sys.stdout, "isatty", lambda: False)())
@@ -699,11 +769,11 @@ class ProbeRuntime:
         )
         if use_pdb:
             pdb.Pdb().set_trace(caller_frame)
-            return
+            return True
         raise ProbeHaltError(halt_msg)
 
     def close(self) -> None:
-        """Finalize run status and close model clients and SQLite store on exit."""
+        """Finalize run status and close model clients and store on exit."""
         with self._state_lock:
             if self._closed:
                 return
@@ -715,12 +785,18 @@ class ProbeRuntime:
         if atexit_was_registered:
             atexit.unregister(self.close)
 
-        if not tripped:
-            self.store.finish_run(
-                self.run_id,
-                status="completed",
-                finished_at=utc_now_iso(),
-            )
-        self.decision_backend.close()
-        self.text_backend.close()
-        self.store.close()
+        try:
+            if not tripped:
+                self.store.finish_run(
+                    self.run_id,
+                    status="completed",
+                    finished_at=utc_now_iso(),
+                )
+        finally:
+            try:
+                self.decision_backend.close()
+            finally:
+                try:
+                    self.text_backend.close()
+                finally:
+                    self.store.close()

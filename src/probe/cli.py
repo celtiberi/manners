@@ -4,13 +4,21 @@ from __future__ import annotations
 
 import dataclasses
 import json
+from collections import Counter
 from pathlib import Path
 from typing import Any
 
 import typer
 
 from probe.backends import BackendError
-from probe.check import _load_lockfile, discover_probes, run_probe_check
+from probe.check import (
+    _load_lockfile,
+    _matches_file_or_dir_prefixes,
+    _rel_display_path,
+    _scan_files,
+    compute_effective_combined_hash,
+    run_probe_check,
+)
 from probe.config import load_config
 from probe.store import EventRecord, ProbeStore, RunRecord
 
@@ -187,16 +195,34 @@ def _format_report_md(run: RunRecord, events: list[EventRecord], *, show_all: bo
     return "\n".join(out)
 
 
-def _resolve_cli_scan_paths(paths: list[Path] | None) -> list[Path]:
+def _resolve_cli_scan_paths(
+    paths: list[Path] | None,
+    *,
+    lock_path: Path | None = None,
+    project_root: Path | None = None,
+) -> list[Path]:
     if not paths:
         return []
     cwd = Path.cwd()
+    base_root = (project_root or cwd).resolve()
+    locked: dict[str, Any] | None = None
     resolved_paths: list[Path] = []
     for p in paths:
         resolved = p.resolve() if p.is_absolute() else (cwd / p).resolve()
         if not resolved.exists():
-            typer.echo(f"Path does not exist: {p}", err=True)
-            raise typer.Exit(code=1)
+            allow_deleted = False
+            if lock_path is not None and lock_path.exists():
+                if locked is None:
+                    locked = _load_lockfile(lock_path).get("probes", {})
+                rel = _rel_display_path(resolved, base_root)
+                allow_deleted = any(
+                    isinstance(meta, dict)
+                    and _matches_file_or_dir_prefixes(str(meta.get("file_line", "")), {rel})
+                    for meta in locked.values()
+                )
+            if not allow_deleted:
+                typer.echo(f"Path does not exist: {p}", err=True)
+                raise typer.Exit(code=1)
         resolved_paths.append(resolved)
     return resolved_paths
 
@@ -208,11 +234,15 @@ def check_cmd(
     json_out: bool = typer.Option(False, "--json", help="Emit machine-readable JSON output."),
 ) -> None:
     """Run Gates 1-3 on new or changed probes and update .probes/lock.json."""
-    resolved_paths = _resolve_cli_scan_paths(paths)
     try:
         cfg = load_config()
+        resolved_paths = _resolve_cli_scan_paths(
+            paths,
+            lock_path=cfg.resolve_lock_path(),
+            project_root=cfg.project_root,
+        )
         ok, results = run_probe_check(resolved_paths, force=force, config=cfg)
-    except (BackendError, ValueError) as exc:
+    except (BackendError, ValueError, OSError) as exc:
         typer.echo(f"Error: {exc}", err=True)
         raise typer.Exit(code=1) from exc
 
@@ -246,22 +276,52 @@ def list_cmd(
     json_out: bool = typer.Option(False, "--json", help="Emit JSON output."),
 ) -> None:
     """List statically discovered @probe and probe.here call sites and lock status."""
-    resolved_paths = _resolve_cli_scan_paths(paths)
     try:
         cfg = load_config()
-        discovered = discover_probes(resolved_paths, root=cfg.project_root)
-        lock_data = _load_lockfile(cfg.resolve_lock_path())
-    except (BackendError, ValueError) as exc:
+        resolved_paths = _resolve_cli_scan_paths(paths, project_root=cfg.project_root)
+        _, discovered, parse_errors = _scan_files(resolved_paths, root=cfg.project_root)
+        lock_path = cfg.resolve_lock_path()
+        lock_data = _load_lockfile(lock_path)
+    except (BackendError, ValueError, OSError) as exc:
         typer.echo(f"Error: {exc}", err=True)
         raise typer.Exit(code=1) from exc
+
+    if parse_errors:
+        base_root = cfg.project_root.resolve()
+        for pf, err in sorted(parse_errors.items()):
+            typer.echo(f"Error parsing {_rel_display_path(pf, base_root)}: {err}", err=True)
+        raise typer.Exit(code=1)
+
     locked = lock_data.get("probes", {})
+    fixtures_dir = lock_path.parent / "fixtures"
+    id_counts = Counter(item.probe_id for item in discovered)
 
     rows: list[dict[str, Any]] = []
     for item in discovered:
+        effective_hash, _, fixture_error = compute_effective_combined_hash(
+            item,
+            fixtures_dir=fixtures_dir,
+            pass_threshold=cfg.decision.pass_threshold,
+            domain_context=cfg.domain_context,
+        )
         entry = locked.get(item.probe_id)
-        if not isinstance(entry, dict):
+        watched_ok = item.site != "here" or (
+            isinstance(entry, dict) and entry.get("watched_keys") == list(item.watched_keys)
+        )
+        params_ok = item.site != "decorator" or (
+            isinstance(entry, dict) and entry.get("param_names") == list(item.param_names)
+        )
+        if item.literal_error or id_counts[item.probe_id] > 1 or fixture_error is not None:
+            lock_status = "invalid"
+        elif not isinstance(entry, dict):
             lock_status = "unlocked"
-        elif entry.get("combined_hash") == item.combined_hash:
+        elif (
+            entry.get("combined_hash") == effective_hash
+            and entry.get("site") == item.site
+            and entry.get("kind") == item.probe_type.value
+            and watched_ok
+            and params_ok
+        ):
             lock_status = "locked"
         elif entry.get("checks_hash") == item.checks_hash:
             lock_status = "source_changed"
@@ -303,17 +363,21 @@ def report_cmd(
     fmt: str = typer.Option("text", "--format", help="Output format: text | md | json."),
 ) -> None:
     """Print call-ordered summary of the latest or specified probe run."""
-    cfg = load_config()
-    runs_dir = cfg.resolve_runs_dir()
-    store = _open_existing_store(runs_dir)
     try:
-        run = store.get_run(run_id)
-        if run is None:
-            typer.echo(f"No matching run found in {runs_dir}.", err=True)
-            raise typer.Exit(code=1)
-        events = store.list_events(run.id)
-    finally:
-        store.close()
+        cfg = load_config()
+        runs_dir = cfg.resolve_runs_dir()
+        store = _open_existing_store(runs_dir)
+        try:
+            run, events = store.get_run_with_events(run_id)
+        finally:
+            store.close()
+    except (BackendError, ValueError, OSError) as exc:
+        typer.echo(f"Error: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+
+    if run is None:
+        typer.echo(f"No matching run found in {runs_dir}.", err=True)
+        raise typer.Exit(code=1)
 
     fmt_norm = fmt.strip().lower()
     if fmt_norm == "json":
@@ -343,17 +407,21 @@ def log_cmd(
     if not probe_ids or any(not pat.strip() for pat in probe_ids):
         typer.echo("Probe ID or glob pattern must not be empty.", err=True)
         raise typer.Exit(code=1)
-    cfg = load_config()
-    runs_dir = cfg.resolve_runs_dir()
-    store = _open_existing_store(runs_dir)
     try:
-        run = store.get_run(run_id)
-        if run is None:
-            typer.echo(f"No matching run found in {runs_dir}.", err=True)
-            raise typer.Exit(code=1)
-        events = store.list_events(run.id, probe_patterns=probe_ids)
-    finally:
-        store.close()
+        cfg = load_config()
+        runs_dir = cfg.resolve_runs_dir()
+        store = _open_existing_store(runs_dir)
+        try:
+            run = store.get_run(run_id)
+            if run is None:
+                typer.echo(f"No matching run found in {runs_dir}.", err=True)
+                raise typer.Exit(code=1)
+            events = store.list_events(run.id, probe_patterns=probe_ids)
+        finally:
+            store.close()
+    except (BackendError, ValueError, OSError) as exc:
+        typer.echo(f"Error: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
 
     fmt_norm = fmt.strip().lower()
     if fmt_norm == "json":
@@ -374,9 +442,10 @@ def log_cmd(
             lines.append("No matching events.")
         for ev in events:
             sec = ev.elapsed_ms / 1000.0
+            halt_note = " **(HALT TRIGGER)**" if run.halt_call_seq == ev.call_seq else ""
             lines.append(
                 f"- `#{ev.call_seq:03d}` `+{sec:.3f}s` **`[{ev.verdict.upper()}]`** "
-                f"`{ev.probe_id}` (`{ev.file_line}`)"
+                f"`{ev.probe_id}` (`{ev.file_line}`) `[kind={ev.probe_type}]`{halt_note}"
             )
             if ev.error_code:
                 lines.append(f"  - error: `{ev.error_code}`")
@@ -426,12 +495,16 @@ def runs_cmd(
     json_out: bool = typer.Option(False, "--json", help="Emit JSON output."),
 ) -> None:
     """List recent probe runs with timestamps, verdict counts, and status."""
-    cfg = load_config()
-    store = _open_existing_store(cfg.resolve_runs_dir())
     try:
-        runs = store.list_runs(limit=limit)
-    finally:
-        store.close()
+        cfg = load_config()
+        store = _open_existing_store(cfg.resolve_runs_dir())
+        try:
+            runs = store.list_runs(limit=limit)
+        finally:
+            store.close()
+    except (BackendError, ValueError, OSError) as exc:
+        typer.echo(f"Error: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
 
     if json_out:
         typer.echo(json.dumps({"runs": [dataclasses.asdict(r) for r in runs]}, indent=2, ensure_ascii=False))
@@ -454,10 +527,14 @@ def clean_cmd(
     keep: int = typer.Option(20, "--keep", min=0, help="Number of newest runs to retain."),
 ) -> None:
     """Prune old run logs from .probes/runs."""
-    cfg = load_config()
-    store = _open_existing_store(cfg.resolve_runs_dir(), read_only=False)
     try:
-        deleted = store.clean_runs(keep=keep)
-    finally:
-        store.close()
+        cfg = load_config()
+        store = _open_existing_store(cfg.resolve_runs_dir(), read_only=False)
+        try:
+            deleted = store.clean_runs(keep=keep)
+        finally:
+            store.close()
+    except (BackendError, ValueError, OSError) as exc:
+        typer.echo(f"Error: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
     typer.echo(f"Removed {deleted} old run(s) (kept newest {keep}).")

@@ -3,19 +3,28 @@
 from __future__ import annotations
 
 import asyncio
+import builtins
+import contextlib
 import functools
 import inspect
 import json
 import os
 import threading
 import traceback
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from types import FrameType
 from typing import Any, ParamSpec, TypeVar
 
 import httpx
 
-from probe.config import ProbeConfig, clear_env_cache, is_probes_enabled, load_config
+from probe.config import (
+    _DISABLED_CTX,
+    ProbeConfig,
+    clear_env_cache,
+    is_probes_enabled,
+    load_config,
+    reset_config_locks_after_fork,
+)
 from probe.redact import serialize_call_inputs, serialize_call_snapshot, serialize_here_snapshot
 from probe.runtime import (
     ProbeHaltError,
@@ -29,6 +38,7 @@ from probe.runtime import (
     normalize_probe_type,
 )
 
+F = TypeVar("F")
 P = ParamSpec("P")
 R = TypeVar("R")
 
@@ -74,10 +84,18 @@ def _reset_child_runtime() -> None:
     global _RUNTIME, _RUNTIME_LOCK
     _RUNTIME = None
     _RUNTIME_LOCK = threading.Lock()
+    reset_config_locks_after_fork()
 
 
 if hasattr(os, "register_at_fork"):
     os.register_at_fork(after_in_child=_reset_child_runtime)
+
+
+def _callable_param_names(fn: Callable[..., Any]) -> tuple[str, ...] | None:
+    try:
+        return tuple(inspect.signature(inspect.unwrap(fn)).parameters.keys())
+    except (TypeError, ValueError):
+        return None
 
 
 def _prepare_decorator_call(
@@ -89,12 +107,12 @@ def _prepare_decorator_call(
     probe_id: str | None,
     probe_type: ProbeType,
     caller_frame: FrameType | None,
-) -> tuple[ProbeRuntime, str, str, int, float, str, dict[str, Any]] | None:
+) -> tuple[ProbeRuntime, str, str, int, float, str, dict[str, Any]]:
     """Validate lock & rate limits and snapshot inputs BEFORE calling wrapped `fn`."""
     rt = _get_runtime()
     rt.ensure_not_tripped()
     resolved_id = probe_id or _derive_decorator_id(fn, project_root=rt.cwd)
-    file_line = _decorator_file_line(fn)
+    file_line = _decorator_file_line(fn, project_root=rt.cwd)
     call_seq, elapsed_ms, started_at = rt.next_call_meta()
     caps = rt.config.runtime
     inputs_data = serialize_call_inputs(
@@ -108,7 +126,22 @@ def _prepare_decorator_call(
     )
     entry_payload_json = json.dumps({"inputs": inputs_data}, ensure_ascii=False)
 
-    rt.verify_lock(
+    entered_pdb_lock = rt.verify_lock(
+        probe_id=resolved_id,
+        probe_type=probe_type,
+        checks=checks,
+        call_seq=call_seq,
+        elapsed_ms=elapsed_ms,
+        started_at=started_at,
+        site="decorator",
+        file_line=file_line,
+        payload_json=entry_payload_json,
+        caller_frame=caller_frame,
+        param_names=_callable_param_names(fn),
+    )
+    if entered_pdb_lock or rt.is_tripped:
+        raise ProbeHaltError(rt._halt_reason or "Probe halted before target call")
+    entered_pdb_rate = rt.check_rate_limit(
         probe_id=resolved_id,
         probe_type=probe_type,
         checks=checks,
@@ -120,22 +153,8 @@ def _prepare_decorator_call(
         payload_json=entry_payload_json,
         caller_frame=caller_frame,
     )
-    if rt.is_tripped:
-        return None
-    rt.check_rate_limit(
-        probe_id=resolved_id,
-        probe_type=probe_type,
-        checks=checks,
-        call_seq=call_seq,
-        elapsed_ms=elapsed_ms,
-        started_at=started_at,
-        site="decorator",
-        file_line=file_line,
-        payload_json=entry_payload_json,
-        caller_frame=caller_frame,
-    )
-    if rt.is_tripped:
-        return None
+    if entered_pdb_rate or rt.is_tripped:
+        raise ProbeHaltError(rt._halt_reason or "Probe halted before target call")
     return rt, resolved_id, file_line, call_seq, elapsed_ms, started_at, inputs_data
 
 
@@ -156,7 +175,7 @@ def _wrap_sync_fn(
         del frame
 
         try:
-            prep = _prepare_decorator_call(
+            rt, resolved_id, file_line, call_seq, elapsed_ms, started_at, inputs_data = _prepare_decorator_call(
                 fn,
                 args,
                 kwargs,
@@ -165,9 +184,6 @@ def _wrap_sync_fn(
                 probe_type=probe_type,
                 caller_frame=caller_frame,
             )
-            if prep is None:
-                return None  # type: ignore[return-value]
-            rt, resolved_id, file_line, call_seq, elapsed_ms, started_at, inputs_data = prep
 
             try:
                 result = fn(*args, **kwargs)
@@ -235,7 +251,7 @@ def _wrap_async_fn(
         del frame
 
         try:
-            prep = _prepare_decorator_call(
+            rt, resolved_id, file_line, call_seq, elapsed_ms, started_at, inputs_data = _prepare_decorator_call(
                 fn,
                 args,
                 kwargs,
@@ -246,10 +262,6 @@ def _wrap_async_fn(
             )
         finally:
             del caller_frame
-
-        if prep is None:
-            return None
-        rt, resolved_id, file_line, call_seq, elapsed_ms, started_at, inputs_data = prep
 
         try:
             result = await fn(*args, **kwargs)
@@ -271,6 +283,7 @@ def _wrap_async_fn(
             )
             raise
 
+        rt.ensure_not_tripped()
         caps = rt.config.runtime
         payload_json = serialize_call_snapshot(
             inputs_data,
@@ -320,12 +333,12 @@ class _ProbeAPI:
         *,
         id: str | None = None,
         kind: ProbeType | str = ProbeType.decision,
-    ) -> Callable[[Any], Any]:
+    ) -> Callable[[F], F]:
         norm_checks = normalize_checks(checks)
         norm_kind = normalize_probe_type(kind)
 
-        def decorator(fn: Any) -> Any:
-            desc_type: type[classmethod[Any, Any, Any]] | type[staticmethod[Any, Any]] | None = None
+        def decorator(fn: F) -> F:
+            desc_type: builtins.type[classmethod[Any, Any, Any]] | builtins.type[staticmethod[Any, Any]] | None = None
             target: Any = fn
             if isinstance(fn, classmethod):
                 desc_type = classmethod
@@ -334,16 +347,20 @@ class _ProbeAPI:
                 desc_type = staticmethod
                 target = fn.__func__
 
-            if inspect.isgeneratorfunction(target) or inspect.isasyncgenfunction(target):
+            if isinstance(target, builtins.type):
+                raise TypeError("@probe can only decorate functions or methods, not classes")
+
+            unwrapped = inspect.unwrap(target)
+            if inspect.isgeneratorfunction(unwrapped) or inspect.isasyncgenfunction(unwrapped):
                 raise TypeError(
                     "@probe cannot wrap generator functions; use probe.here(...) inside the generator instead"
                 )
 
-            is_async = inspect.iscoroutinefunction(target) or (
+            is_async = inspect.iscoroutinefunction(unwrapped) or (
                 not inspect.isfunction(target)
                 and not inspect.ismethod(target)
                 and callable(target)
-                and inspect.iscoroutinefunction(type(target).__call__)
+                and inspect.iscoroutinefunction(builtins.type(target).__call__)
             )
             if is_async:
                 wrapped: Any = _wrap_async_fn(
@@ -361,7 +378,7 @@ class _ProbeAPI:
                 )
 
             if desc_type is not None:
-                return desc_type(wrapped)
+                return desc_type(wrapped)  # type: ignore[return-value]
             return wrapped
 
         return decorator
@@ -378,6 +395,9 @@ class _ProbeAPI:
         if not is_probes_enabled():
             return
 
+        if not watched_vars:
+            raise ValueError("probe.here requires at least one watched keyword variable")
+
         norm_checks = normalize_checks(checks)
         norm_kind = normalize_probe_type(kind)
 
@@ -390,7 +410,7 @@ class _ProbeAPI:
         del frame
 
         resolved_id = id or _derive_here_id(caller_frame, project_root=rt.cwd)
-        file_line = _here_file_line(caller_frame)
+        file_line = _here_file_line(caller_frame, project_root=rt.cwd)
 
         caps = rt.config.runtime
         payload_json = serialize_here_snapshot(
@@ -401,7 +421,7 @@ class _ProbeAPI:
             max_str_bytes=caps.max_str_bytes,
         )
         try:
-            rt.verify_lock(
+            entered_pdb_lock = rt.verify_lock(
                 probe_id=resolved_id,
                 probe_type=norm_kind,
                 checks=norm_checks,
@@ -414,9 +434,10 @@ class _ProbeAPI:
                 caller_frame=caller_frame,
                 watched_keys=tuple(watched_vars.keys()),
             )
-            if rt.is_tripped:
+            if entered_pdb_lock:
                 return
-            rt.check_rate_limit(
+            rt.ensure_not_tripped()
+            entered_pdb_rate = rt.check_rate_limit(
                 probe_id=resolved_id,
                 probe_type=norm_kind,
                 checks=norm_checks,
@@ -428,8 +449,9 @@ class _ProbeAPI:
                 payload_json=payload_json,
                 caller_frame=caller_frame,
             )
-            if rt.is_tripped:
+            if entered_pdb_rate:
                 return
+            rt.ensure_not_tripped()
             rt.evaluate_event(
                 call_seq=call_seq,
                 elapsed_ms=elapsed_ms,
@@ -444,6 +466,16 @@ class _ProbeAPI:
             )
         finally:
             del caller_frame
+
+    @staticmethod
+    @contextlib.contextmanager
+    def disabled() -> Iterator[None]:
+        """Temporarily suppress @probe and probe.here instrumentation in the current context."""
+        token = _DISABLED_CTX.set(True)
+        try:
+            yield
+        finally:
+            _DISABLED_CTX.reset(token)
 
     @staticmethod
     def reset_for_testing(
@@ -466,11 +498,13 @@ class _ProbeAPI:
 
 probe = _ProbeAPI()
 here = probe.here
+disabled = probe.disabled
 type = ProbeType
 
 __all__ = [
     "ProbeHaltError",
     "ProbeType",
+    "disabled",
     "here",
     "probe",
     "reset_for_testing",
