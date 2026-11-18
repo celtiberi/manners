@@ -22,7 +22,14 @@ from probe.backends import (
     extract_json_object,
     strip_thinking,
 )
-from probe.config import DecisionConfig, ModelEndpointConfig, TextConfig, load_config
+from probe.config import (
+    DecisionConfig,
+    ModelEndpointConfig,
+    TextConfig,
+    _merge_endpoint_config,
+    is_probes_enabled,
+    load_config,
+)
 from probe.prompts import (
     compose_system_prompt,
     format_analyze_snapshot_prompts,
@@ -281,6 +288,73 @@ def test_load_config_isolates_credentials_and_validates_types_and_bounds(
     )
     with pytest.raises(ValueError, match="pass_threshold"):
         load_config(cwd=tmp_path)
+
+    # Rejects literal api_key leak via api_key_env="DUMMY", scheme downgrades, untrusted external endpoints,
+    # outside env_files traversal, unknown keys, and invalid bounds.
+    default_txt = ModelEndpointConfig(
+        provider="openai_compat",
+        url="https://api.deepseek.com/v1",
+        model="deepseek-chat",
+        api_key_env="DEEPSEEK_API_KEY",
+    )
+    merged_scheme = _merge_endpoint_config(
+        default_txt,
+        {"api_key": "sk-personal", "reasoning_effort": "high"},
+        {"url": "http://api.deepseek.com/v1", "api_key_env": "DUMMY"},
+    )
+    assert merged_scheme.api_key == ""
+    assert merged_scheme.reasoning_effort == ""
+    assert merged_scheme.model == ""
+
+    user_cfg = tmp_path / "user.toml"
+    user_cfg.write_text(
+        '[models.text]\nurl = "https://api.openai.com/v1"\nmodel = "gpt-4.1-mini"\napi_key = "sk-user"\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("PROBE_CONFIG", str(user_cfg))
+    (tmp_path / "pyproject.toml").write_text(
+        "[project]\nname = 'cfg-test'\n[tool.probe.models.text]\n"
+        'url = "https://attacker.example/v1"\napi_key_env = "OPENAI_API_KEY"\n',
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="PROBE_TRUST_PROJECT_ENDPOINTS"):
+        load_config(cwd=tmp_path)
+
+    outside_env = tmp_path / "outside.env"
+    outside_env.write_text("SECRET_ENV=outside_secret\n", encoding="utf-8")
+    proj_dir = tmp_path / "repo"
+    proj_dir.mkdir()
+    (proj_dir / "pyproject.toml").write_text(
+        "[project]\nname = 'cfg-inner'\n[tool.probe]\n"
+        'domain_context = "Spanish audio tags allowed."\n'
+        '[tool.probe.redact]\nenv_files = ["../outside.env"]\n',
+        encoding="utf-8",
+    )
+    cfg_inner = load_config(cwd=proj_dir)
+    assert cfg_inner.rate_limit.max_calls == 20
+    assert cfg_inner.domain_context == "Spanish audio tags allowed."
+    ep_trav = ModelEndpointConfig(
+        provider="openai_compat",
+        api_key_env="SECRET_ENV",
+        env_search_dirs=(proj_dir,),
+        env_files=cfg_inner.redact.env_files,
+    )
+    assert ep_trav.resolve_api_key() is None
+
+    (proj_dir / "pyproject.toml").write_text(
+        "[project]\nname = 'cfg-inner'\n[tool.probe.models.text]\nbase_url = 'http://127.0.0.1:11434/v1'\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="Unknown config key"):
+        load_config(cwd=proj_dir)
+
+    # .env stat cache picks up immediate file edits without manual clear_env_cache().
+    monkeypatch.delenv("PROBES", raising=False)
+    env_file = proj_dir / ".env"
+    env_file.write_text("PROBES=0\n", encoding="utf-8")
+    assert is_probes_enabled(proj_dir) is False
+    env_file.write_text("PROBES=1   # updated\n", encoding="utf-8")
+    assert is_probes_enabled(proj_dir) is True
 
 
 def test_stage5_prompt_escaping_validation_and_reasoning_effort(tmp_path: Path, monkeypatch) -> None:
