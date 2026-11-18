@@ -159,7 +159,7 @@ Every probe ends at `[models.decision]` and produces either `pass` or `fail` (pl
 |---|---|---|
 | `pass` | Counted in summary; shown in `--all` and `probe log` | Continues normally |
 | `fail` | Shown in `probe report` with per-check `p` and text analysis | **Halts execution (§3.5)** |
-| `error` | Shown in `probe report` | `PROBE_MISUSE` **halts execution**; backend HTTP errors log `error` unless `strict_api = true` |
+| `error` | Shown in `probe report` | `PROBE_MISUSE`, `PROBE_TRUNCATED`, and (with default `strict_api = true`) `BACKEND_ERROR` **halt execution**; when `strict_api = false`, backend HTTP errors print `[PROBE ERROR]` to `stderr` and log `error` |
 
 ### 3.5 Execution Halt
 
@@ -274,7 +274,7 @@ pass_threshold = 0.50            # Check passes iff p > pass_threshold
 
 [text]
 detail = "standard"              # "concise" | "standard" | "detailed"
-max_tokens = 400
+max_tokens = 1024
 explain_decision_failures = true
 system_prompt = ""               # Optional custom instructions for [models.text]
 
@@ -295,6 +295,7 @@ extra_keys = []                  # Additional argument/dict key names to mask
 [runtime]
 runs_dir = ".probes/runs"
 lock_path = ".probes/lock.json"
+strict_api = true                # Halt on BACKEND_ERROR; set false for stderr warning + non-halting log
 ```
 
 **Environment flags (shell env or `.env`):**

@@ -23,7 +23,7 @@ from typing import Any, ParamSpec, TypeVar
 
 import httpx
 
-from probe.backends import BackendError, CheckScore, DecisionBackend, TextBackend
+from probe.backends import BackendError, CheckScore, DecisionBackend, ModelTruncatedError, TextBackend
 from probe.config import (
     ProbeConfig,
     is_no_pdb,
@@ -620,8 +620,26 @@ class ProbeRuntime:
                         scores=scores,
                         snapshot_json=payload_json,
                     )
-                except BackendError:
-                    analysis_text = None
+                except ModelTruncatedError as exc:
+                    max_tok = self.config.text.max_tokens
+                    if exc.partial_text:
+                        note = (
+                            f"{exc.partial_text} ...[truncated at max_tokens={max_tok}; increase [text].max_tokens]"
+                        )
+                    else:
+                        note = f"[Explanation truncated at max_tokens={max_tok}; increase [text].max_tokens]"
+                    analysis_text = _scrub_and_truncate(note, self.redactor, self.config.runtime.max_str_bytes)
+                except BackendError as exc:
+                    analysis_text = _scrub_and_truncate(
+                        f"[Explanation unavailable: {exc}]",
+                        self.redactor,
+                        self.config.runtime.max_str_bytes,
+                    )
+        except ModelTruncatedError as exc:
+            verdict = "error"
+            error_code = "PROBE_TRUNCATED"
+            detail = f"{exc}: {exc.partial_text}" if exc.partial_text else str(exc)
+            analysis_text = _scrub_and_truncate(detail, self.redactor, self.config.runtime.max_str_bytes)
         except BackendError as exc:
             verdict = "error"
             error_code = "BACKEND_ERROR"
@@ -679,6 +697,7 @@ class ProbeRuntime:
 
         should_halt = (
             graded.verdict == "fail"
+            or graded.error_code == "PROBE_TRUNCATED"
             or (graded.verdict == "error" and self.config.runtime.strict_api)
         )
         if should_halt:
@@ -696,6 +715,13 @@ class ProbeRuntime:
                 file_line=graded.file_line,
                 summary=reason,
                 caller_frame=caller_frame,
+            )
+        elif graded.verdict == "error":
+            err_detail = graded.analysis_text or graded.error_code or "Backend error"
+            print(
+                f"[PROBE ERROR] call #{call_seq:03d} {graded.probe_id} ({graded.file_line}): {err_detail}",
+                file=sys.stderr,
+                flush=True,
             )
 
     def evaluate_event(

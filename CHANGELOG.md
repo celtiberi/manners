@@ -5,6 +5,17 @@ All notable changes to `probe` will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.1] - 2026-11-18
+
+### Changed
+- Raised default `[text].max_tokens` from `400` to `1024` to avoid avoidable response truncation on multi-check or thinking-model turns.
+- Changed default `[runtime].strict_api` from `false` to `true` so `PROBES=1` runs halt on backend/API errors by default rather than letting test suites pass silently with ungraded probes.
+
+### Fixed
+- Added `ModelTruncatedError` (`error_code = "PROBE_TRUNCATED"`) capturing partial model text on `finish_reason == "length"`; runtime `probe.type.text` truncation now always halts execution even when `strict_api = false`.
+- Preserved partial explanation text plus an explicit truncation or unavailability note when `explain_failure` fails or hits `max_tokens` instead of dropping `analysis_text` to `None`.
+- Printed a `[PROBE ERROR]` warning to `stderr` whenever `strict_api = false` and a non-truncation `BACKEND_ERROR` is recorded, eliminating silent error swallowing.
+
 ## [0.2.0] - 2026-11-18
 
 ### Added
