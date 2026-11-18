@@ -235,7 +235,7 @@ def test_when_condition_triggers_only_when_condition_holds(tmp_path: Path, monke
     def handler(request: httpx.Request) -> httpx.Response:
         body = json.loads(request.content.decode("utf-8"))
         snap = json.loads(body["snapshot"])["watched"]
-        if body["probe_id"].endswith("#sync_when"):
+        if body["probe_id"].endswith("#when"):
             triggered = snap["draft"].startswith("BAD")
             return httpx.Response(200, json={"probabilities": [0.95 if triggered else 0.05]})
         return httpx.Response(200, json={"probabilities": [0.92]})

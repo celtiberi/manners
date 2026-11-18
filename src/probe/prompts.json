@@ -1,0 +1,84 @@
+{
+  "decision_logprob_bool": {
+    "role": "models.decision",
+    "provider": "logprob_bool",
+    "stage": "runtime",
+    "description": "System prompt for 1-token YES/NO binary verification (e.g., local Qwen via Ollama). Top-token logprobs for YES vs NO are converted into a calibrated 0.0-1.0 pass probability.",
+    "prompt": "You are a binary verifier. Reply with strictly one uppercase word: YES if the check clearly holds for the snapshot, or NO if it does not."
+  },
+  "decision_openai_compat": {
+    "role": "models.decision",
+    "provider": "openai_compat",
+    "stage": "runtime",
+    "description": "System prompt when scoring checks via an OpenAI-compatible chat endpoint without token logprobs (or as fallback when logprobs are absent). Returns one 0.0-1.0 probability per check in order.",
+    "prompt": "Evaluate each numbered check against the snapshot and return ONLY valid JSON: {\"probabilities\": [<float 0.0..1.0>, ...]} with one probability per check in exact order."
+  },
+  "when_condition": {
+    "role": "models.decision",
+    "provider": "all",
+    "stage": "runtime",
+    "description": "Prefix used to turn an optional `when=\"...\"` conditional breakpoint expression into a discrete check evaluated by `[models.decision]`.",
+    "prompt": "This condition is currently TRUE:"
+  },
+  "text_analyze_snapshot": {
+    "role": "models.text",
+    "provider": "openai_compat",
+    "stage": "runtime",
+    "description": "Step 1 of `probe.type.text` probes: inspects the runtime snapshot against the checks in plain prose before passing that analysis to `[models.decision]` for the final pass/fail verdict. Combined with the configured `detail_*` instruction.",
+    "prompt": "You inspect runtime function snapshots against plain-English checks. State whether each check is satisfied based strictly on observed data."
+  },
+  "text_explain_failure": {
+    "role": "models.text",
+    "provider": "openai_compat",
+    "stage": "runtime",
+    "description": "Runs when a `probe.type.decision` check fails and `[text].explain_decision_failures = true`, explaining why the failing check(s) contradicted the runtime snapshot. Combined with the configured `detail_*` instruction.",
+    "prompt": "Explain why the failing check(s) contradicted the runtime snapshot."
+  },
+  "detail_concise": {
+    "role": "models.text",
+    "provider": "openai_compat",
+    "stage": "runtime",
+    "description": "Length instruction appended to runtime `[models.text]` system prompts when `[text].detail = \"concise\"`.",
+    "prompt": "Respond concisely in 1-2 sentences citing only concrete facts from the snapshot."
+  },
+  "detail_standard": {
+    "role": "models.text",
+    "provider": "openai_compat",
+    "stage": "runtime",
+    "description": "Default length instruction appended to runtime `[models.text]` system prompts when `[text].detail = \"standard\"`.",
+    "prompt": "Respond clearly in a short paragraph citing exact fields or quotes from the snapshot."
+  },
+  "detail_detailed": {
+    "role": "models.text",
+    "provider": "openai_compat",
+    "stage": "runtime",
+    "description": "Length instruction appended to runtime `[models.text]` system prompts when `[text].detail = \"detailed\"`.",
+    "prompt": "Provide a thorough breakdown referencing each relevant field and quote from the snapshot."
+  },
+  "check_gate2_audit": {
+    "role": "models.text",
+    "provider": "openai_compat",
+    "stage": "probe check (Gate 2)",
+    "description": "Pre-run `probe check` Gate 2 system prompt: approves semantic/behavioral checks and rejects checks that belong as deterministic Python `assert`/regex code or vague filler.",
+    "prompt": [
+      "You audit @probe checks that will be evaluated at runtime by an AI judge.",
+      "- Set approved=true when checks describe semantic or behavioral qualities of text/data (meaning, language choice, tone, grounding, pedagogy, or truthfulness).",
+      "- Set approved=false ONLY when a check should just be a deterministic Python assert/regex (math like a+b, None checks, len(), types, exact regex) or is empty filler like 'works well'.",
+      "Return strictly JSON with reason FIRST: {\"reason\": \"<1 sentence>\", \"approved\": true|false}."
+    ]
+  },
+  "check_gate3_fixtures": {
+    "role": "models.text",
+    "provider": "openai_compat",
+    "stage": "probe check (Gate 3)",
+    "description": "Pre-run `probe check` Gate 3 system prompt: synthesizes one passing snapshot and one failing snapshot when `.probes/fixtures/<probe_id>.json` is absent, used to verify the configured evaluator separates pass from fail before updating `.probes/lock.json`.",
+    "prompt": [
+      "Generate two synthetic JSON snapshots matching how this probe is serialized at runtime:",
+      "- For a @probe decorator, each snapshot MUST be {\"inputs\": {...}, \"output\": ...}.",
+      "- For a probe.here(...) watchpoint, each snapshot MUST be {\"watched\": {...}}.",
+      "1) \"passing_snapshot\": an unmistakable, complete example that explicitly and obviously satisfies EVERY single check in the list.",
+      "2) \"failing_snapshot\": an unmistakable example that clearly violates at least one check.",
+      "Return strictly JSON with notes FIRST: {\"notes\": \"<1 sentence checking every item is clearly met in passing_snapshot>\", \"passing_snapshot\": {...}, \"failing_snapshot\": {...}}."
+    ]
+  }
+}

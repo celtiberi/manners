@@ -313,6 +313,8 @@ probe/
 │       ├── __init__.py          # Public API: @probe, probe.here, probe.type.{decision,text}
 │       ├── config.py            # ~/.config/probe/config.toml + pyproject.toml + env/.env resolution
 │       ├── redact.py            # .env / os.environ secret collection + request-key masking
+│       ├── prompts.json         # Internal prompts with role/stage/purpose metadata
+│       ├── prompts.py           # Prompt catalog loader + model message builders
 │       ├── backends.py          # Decision providers + Text LLM client
 │       ├── runtime.py           # call_seq tracker, rate guard, inline grading, halt switch
 │       ├── store.py             # SQLite WAL store

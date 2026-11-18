@@ -10,6 +10,7 @@ import httpx
 
 from probe.backends import CheckScore, DecisionBackend, TextBackend, extract_json_object, strip_thinking
 from probe.config import DecisionConfig, ModelEndpointConfig, TextConfig, load_config
+from probe.prompts import compose_system_prompt, format_when_check, get_prompt, load_prompt_catalog
 
 
 def test_strip_thinking_and_extract_json() -> None:
@@ -247,3 +248,21 @@ def test_text_backend_analysis_and_failure_explanation() -> None:
     assert analysis == "Tutor leaked 'Quiero un café' directly."
     assert "Focus on Spanish pedagogy." in seen_system_prompts[0]
     assert "thorough breakdown" in seen_system_prompts[0]
+
+
+def test_prompts_json_catalog_and_formatting() -> None:
+    catalog = load_prompt_catalog()
+    assert len(catalog) == 10
+    for key, entry in catalog.items():
+        assert entry.role, f"Missing role for {key}"
+        assert entry.provider, f"Missing provider for {key}"
+        assert entry.stage, f"Missing stage for {key}"
+        assert entry.description, f"Missing description for {key}"
+        assert entry.prompt, f"Empty prompt for {key}"
+        assert get_prompt(key) == entry.prompt
+
+    assert (
+        format_when_check("when draft cites external facts")
+        == "This condition is currently TRUE: draft cites external facts"
+    )
+    assert compose_system_prompt("Base.", "Custom.") == "Custom.\n\nBase."

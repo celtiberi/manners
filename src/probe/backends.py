@@ -13,16 +13,22 @@ from typing import Any
 import httpx
 
 from probe.config import DecisionConfig, ModelEndpointConfig, TextConfig
+from probe.prompts import (
+    compose_system_prompt,
+    format_analyze_snapshot_prompts,
+    format_explain_failure_prompts,
+    format_gate2_audit_prompts,
+    format_gate3_fixtures_prompts,
+    format_logprob_eval_user,
+    format_openai_decision_user,
+    format_typesafe_state,
+    format_when_check,
+    get_prompt,
+)
 
 _THINK_BLOCK_RE = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
 _UNCLOSED_THINK_RE = re.compile(r"<think>.*\Z", re.DOTALL | re.IGNORECASE)
 _CODE_FENCE_RE = re.compile(r"```(?:json)?\s*(.*?)\s*```", re.DOTALL | re.IGNORECASE)
-
-_DETAIL_GUIDANCE: dict[str, str] = {
-    "concise": "Respond concisely in 1-2 sentences citing only concrete facts from the snapshot.",
-    "standard": "Respond clearly in a short paragraph citing exact fields or quotes from the snapshot.",
-    "detailed": "Provide a thorough breakdown referencing each relevant field and quote from the snapshot.",
-}
 
 _DEFAULT_TYPESAFE_URL = "https://api.typesafe.ai/v1/systemone"
 _DEFAULT_TYPESAFE_MODEL = "jev-latest"
@@ -253,13 +259,10 @@ class DecisionBackend:
         snapshot_json: str,
         analysis: str = "",
     ) -> bool:
-        """Evaluate a `sync="when <condition>"` expression against the current snapshot."""
-        cond = condition.strip()
-        if cond.lower().startswith("when "):
-            cond = cond[5:].strip()
-        prompt_check = f"This condition is currently TRUE: {cond}"
+        """Evaluate a when="<condition>" expression against the current snapshot."""
+        prompt_check = format_when_check(condition)
         scores = self.evaluate_checks(
-            probe_id=f"{probe_id}#sync_when",
+            probe_id=f"{probe_id}#when",
             checks=[prompt_check],
             snapshot_json=snapshot_json,
             analysis=analysis,
@@ -290,11 +293,7 @@ class DecisionBackend:
         raw_model = (self.endpoint.model or "").strip()
         eff_model = _DEFAULT_TYPESAFE_MODEL if raw_model in _LEGACY_JEV_MODELS else raw_model
 
-        state_parts = [f"Probe: {probe_id}"]
-        if analysis:
-            state_parts.append(f"Analysis:\n{analysis}")
-        state_parts.append(f"Runtime Snapshot (JSON):\n{snapshot_json}")
-        state_str = "\n\n".join(state_parts)
+        state_str = format_typesafe_state(probe_id, snapshot_json, analysis)
 
         questions = {
             f"q{i}": {"type": "noul", "instructions": check}
@@ -349,19 +348,17 @@ class DecisionBackend:
         analysis: str,
     ) -> list[float]:
         url = _chat_completions_url(self.endpoint.url)
+        system_prompt = get_prompt("decision_logprob_bool")
         probs: list[float] = []
         for idx, check in enumerate(checks):
             messages = [
                 {
                     "role": "system",
-                    "content": (
-                        "You are a binary verifier. Reply with strictly one uppercase word: YES if the check "
-                        "clearly holds for the snapshot, or NO if it does not."
-                    ),
+                    "content": system_prompt,
                 },
                 {
                     "role": "user",
-                    "content": _format_eval_context(probe_id, check, snapshot_json, analysis),
+                    "content": format_logprob_eval_user(probe_id, check, snapshot_json, analysis),
                 },
             ]
             req_payload: dict[str, Any] = {
@@ -391,24 +388,14 @@ class DecisionBackend:
         analysis: str,
     ) -> list[float]:
         url = _chat_completions_url(self.endpoint.url)
-        numbered = "\n".join(f"{i}: {chk}" for i, chk in enumerate(checks))
-        analysis_block = f"\nPrior analysis:\n{analysis}\n" if analysis else ""
         messages = [
             {
                 "role": "system",
-                "content": (
-                    "Evaluate each numbered check against the snapshot and return ONLY valid JSON: "
-                    '{"probabilities": [<float 0.0..1.0>, ...]} with one probability per check in exact order.'
-                ),
+                "content": get_prompt("decision_openai_compat"),
             },
             {
                 "role": "user",
-                "content": (
-                    f"Probe: {probe_id}\n"
-                    f"Snapshot:\n{snapshot_json}\n"
-                    f"{analysis_block}\n"
-                    f"Checks:\n{numbered}"
-                ),
+                "content": format_openai_decision_user(probe_id, checks, snapshot_json, analysis),
             },
         ]
         chat_payload: dict[str, Any] = {
@@ -505,11 +492,7 @@ class TextBackend:
 
     def _chat(self, system: str, user: str, *, max_tokens: int | None = None) -> str:
         url = _chat_completions_url(self.endpoint.url)
-        full_system = (
-            f"{self.text_cfg.system_prompt.strip()}\n\n{system}".strip()
-            if self.text_cfg.system_prompt.strip()
-            else system
-        )
+        full_system = compose_system_prompt(system, self.text_cfg.system_prompt)
         payload = {
             "model": self.endpoint.model,
             "messages": [
@@ -529,17 +512,14 @@ class TextBackend:
         )
         return strip_thinking(_extract_chat_content(data))
 
-    def _detail_instruction(self) -> str:
-        return _DETAIL_GUIDANCE.get(self.text_cfg.detail.strip().lower(), _DETAIL_GUIDANCE["standard"])
-
     def analyze_snapshot(self, *, probe_id: str, checks: Sequence[str], snapshot_json: str) -> str:
         """Produce factual prose analysis for probe.type.text before decision scoring."""
-        numbered = "\n".join(f"- {c}" for c in checks)
-        system = (
-            "You inspect runtime function snapshots against plain-English checks. "
-            f"State whether each check is satisfied based strictly on observed data. {self._detail_instruction()}"
+        system, user = format_analyze_snapshot_prompts(
+            probe_id=probe_id,
+            checks=checks,
+            snapshot_json=snapshot_json,
+            detail=self.text_cfg.detail,
         )
-        user = f"Probe: {probe_id}\nChecks:\n{numbered}\n\nSnapshot:\n{snapshot_json}"
         return self._chat(system, user)
 
     def explain_failure(
@@ -550,15 +530,16 @@ class TextBackend:
         snapshot_json: str,
     ) -> str:
         """Write failure diagnostic citing failed check(s) and snapshot evidence."""
-        score_lines = "\n".join(
+        score_lines = [
             f"- [{'PASS' if s.passed else 'FAIL'} p={s.probability:.2f}] {s.check}"
             for s in scores
+        ]
+        system, user = format_explain_failure_prompts(
+            probe_id=probe_id,
+            score_lines=score_lines,
+            snapshot_json=snapshot_json,
+            detail=self.text_cfg.detail,
         )
-        system = (
-            "Explain why the failing check(s) contradicted the runtime snapshot. "
-            f"{self._detail_instruction()}"
-        )
-        user = f"Probe: {probe_id}\nCheck results:\n{score_lines}\n\nSnapshot:\n{snapshot_json}"
         return self._chat(system, user)
 
     def audit_checks_gate2(
@@ -570,20 +551,11 @@ class TextBackend:
         source_excerpt: str,
     ) -> tuple[bool, str]:
         """Gate 2 audit: reject checks better written as Python asserts/regexes or unfalsifiable prose."""
-        numbered = "\n".join(f"- {c}" for c in checks)
-        system = (
-            "You audit @probe checks that will be evaluated at runtime by an AI judge.\n"
-            "- Set approved=true when checks describe semantic or behavioral qualities of text/data "
-            "(meaning, language choice, tone, grounding, pedagogy, or truthfulness).\n"
-            "- Set approved=false ONLY when a check should just be a deterministic Python assert/regex "
-            "(math like a+b, None checks, len(), types, exact regex) or is empty filler like 'works well'.\n"
-            'Return strictly JSON with reason FIRST: {"reason": "<1 sentence>", "approved": true|false}.'
-        )
-        user = (
-            f"Probe: {probe_id}\n"
-            f"Signature: {signature}\n"
-            f"Checks:\n{numbered}\n\n"
-            f"Source excerpt:\n{source_excerpt}"
+        system, user = format_gate2_audit_prompts(
+            probe_id=probe_id,
+            checks=checks,
+            signature=signature,
+            source_excerpt=source_excerpt,
         )
         content = self._chat(system, user, max_tokens=max(250, self.text_cfg.max_tokens))
         parsed = extract_json_object(content)
@@ -600,23 +572,11 @@ class TextBackend:
         source_excerpt: str,
     ) -> tuple[str, str]:
         """Gate 3 synthesis: create one valid passing snapshot and one clearly broken failing snapshot."""
-        numbered = "\n".join(f"- {c}" for c in checks)
-        system = (
-            "Generate two synthetic JSON snapshots matching how this probe is serialized at runtime:\n"
-            '- For a @probe decorator, each snapshot MUST be {"inputs": {...}, "output": ...}.\n'
-            '- For a probe.here(...) watchpoint, each snapshot MUST be {"watched": {...}}.\n'
-            '1) "passing_snapshot": an unmistakable, complete example that explicitly and obviously '
-            "satisfies EVERY single check in the list.\n"
-            '2) "failing_snapshot": an unmistakable example that clearly violates at least one check.\n'
-            'Return strictly JSON with notes FIRST: '
-            '{"notes": "<1 sentence checking every item is clearly met in passing_snapshot>", '
-            '"passing_snapshot": {...}, "failing_snapshot": {...}}.'
-        )
-        user = (
-            f"Probe: {probe_id}\n"
-            f"Signature: {signature}\n"
-            f"Checks:\n{numbered}\n\n"
-            f"Source excerpt:\n{source_excerpt}"
+        system, user = format_gate3_fixtures_prompts(
+            probe_id=probe_id,
+            checks=checks,
+            signature=signature,
+            source_excerpt=source_excerpt,
         )
         content = self._chat(system, user, max_tokens=max(600, self.text_cfg.max_tokens))
         parsed = extract_json_object(content)
@@ -627,14 +587,6 @@ class TextBackend:
                 f"Gate 3 synthesis missing passing_snapshot or failing_snapshot for {probe_id}"
             )
         return json.dumps(passing, ensure_ascii=False), json.dumps(failing, ensure_ascii=False)
-
-
-def _format_eval_context(probe_id: str, check: str, snapshot_json: str, analysis: str) -> str:
-    parts = [f"Probe: {probe_id}", f"Snapshot:\n{snapshot_json}"]
-    if analysis:
-        parts.append(f"Analysis:\n{analysis}")
-    parts.append(f"Check: {check}")
-    return "\n\n".join(parts)
 
 
 def _extract_chat_content(data: dict[str, Any]) -> str:
