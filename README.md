@@ -15,13 +15,14 @@ Normally you only spot those by manually clicking through your app or reading th
 
 ## How It Works
 
-- **Off by default (`PROBES=0` or unset):** `@probe` returns the original function unwrapped and `probe.here` does nothing. Probes can stay in application code with zero latency or API cost in production.
-- **On when testing or debugging (`PROBES=1` in shell or `.env`):** Start your web server, CLI script, or `pytest` run with `PROBES=1`. When a probed function or `probe.here` line runs, `probe` snapshots inputs, return values, and watched variables, scrubs secrets collected from `.env*` and `os.environ` (plus `password`, `authorization`, and `cookie` fields), and evaluates the checks inline.
-- **Stops on the live frame:** If any check fails (or an optional `when="..."` breakpoint condition holds), `probe` logs the snapshot and per-check scores to `.probes/probes.db` and stops before the function returns—opening `pdb` on that caller frame in an interactive terminal, or raising `ProbeHaltError` in tests and scripts.
-- **Guardrails against misuse and noisy grading:**
-  - **`probe check`:** Run on new or edited probes (approved hashes are saved in `.probes/lock.json`). It rejects checks that belong in regular Python `assert`s or regexes, and dry-runs each probe against a passing and failing sample before running live code.
-  - **Loop protection (`PROBE_MISUSE`):** Each probe is guarded by a sliding-window limit (`5` calls per `10.0` seconds by default) so accidentally calling a probe inside a tight loop halts the process before wasting API calls.
-  - **Two configurable model roles (`decision` + `text`):** `probe.type.decision` (default) uses a decision model (such as TypeSafe Jev or a local endpoint) that scores each check in `0.0–1.0` -> `pass` or `fail`. `probe.type.text` runs a chat LLM first when open-ended analysis is helpful, then sends that analysis to the decision model for the final `pass` or `fail`.
+When probes are enabled during local development or testing, `probe` captures the inputs and outputs at each `@probe` or `probe.here` call (redacting secrets first) and checks whether the runtime behavior matches your plain-English rules—halting execution right there if a check fails, and staying completely inactive when turned off in production.
+
+Instead of asking a chat LLM to output `"pass"` or `"fail"` directly—which tends to hedge and drift—`probe` splits the work across two configurable model roles:
+
+- **Decision model (`probe.type.decision`, default):** Evaluates discrete yes/no checks directly and returns a calibrated probability per check (`pass` or `fail`). Fast and deterministic enough for most checks.
+- **Text LLM + Decision model (`probe.type.text`):** When a check requires open-ended reasoning first (such as comparing a generated answer against source documents), a text LLM analyzes the snapshot and hands its findings to the decision model for the final `pass` or `fail` verdict.
+
+Both roles are configured once in `config.toml` and can point at cloud APIs or local models without changing your code. Before probes run, `probe check` validates your check prompts against synthetic pass/fail cases and rejects checks that belong as normal Python `assert`s.
 
 ## Install
 
