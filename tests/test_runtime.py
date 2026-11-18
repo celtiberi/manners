@@ -6,6 +6,7 @@ import asyncio
 import concurrent.futures
 import json
 import pdb
+import threading
 from pathlib import Path
 
 import httpx
@@ -830,3 +831,124 @@ def test_v03_base_exception_thread_disabled_and_soak_mode(
         probe.flush_for_testing()
         reset_for_testing()
     assert runner.invoke(app, ["report", "--check"]).exit_code == 0
+
+
+def test_v05_soak_mode_async_worker_pool_and_flush(tmp_path: Path, monkeypatch) -> None:
+    assert RuntimeConfig().max_workers == 4
+    monkeypatch.setenv("PROBES", "1")
+    monkeypatch.setenv("PROBE_NO_HALT", "1")
+    monkeypatch.setenv("PROBE_NO_PDB", "1")
+
+    # Barrier(4) proves all 4 sequential single-thread calls dispatch concurrently on the soak pool.
+    barrier = threading.Barrier(4, timeout=3.0)
+
+    def barrier_handler(request: httpx.Request) -> httpx.Response:
+        barrier.wait()
+        body = json.loads(request.content.decode("utf-8"))
+        ok = "PASS" in body["snapshot"]
+        return httpx.Response(200, json={"probabilities": [0.95 if ok else 0.10]})
+
+    cfg = _make_config(tmp_path)
+    cfg.runtime.max_workers = 4
+    cfg.runtime.runs_dir = str(tmp_path / ".probes" / "runs_soak_async")
+    reset_for_testing(config=cfg, transport=httpx.MockTransport(barrier_handler))
+
+    @probe("Reply marks PASS", id="soak.dec")
+    def step_fn(tag: str) -> str:
+        return tag
+
+    @probe("Async reply marks PASS", id="soak.async_dec")
+    async def async_step(tag: str) -> str:
+        return tag
+
+    try:
+        assert step_fn("PASS 1") == "PASS 1"
+        probe.here("Inline PASS", id="soak.h1", val="FAIL 2")
+        asyncio.run(async_step("PASS 3"))
+        probe.here("Inline PASS", id="soak.h2", val="PASS 4")
+        probe.flush()
+
+        store_mid = ProbeStore(cfg.resolve_runs_dir(), create=False)
+        try:
+            _, mid_events = store_mid.get_run_with_events()
+            assert [e.call_seq for e in mid_events] == [1, 2, 3, 4]
+            assert [e.verdict for e in mid_events] == ["pass", "fail", "pass", "pass"]
+        finally:
+            store_mid.close()
+    finally:
+        rt = probe.flush_for_testing()
+        reset_for_testing()
+
+    assert rt is not None
+    store = ProbeStore(cfg.resolve_runs_dir(), create=False)
+    try:
+        run, events = store.get_run_with_events(rt.run_id)
+    finally:
+        store.close()
+    assert run is not None
+    assert run.status == "failed"
+    assert [e.call_seq for e in events] == [1, 2, 3, 4]
+
+
+def test_v05_daemon_thread_halt_capture_and_threadpool_future(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("PROBES", "1")
+    monkeypatch.setenv("PROBE_NO_PDB", "1")
+    monkeypatch.delenv("PROBE_NO_HALT", raising=False)
+
+    in_http = threading.Event()
+    release_http = threading.Event()
+
+    def fail_handler(request: httpx.Request) -> httpx.Response:
+        url = str(request.url)
+        if url.endswith("/chat/completions"):
+            return httpx.Response(200, json={"choices": [{"message": {"content": "Assigned proficiency grade."}}]})
+        in_http.set()
+        release_http.wait(timeout=2.0)
+        return httpx.Response(200, json={"probabilities": [0.04]})
+
+    # 3a. Fire-and-forget daemon Thread failure surfaces on main via probe.flush().
+    cfg = _make_config(tmp_path)
+    cfg.runtime.runs_dir = str(tmp_path / ".probes" / "runs_daemon")
+    reset_for_testing(config=cfg, transport=httpx.MockTransport(fail_handler))
+
+    def bg_summary() -> None:
+        probe.here("No proficiency grades in summary", id="tutor.history_summary", summary="Fluent speaker.")
+
+    t = threading.Thread(target=bg_summary, daemon=True)
+    t.start()
+    try:
+        assert in_http.wait(timeout=2.0)
+        release_http.set()
+        with pytest.raises(ProbeHaltError, match="tutor.history_summary"):
+            probe.flush()
+    finally:
+        t.join(timeout=1.0)
+        rt = probe.flush_for_testing()
+        reset_for_testing()
+
+    assert rt is not None
+    store = ProbeStore(cfg.resolve_runs_dir(), create=False)
+    try:
+        run, events = store.get_run_with_events(rt.run_id)
+    finally:
+        store.close()
+    assert run is not None
+    assert run.status == "halted"
+    assert [e.verdict for e in events] == ["fail"]
+
+    # 3b. ThreadPoolExecutor Future delivers ProbeHaltError cleanly and flush() does not double-raise.
+    in_http.clear()
+    release_http.set()
+    cfg_pool = _make_config(tmp_path)
+    cfg_pool.runtime.runs_dir = str(tmp_path / ".probes" / "runs_pool")
+    reset_for_testing(config=cfg_pool, transport=httpx.MockTransport(fail_handler))
+
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            fut = pool.submit(bg_summary)
+            with pytest.raises(ProbeHaltError, match="tutor.history_summary"):
+                fut.result()
+        probe.flush()
+    finally:
+        probe.flush_for_testing()
+        reset_for_testing()

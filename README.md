@@ -29,15 +29,15 @@ Both roles are configured once in `config.toml` and can point at cloud APIs or l
 From a GitHub Release wheel (recommended in containers/CI — no `git` binary required):
 
 ```sh
-uv tool install https://github.com/celtiberi/probe/releases/download/v0.4.0/probe-0.4.0-py3-none-any.whl
+uv tool install https://github.com/celtiberi/probe/releases/download/v0.5.0/probe-0.5.0-py3-none-any.whl
 ```
 
 In a project virtual environment (wheel or git):
 
 ```sh
-uv add https://github.com/celtiberi/probe/releases/download/v0.4.0/probe-0.4.0-py3-none-any.whl
+uv add https://github.com/celtiberi/probe/releases/download/v0.5.0/probe-0.5.0-py3-none-any.whl
 # or via pip:
-# pip install https://github.com/celtiberi/probe/releases/download/v0.4.0/probe-0.4.0-py3-none-any.whl
+# pip install https://github.com/celtiberi/probe/releases/download/v0.5.0/probe-0.5.0-py3-none-any.whl
 # or from git main:
 # uv add git+https://github.com/celtiberi/probe.git
 ```
@@ -95,9 +95,13 @@ PROBES=1 PROBE_NO_PDB=1 pytest
 
 To skip `.probes/lock.json` enforcement during quick local iteration, set `PROBE_SKIP_LOCK=1`. Setting `PROBES=""` or `PROBES=0` in the shell overrides `PROBES=1` in `.env`.
 
-To run multi-turn simulations or soak tests without stopping on the first failure, set `PROBE_NO_HALT=1` (or `[runtime].halt_on_fail = false`) and run `probe report --check` at the end to inspect failures and exit `1` if any probe failed.
+To run multi-turn simulations or soak tests without stopping on the first failure, set `PROBE_NO_HALT=1` (or `[runtime].halt_on_fail = false`) and run `probe report --check` at the end to inspect failures and exit `1` if any probe failed. In non-halting soak mode, model grading dispatches onto a bounded background pool (`[runtime].max_workers = 4`) after capturing `call_seq` and snapshots synchronously; call `probe.flush()` (or let process exit / pytest teardown drain automatically) to flush pending evaluations.
 
-To temporarily suppress probes inside mocked unit tests (including code using worker threads) when `PROBES=1` is set globally, use `with probe.disabled():` (or `from probe import disabled`).
+To control probes inside `pytest` when `PROBES=1` is set in `.env`:
+- Add `--no-probes` to `[tool.pytest.ini_options] addopts` so mocked unit tests skip probes automatically without extra `conftest.py` boilerplate.
+- Mark probe-backed integration tests with `@pytest.mark.probes` (or pass `--probes` on the CLI) to opt them back in; mark exclusions with `@pytest.mark.no_probes`.
+- The built-in `pytest` plugin also drains background/daemon-thread evaluations after each test item so uncaught `ProbeHaltError`s from background threads fail the test cleanly.
+- In plain Python code or fixtures, use stackable `with probe.disabled():` and `with probe.enabled():` (`from probe import disabled, enabled, flush`).
 
 4. Inspect results in call-entry order (works while a server is running too, via per-run JSONL logs):
 
@@ -112,7 +116,7 @@ probe runs
 
 - **Keep `probe.type.decision` checks short and atomic:** A single-pass decision model evaluates each check in parallel without multi-step reasoning. Prefer several short single-fact statements (`max_checks = 12` default) naming `output` or specific watched variables directly over one long compound sentence joining multiple `and`/`without`/`unless` clauses.
 - **Use `kind=probe.type.text` for comparison or reasoning:** When a check requires comparing `output` against multi-turn `inputs` or retrieved context first, use `kind=probe.type.text` so `[models.text]` extracts factual evidence before `[models.decision]` scores the rule.
-- **Add regression fixtures in `.probes/fixtures/<probe_id>.json`:** Place optional JSON files with either a single `"pass"` / `"fail"` snapshot object or lists of historical regression snapshots (`"pass": [{...}, ...]`, `"fail": [{...}, ...]`). `probe check` backtests every listed pass and fail case whenever checks or fixtures change.
+- **Add regression fixtures in `.probes/fixtures/<probe_id>.json`:** Place optional JSON files with either a single `"pass"` / `"fail"` snapshot object or lists of historical regression snapshots (`"pass": [{...}, ...]`, `"fail": [{...}, ...]`). `probe check` backtests every listed pass and fail case whenever checks or fixtures change. Run `probe fixture <probe_id>` to promote recorded pass/fail snapshots out of `.probes/runs/*.jsonl` (or `probe fixture <probe_id> --init` to scaffold missing entries from the probe's AST signature/watched keys).
 
 ## CLI
 
@@ -120,6 +124,7 @@ probe runs
 |---|---|
 | `probe check [paths...]` | Audit checks (Gate 1–2), run pass/fail calibration (Gate 3), and update `.probes/lock.json`. |
 | `probe list [paths...]` | List discovered `@probe` and `probe.here` sites with lock status. |
+| `probe fixture <id> [--run ID] [--init]` | Promote recorded pass/fail run snapshots into `.probes/fixtures/<id>.json` or scaffold from AST. |
 | `probe report [--run ID] [--all] [--check]` | Show call-ordered summary of failures/errors (or all events with `--all`); exit `1` on failures with `--check`. |
 | `probe log <probe_id>... [--payload]` | Interleave chronological events across one or more probe IDs or globs. |
 | `probe runs` | List recorded runs and pass/fail/error counts. |
@@ -179,6 +184,7 @@ runs_dir = ".probes/runs"
 lock_path = ".probes/lock.json"
 strict_api = true
 halt_on_fail = true
+max_workers = 4
 ```
 
 ## License

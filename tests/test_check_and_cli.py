@@ -1387,3 +1387,202 @@ def test_multi_case_manual_fixtures_backtest_and_hash_invalidation(tmp_path: Pat
     )
     with pytest.raises(BackendError, match="at least one snapshot"):
         _load_manual_fixture(fixtures_dir, "tutor.multi")
+
+
+def test_v05_here_rich_excerpt_and_probe_fixture_cli(tmp_path: Path, monkeypatch) -> None:
+    (tmp_path / "pyproject.toml").write_text(
+        textwrap.dedent(
+            """
+            [project]
+            name = "fixture-app"
+            version = "0.1.0"
+
+            [tool.probe.models.decision]
+            provider = "http_decision"
+            url = "http://mock.local/decision"
+            model = "jev"
+
+            [tool.probe.models.text]
+            provider = "openai_compat"
+            url = "http://mock.local/v1"
+            model = "qwen3.5:9b"
+            """
+        ).strip()
+        + "\n",
+        encoding="utf-8",
+    )
+    app_py = tmp_path / "teach.py"
+    app_py.write_text(
+        textwrap.dedent(
+            """
+            from probe import probe
+
+            def build_teach_turn(user_msg: str) -> str:
+                \"\"\"Assemble a beginner lesson with coupled warmup flags.\"\"\"
+                also_introduce = "gracias"
+                warmup_recall_only = True
+                target_phrase = "hola"
+                mode = "teach"
+                recast_text = ""
+                hint = "greet"
+                # padding setup lines to exceed 6-line old window
+                step1 = user_msg.strip()
+                step2 = step1.lower()
+                step3 = f"{target_phrase} {step2}"
+                reply = f"GOOD {step3}"
+                probe.here(
+                    "Reply aligns with target_phrase and coupled flags",
+                    id="tutor.teach_turn",
+                    kind=probe.type.text,
+                    also_introduce=also_introduce,
+                    warmup_recall_only=warmup_recall_only,
+                    target_phrase=target_phrase,
+                    mode=mode,
+                    recast_text=recast_text,
+                    hint=hint,
+                    reply=reply,
+                )
+                return reply
+            """
+        ).strip()
+        + "\n",
+        encoding="utf-8",
+    )
+
+    items = discover_probes([app_py], root=tmp_path)
+    assert len(items) == 1
+    item = items[0]
+    assert "Assemble a beginner lesson with coupled warmup flags." in item.source_excerpt
+    assert 'also_introduce = "gracias"' in item.source_excerpt
+    assert "warmup_recall_only = True" in item.source_excerpt
+    orig_source_hash = item.source_hash
+
+    # Unrelated body refactor preserves probe.here source_hash.
+    app_py.write_text(
+        app_py.read_text(encoding="utf-8").replace(
+            "# padding setup lines to exceed 6-line old window",
+            "# logging trace added here",
+        ),
+        encoding="utf-8",
+    )
+    items_after = discover_probes([app_py], root=tmp_path)
+    assert items_after[0].source_hash == orig_source_hash
+
+    monkeypatch.chdir(tmp_path)
+    runner = CliRunner()
+
+    # --init scaffolds a valid starter fixture matching all 7 watched keys.
+    init_res = runner.invoke(app, ["fixture", "tutor.teach_turn", "--init", "--json"])
+    assert init_res.exit_code == 0, init_res.stderr
+    init_data = json.loads(init_res.stdout)
+    assert init_data["pass_count"] == 1
+    assert init_data["fail_count"] == 1
+    fixture_fp = tmp_path / ".probes" / "fixtures" / "tutor.teach_turn.json"
+    assert fixture_fp.is_file()
+    fixture_json = json.loads(fixture_fp.read_text(encoding="utf-8"))
+    assert set(fixture_json["pass"][0]["watched"].keys()) == set(item.watched_keys)
+
+    # Clear fixture and verify `probe fixture` promotes recorded pass + fail snapshots across runs.
+    fixture_fp.unlink()
+    runs_dir = tmp_path / ".probes" / "runs"
+    store = ProbeStore(runs_dir, create=True)
+    try:
+        r_fail = "01FIXTURE00000000000000001"
+        store.create_run(
+            r_fail,
+            started_at="2026-11-18T10:00:00.000000Z",
+            cmd="pytest",
+            pid=101,
+            decision_model="http_decision:jev",
+            text_model="openai_compat:qwen3.5:9b",
+        )
+        store.insert_event(
+            run_id=r_fail,
+            call_seq=1,
+            elapsed_ms=10.0,
+            started_at="2026-11-18T10:00:00.010000Z",
+            probe_id="tutor.teach_turn",
+            site="here",
+            probe_type="text",
+            file_line="teach.py:16",
+            checks=item.checks,
+            payload_json=json.dumps({"watched": {k: "BAD" for k in item.watched_keys}}),
+            check_scores=(CheckScore(item.checks[0], 0.08, False),),
+            verdict="fail",
+        )
+        store.finish_run(r_fail, status="halted", finished_at="2026-11-18T10:00:01.000000Z", halt_call_seq=1)
+
+        # Fail-only run without --init fails cleanly with guidance instead of writing half-empty fixture.
+        incomplete_res = runner.invoke(app, ["fixture", "tutor.teach_turn"])
+        assert incomplete_res.exit_code == 1
+        assert "found 0 pass, 1 fail" in incomplete_res.stderr
+        assert not fixture_fp.exists()
+
+        # Second run records a passing snapshot -> `probe fixture` promotes both into pass + fail lists.
+        r_pass = "01FIXTURE00000000000000002"
+        store.create_run(
+            r_pass,
+            started_at="2026-11-18T10:05:00.000000Z",
+            cmd="pytest",
+            pid=102,
+            decision_model="http_decision:jev",
+            text_model="openai_compat:qwen3.5:9b",
+        )
+        store.insert_event(
+            run_id=r_pass,
+            call_seq=1,
+            elapsed_ms=12.0,
+            started_at="2026-11-18T10:05:00.012000Z",
+            probe_id="tutor.teach_turn",
+            site="here",
+            probe_type="text",
+            file_line="teach.py:16",
+            checks=item.checks,
+            payload_json=json.dumps({"watched": {k: "GOOD ok" for k in item.watched_keys}}),
+            check_scores=(CheckScore(item.checks[0], 0.96, True),),
+            verdict="pass",
+        )
+        store.finish_run(r_pass, status="completed", finished_at="2026-11-18T10:05:01.000000Z")
+    finally:
+        store.close()
+
+    promo_res = runner.invoke(app, ["fixture", "tutor.teach_turn"])
+    assert promo_res.exit_code == 0, promo_res.stderr
+    assert "(1 pass, 1 fail)" in promo_res.stdout
+
+    # Repeat invocation deduplicates identically.
+    promo_again = runner.invoke(app, ["fixture", "tutor.teach_turn", "--json"])
+    assert promo_again.exit_code == 0
+    assert json.loads(promo_again.stdout)["pass_count"] == 1
+    assert json.loads(promo_again.stdout)["fail_count"] == 1
+
+    # Promoted fixture passes `probe check` Gate 3 directly without synthetic synthesis.
+    synth_called = {"n": 0}
+
+    def check_handler(request: httpx.Request) -> httpx.Response:
+        url = str(request.url)
+        body = json.loads(request.content.decode("utf-8"))
+        if url.endswith("/chat/completions"):
+            if "passing_snapshot" in body["messages"][0]["content"]:
+                synth_called["n"] += 1
+            return httpx.Response(200, json={"choices": [{"message": {"content": "Factual check audit."}}]})
+        if body["probe_id"].endswith("#gate2"):
+            return httpx.Response(200, json={"probabilities": [0.05 for _ in body["checks"]]})
+        ok = "GOOD" in body["snapshot"]
+        return httpx.Response(200, json={"probabilities": [0.95 if ok else 0.10 for _ in body["checks"]]})
+
+    cfg = ProbeConfig(
+        models_decision=ModelEndpointConfig(provider="http_decision", url="http://mock.local/decision", model="jev"),
+        models_text=ModelEndpointConfig(provider="openai_compat", url="http://mock.local/v1", model="qwen3.5:9b"),
+        decision=DecisionConfig(pass_threshold=0.50),
+        check=CheckConfig(require_check=True),
+        runtime=RuntimeConfig(
+            runs_dir=str(runs_dir),
+            lock_path=str(tmp_path / ".probes" / "lock.json"),
+        ),
+        project_root=tmp_path,
+    )
+    ok_check, res_check = run_probe_check([app_py], config=cfg, transport=httpx.MockTransport(check_handler))
+    assert ok_check is True
+    assert res_check[0].status == "passed"
+    assert synth_called["n"] == 0
