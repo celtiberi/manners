@@ -5,6 +5,13 @@ All notable changes to `probe` will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.1] - 2026-11-18
+
+### Changed
+- Raised Gate 3 synthetic fixture generation default `max_tokens` floor from `1200` to `2400` and added automatic 1x retry with `max(4096, [text].max_tokens * 2)` and concise-output feedback when attempt 1 hits `finish_reason='length'` (`ModelTruncatedError`).
+- Raised default `[runtime].max_items` snapshot serialization cap from `25` to `50` so wider structured return models serialize intact without `__truncated_items__`.
+- Clarified Gate 1's non-callable `probe` module error hint to note that `from probe import probe` already exposes `probe.type`, `probe.here`, and `probe.disabled`.
+
 ## [0.6.0] - 2026-11-18
 
 ### Added

@@ -405,7 +405,7 @@ def test_stage5_prompt_escaping_validation_and_reasoning_effort(tmp_path: Path, 
     with pytest.raises(BackendError, match="missing entry"):
         _parse_probabilities_payload({"probabilities": {"q0": 0.9}}, ["A", "B"])
 
-    # Gate 2 & Gate 3 do not prepend user system_prompt; Gate 3 sets max_tokens >= 1200; empty fails.
+    # Gate 2 & Gate 3 skip user system_prompt; Gate 3 uses max_tokens >= 2400 (or override).
     seen_calls: list[dict] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -413,7 +413,7 @@ def test_stage5_prompt_escaping_validation_and_reasoning_effort(tmp_path: Path, 
         seen_calls.append(body)
         if len(seen_calls) == 1:
             return httpx.Response(200, json={"choices": [{"message": {"content": "Gate2 factual summary"}}]})
-        if len(seen_calls) == 2:
+        if len(seen_calls) in {2, 3}:
             return httpx.Response(
                 200,
                 json={
@@ -445,9 +445,18 @@ def test_stage5_prompt_escaping_validation_and_reasoning_effort(tmp_path: Path, 
         tb.generate_calibration_fixtures_gate3(
             probe_id="p", site="decorator", checks=["C"], signature="def f():", source_excerpt="pass"
         )
+        tb.generate_calibration_fixtures_gate3(
+            probe_id="p",
+            site="decorator",
+            checks=["C"],
+            signature="def f():",
+            source_excerpt="pass",
+            max_tokens=4096,
+        )
         assert "USER_CUSTOM_SYSTEM_PROMPT" not in seen_calls[0]["messages"][0]["content"]
         assert "USER_CUSTOM_SYSTEM_PROMPT" not in seen_calls[1]["messages"][0]["content"]
-        assert seen_calls[1]["max_tokens"] >= 1200
+        assert seen_calls[1]["max_tokens"] >= 2400
+        assert seen_calls[2]["max_tokens"] == 4096
         assert seen_calls[1]["response_format"]["type"] == "json_schema"
         assert seen_calls[1]["response_format"]["json_schema"]["name"] == "gate3_calibration_fixtures"
         assert "Respond with a JSON object matching this JSON Schema" not in seen_calls[1]["messages"][0]["content"]

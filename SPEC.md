@@ -122,7 +122,7 @@ def here(
 When probes are nested (e.g., an outer `@probe` calls an inner `@probe` or `probe.here`), inner checks finish before the outer function returns. `probe` sequences events by call entry:
 
 1. At entry into `@probe` or `probe.here(...)`, the caller claims an atomic `call_seq` (`1, 2, 3, ...`), relative `elapsed_ms`, UTC `started_at`, and `file:line`.
-2. Arguments (or `watched_vars`) are bounded-serialized on entry before function body execution can mutate them (caps: max depth `4`, max items `25`, max string `4 KB`).
+2. Arguments (or `watched_vars`) are bounded-serialized on entry before function body execution can mutate them (caps: max depth `4`, max items `50`, max string `4 KB`).
 3. On `@probe` exit (and immediately on `probe.here`), the full snapshot is redaction-scrubbed and evaluated inline before execution continues.
 
 ### 3.2 Secret Redaction (Runtime Secret Collection + Key Masking)

@@ -1982,3 +1982,124 @@ def test_v06_cli_root_and_monorepo_check_list_fixture_report(tmp_path: Path, mon
     finally:
         server.shutdown()
         server.server_close()
+
+
+def test_v061_gate3_truncation_retry_max_items_50_and_import_hint(tmp_path: Path) -> None:
+    from probe.redact import SecretRedactor, serialize_call_snapshot
+
+    # 1. Gate 3 synthetic truncation (finish_reason="length") auto-retries once with max_tokens >= 4096.
+    app_py = tmp_path / "summary.py"
+    app_py.write_text(
+        textwrap.dedent(
+            """
+            from probe import probe
+
+            @probe("Summary captures all key action items", id="app.summary")
+            def make_summary(notes: str) -> dict[str, str]:
+                return {"summary": notes}
+            """
+        ).strip()
+        + "\n",
+        encoding="utf-8",
+    )
+
+    gate3_calls: list[dict] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        url = str(request.url)
+        body = json.loads(request.content.decode("utf-8"))
+        if url.endswith("/chat/completions"):
+            sys_msg = body["messages"][0]["content"]
+            if "passing_snapshot" in sys_msg:
+                gate3_calls.append(body)
+                if len(gate3_calls) == 1:
+                    return httpx.Response(
+                        200,
+                        json={
+                            "choices": [
+                                {
+                                    "finish_reason": "length",
+                                    "message": {"content": '{"notes": "truncated...'},
+                                }
+                            ]
+                        },
+                    )
+                payload = {
+                    "notes": "concise",
+                    "passing_snapshot": {"inputs": {"notes": "ok"}, "output": {"summary": "GOOD summary"}},
+                    "failing_snapshot": {"inputs": {"notes": "ok"}, "output": {"summary": "BAD empty"}},
+                }
+                return httpx.Response(200, json={"choices": [{"message": {"content": json.dumps(payload)}}]})
+            return httpx.Response(
+                200,
+                json={"choices": [{"message": {"content": "Check evaluates summary completeness."}}]},
+            )
+        if body["probe_id"].endswith("#gate2"):
+            return httpx.Response(200, json={"probabilities": [0.05 for _ in body["checks"]]})
+        ok = "GOOD" in body["snapshot"]
+        return httpx.Response(200, json={"probabilities": [0.94 if ok else 0.08]})
+
+    cfg = ProbeConfig(
+        models_decision=ModelEndpointConfig(provider="http_decision", url="http://mock.local/decision", model="jev"),
+        models_text=ModelEndpointConfig(provider="openai_compat", url="http://mock.local/v1", model="qwen3.5:9b"),
+        decision=DecisionConfig(pass_threshold=0.50),
+        text=TextConfig(max_tokens=1024),
+        check=CheckConfig(require_check=True),
+        runtime=RuntimeConfig(
+            runs_dir=str(tmp_path / ".probes" / "runs"),
+            lock_path=str(tmp_path / ".probes" / "lock.json"),
+        ),
+        project_root=tmp_path,
+    )
+    ok_check, results = run_probe_check([app_py], config=cfg, transport=httpx.MockTransport(handler))
+    assert ok_check is True
+    assert results[0].status == "passed"
+    assert len(gate3_calls) == 2
+    assert gate3_calls[0]["max_tokens"] >= 2400
+    assert gate3_calls[1]["max_tokens"] >= 4096
+    assert "truncated at max_tokens" in gate3_calls[1]["messages"][1]["content"]
+
+    # 2. Default max_items is 50 (a 30-field return dict stays intact; 55-field dict truncates 5).
+    assert RuntimeConfig().max_items == 50
+    redactor = SecretRedactor()
+    snap_30 = json.loads(
+        serialize_call_snapshot(
+            {"x": 1},
+            redactor=redactor,
+            return_value={f"f{i}": i for i in range(30)},
+            has_return=True,
+        )
+    )
+    assert "__truncated_items__" not in snap_30["output"]
+    assert len(snap_30["output"]) == 30
+
+    snap_55 = json.loads(
+        serialize_call_snapshot(
+            {"x": 1},
+            redactor=redactor,
+            return_value={f"f{i}": i for i in range(55)},
+            has_return=True,
+        )
+    )
+    assert snap_55["output"]["__truncated_items__"] == 5
+
+    # 3. Gate 1 import hint explicitly mentions `from probe import probe` and `probe.type`.
+    bad_import_py = tmp_path / "bad_import.py"
+    bad_import_py.write_text(
+        textwrap.dedent(
+            """
+            import probe
+
+            @probe("Output summarizes metrics", id="app.bad")
+            def bad(x: str) -> str:
+                return x
+            """
+        ).strip()
+        + "\n",
+        encoding="utf-8",
+    )
+    ok_bad, res_bad = run_probe_check([bad_import_py], config=cfg, transport=httpx.MockTransport(handler))
+    assert ok_bad is False
+    assert res_bad[0].gate == "gate1"
+    assert "from probe import probe" in res_bad[0].reason
+    assert "probe.type" in res_bad[0].reason

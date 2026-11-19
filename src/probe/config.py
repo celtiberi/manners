@@ -371,7 +371,7 @@ class RuntimeConfig:
     strict_api: bool = True
     halt_on_fail: bool = True
     max_depth: int = 4
-    max_items: int = 25
+    max_items: int = 50
     max_str_bytes: int = 4096
     max_workers: int = 4
 

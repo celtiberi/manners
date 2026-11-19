@@ -33,17 +33,17 @@ Both roles are configured once in `config.toml` and can point at cloud APIs or l
 From a GitHub Release wheel (recommended in containers/CI — no `git` binary required):
 
 ```sh
-uv tool install https://github.com/celtiberi/probe/releases/download/v0.6.0/probe-0.6.0-py3-none-any.whl
+uv tool install https://github.com/celtiberi/probe/releases/download/v0.6.1/probe-0.6.1-py3-none-any.whl
 ```
 
 In a project virtual environment (wheel or git):
 
 ```sh
-uv add https://github.com/celtiberi/probe/releases/download/v0.6.0/probe-0.6.0-py3-none-any.whl
+uv add https://github.com/celtiberi/probe/releases/download/v0.6.1/probe-0.6.1-py3-none-any.whl
 # Optional local ONNX NLI decision runtime (no cloud decision API key required):
-# uv add "probe[onnx] @ https://github.com/celtiberi/probe/releases/download/v0.6.0/probe-0.6.0-py3-none-any.whl"
+# uv add "probe[onnx] @ https://github.com/celtiberi/probe/releases/download/v0.6.1/probe-0.6.1-py3-none-any.whl"
 # or via pip:
-# pip install https://github.com/celtiberi/probe/releases/download/v0.6.0/probe-0.6.0-py3-none-any.whl
+# pip install https://github.com/celtiberi/probe/releases/download/v0.6.1/probe-0.6.1-py3-none-any.whl
 # or from git main:
 # uv add git+https://github.com/celtiberi/probe.git
 ```
