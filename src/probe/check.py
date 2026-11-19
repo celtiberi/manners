@@ -1611,7 +1611,6 @@ def _evaluate_uncached_probe(
     fixture_source = "fixture" if fixture is not None else "synthetic"
     max_attempts = 1 if fixture is not None else 2
     retry_feedback = ""
-    gate3_max_tokens: int | None = None
     pass_case_scores: list[list[CheckScore]] = []
     fail_case_scores: list[list[CheckScore]] = []
     bad_pass_indices: list[int] = []
@@ -1636,14 +1635,12 @@ def _evaluate_uncached_probe(
                     captured_params=item.param_names,
                     temperature=0.0 if attempt == 1 else 0.3,
                     retry_feedback=retry_feedback,
-                    max_tokens=gate3_max_tokens,
                 )
                 raw_pass_cases, raw_fail_cases = (p_snap,), (f_snap,)
         except BackendError as exc:
             if fixture is None and attempt == 1 and isinstance(exc, ModelTruncatedError):
-                gate3_max_tokens = max(4096, cfg.text.max_tokens * 2)
                 retry_feedback = (
-                    "Previous synthetic fixture JSON truncated at max_tokens; "
+                    "Previous synthetic fixture JSON truncated (finish_reason='length'); "
                     "keep field values concise while satisfying every check."
                 )
                 continue

@@ -718,12 +718,15 @@ class ProbeRuntime:
                     )
                 except ModelTruncatedError as exc:
                     max_tok = self.config.text.max_tokens
+                    limit_hint = (
+                        f"max_tokens={max_tok}; increase or unset [text].max_tokens"
+                        if max_tok is not None
+                        else "model output token limit"
+                    )
                     if exc.partial_text:
-                        note = (
-                            f"{exc.partial_text} ...[truncated at max_tokens={max_tok}; increase [text].max_tokens]"
-                        )
+                        note = f"{exc.partial_text} ...[truncated at {limit_hint}]"
                     else:
-                        note = f"[Explanation truncated at max_tokens={max_tok}; increase [text].max_tokens]"
+                        note = f"[Explanation truncated at {limit_hint}]"
                     analysis_text = _scrub_and_truncate(note, self.redactor, self.config.runtime.max_str_bytes)
                 except BackendError as exc:
                     analysis_text = _scrub_and_truncate(

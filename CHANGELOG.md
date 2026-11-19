@@ -5,6 +5,12 @@ All notable changes to `probe` will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.2] - 2026-11-18
+
+### Changed
+- Changed `[text].max_tokens` default from `1024` to `None` (unset), omitting `"max_tokens"` from `/chat/completions` requests so providers use each model's own output limit unless `[text].max_tokens` is explicitly configured.
+- Removed hardcoded Gate 2 (`260`) and Gate 3 (`2400` / `4096`) client-side `max_tokens` floors while keeping 1x concise-output retry on Gate 3 `ModelTruncatedError`.
+
 ## [0.6.1] - 2026-11-18
 
 ### Changed

@@ -572,7 +572,7 @@ def test_disabled_context_class_rejection_tty_entry_halt_and_jsonl_hardening(
 def test_truncation_always_halts_and_strict_api_defaults_true(
     tmp_path: Path, monkeypatch, capsys
 ) -> None:
-    assert TextConfig().max_tokens == 1024
+    assert TextConfig().max_tokens is None
     assert RuntimeConfig().strict_api is True
 
     monkeypatch.setenv("PROBES", "1")
@@ -659,6 +659,27 @@ def test_truncation_always_halts_and_strict_api_defaults_true(
     assert ev2.verdict == "fail"
     assert "Output leaked answer" in (ev2.text_analysis or "")
     assert "truncated at max_tokens=123" in (ev2.text_analysis or "")
+
+    # 2b. When max_tokens is None (default), explanation truncation avoids emitting "max_tokens=None".
+    cfg_explain_unset = _make_config(tmp_path)
+    cfg_explain_unset.runtime.runs_dir = str(tmp_path / ".probes" / "runs_trunc_unset")
+    cfg_explain_unset.text.max_tokens = None
+    reset_for_testing(config=cfg_explain_unset, transport=httpx.MockTransport(trunc_explain_handler))
+    try:
+        with pytest.raises(ProbeHaltError):
+            probe.here("No spoilers", id="trunc.explain.unset", kind=probe.type.decision, reply="Quiero café")
+    finally:
+        rt2b = probe.flush_for_testing()
+        reset_for_testing()
+
+    assert rt2b is not None
+    s2b = ProbeStore(cfg_explain_unset.resolve_runs_dir(), create=False)
+    try:
+        ev2b = s2b.list_events(rt2b.run_id)[0]
+    finally:
+        s2b.close()
+    assert "truncated at model output token limit" in (ev2b.text_analysis or "")
+    assert "max_tokens=None" not in (ev2b.text_analysis or "")
 
     # 3. BACKEND_ERROR halts under default strict_api=True; when strict_api=False prints [PROBE ERROR] to stderr.
     def err500_handler(_request: httpx.Request) -> httpx.Response:
