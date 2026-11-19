@@ -1,5 +1,7 @@
 # `probe`
 
+[![CI](https://github.com/celtiberi/probe/actions/workflows/ci.yml/badge.svg)](https://github.com/celtiberi/probe/actions/workflows/ci.yml)
+
 Plain-English runtime behavioral checks (`@probe` and `probe.here`) and call-ordered debug logs for Python. See [`SPEC.md`](./SPEC.md) for the full design and [`docs/case-study-spanish-tutor.md`](./docs/case-study-spanish-tutor.md) for a real-world multi-stage tutor integration report.
 
 ## Why This Exists
@@ -26,6 +28,8 @@ Both roles are configured once in `config.toml` and can point at cloud APIs or l
 
 ## Install
 
+> **Note:** Install from the GitHub Release wheel or git URL below—do **not** run bare `pip install probe` or `uv add probe`, which resolves to an unrelated legacy package on PyPI.
+
 From a GitHub Release wheel (recommended in containers/CI — no `git` binary required):
 
 ```sh
@@ -36,6 +40,8 @@ In a project virtual environment (wheel or git):
 
 ```sh
 uv add https://github.com/celtiberi/probe/releases/download/v0.5.0/probe-0.5.0-py3-none-any.whl
+# Optional local ONNX NLI decision runtime (no cloud decision API key required):
+# uv add "probe[onnx] @ https://github.com/celtiberi/probe/releases/download/v0.5.0/probe-0.5.0-py3-none-any.whl"
 # or via pip:
 # pip install https://github.com/celtiberi/probe/releases/download/v0.5.0/probe-0.5.0-py3-none-any.whl
 # or from git main:
@@ -44,7 +50,18 @@ uv add https://github.com/celtiberi/probe/releases/download/v0.5.0/probe-0.5.0-p
 
 ## Quick Start
 
-1. Attach checks to a function or intermediate step:
+1. Configure your models and API keys (`probe` splits grading into two roles, configured once in `~/.config/probe/config.toml` or `[tool.probe]` in `pyproject.toml`, reading keys from shell env or `.env`):
+   - **`[models.decision]` (scores yes/no checks):** Defaults to **TypeSafe Jev** (`TYPESAFE_API_KEY` from [typesafe.ai](https://typesafe.ai)). Without a TypeSafe key, install `"probe[onnx] @ ..."` and point `provider = "onnx_nli"` at local NLI weights (such as `DeBERTa-v3-base-mnli-fever-anli` — see [Configuration](#configuration-configprobeconfigtoml)).
+   - **`[models.text]` (runs `probe check` calibration, `probe.type.text` analysis, and failure explanations):** Defaults to **DeepSeek** (`DEEPSEEK_API_KEY`), or point `url` / `model` / `api_key_env` at **OpenAI** (`OPENAI_API_KEY`), **Gemini** (`GEMINI_API_KEY`), or local **Ollama** (`qwen3.5:9b`, no API key).
+
+Minimal `.env` when using defaults (no `config.toml` needed; see [Configuration](#configuration-configprobeconfigtoml) to swap in OpenAI, Gemini, Ollama, or local ONNX):
+
+```sh
+TYPESAFE_API_KEY=...
+DEEPSEEK_API_KEY=...
+```
+
+2. Attach checks to a function or intermediate step:
 
 ```python
 from probe import probe
@@ -79,13 +96,13 @@ probe.here(
 )
 ```
 
-2. Run the pre-run check (populates `.probes/lock.json`):
+3. Run the pre-run check (populates `.probes/lock.json`):
 
 ```sh
 probe check
 ```
 
-3. Run your server or tests with probes enabled (either in the shell or by setting `PROBES=1` in `.env`):
+4. Run your server or tests with probes enabled (either in the shell or by setting `PROBES=1` in `.env`):
 
 ```sh
 PROBES=1 uvicorn app:app --reload
@@ -103,13 +120,38 @@ To control probes inside `pytest` when `PROBES=1` is set in `.env`:
 - The built-in `pytest` plugin also drains background/daemon-thread evaluations after each test item so uncaught `ProbeHaltError`s from background threads fail the test cleanly.
 - In plain Python code or fixtures, use stackable `with probe.disabled():` and `with probe.enabled():` (`from probe import disabled, enabled, flush`).
 
-4. Inspect results in call-entry order (works while a server is running too, via per-run JSONL logs):
+5. Inspect results in call-entry order (works while a server is running too, via per-run JSONL logs):
 
 ```sh
 probe report --all
 probe report --check
 probe log tutor.opening_turn rag.*
 probe runs
+```
+
+### Example Output
+
+```text
+Run 2026-11-18T15:10:04Z (cmd: pytest evals/test_tutor_turns.py) — HALTED on FAIL at call #003
+Probes: 2 active | Calls: 3 (2 pass, 1 fail, 0 error)
+
+Chronological Timeline (ordered by call_seq):
+  #001  +0.088s  [PASS]  rag.draft_answer (rag/synthesize.py:94) [kind=text]
+        checks:
+          ✓ [0.96] Draft answer stays strictly grounded in the retrieved chunks without inventing figures or dates
+          ✓ [0.93] Draft answer directly addresses the user's question
+        analysis: Response cites only figures from chunk #1 (filing 2026-11-16) and directly answers the question.
+
+  #002  +0.412s  [PASS]  tutor.opening_turn (tutor/turn.py:61) [kind=decision]
+        checks:  4/4 passed (min p=0.89)
+
+  #003  +0.785s  [FAIL]  tutor.opening_turn (tutor/turn.py:61) [kind=decision]  <-- HALT TRIGGER
+        checks:
+          ✓ [0.97] Tutor opens with a short Spanish greeting or phrase
+          ✓ [0.91] Tutor gives brief teaching or instructions to help the student
+          ✓ [0.89] Tutor asks the student to say something in Spanish
+          ✗ [0.06] Tutor does NOT give away the exact Spanish sentence the student is expected to say
+        analysis: Tutor tells the student: 'Try saying: Quiero un café por favor', giving away the target sentence verbatim.
 ```
 
 ## Writing Effective Checks & Fixtures
@@ -143,13 +185,31 @@ url = "https://api.typesafe.ai/v1/systemone"
 model = "jev-latest"
 api_key_env = "TYPESAFE_API_KEY"
 
+# Alternative: local ONNX NLI decision runtime (install "probe[onnx] @ ..."):
+# [models.decision]
+# provider = "onnx_nli"
+# onnx_path = "~/.cache/probe/deberta-v3-mnli/model.onnx"
+# tokenizer_path = "~/.cache/probe/deberta-v3-mnli/tokenizer.json"
+
 [models.text]
 provider = "openai_compat"
 url = "https://api.deepseek.com/v1"
 model = "deepseek-chat"
 api_key_env = "DEEPSEEK_API_KEY"
 
-# Local text LLM via Ollama (paired with your configured [models.decision]):
+# Alternatives for [models.text] (OpenAI, Gemini, or local Ollama):
+# [models.text]
+# provider = "openai_compat"
+# url = "https://api.openai.com/v1"
+# model = "gpt-4.1-mini"
+# api_key_env = "OPENAI_API_KEY"
+#
+# [models.text]
+# provider = "openai_compat"
+# url = "https://generativelanguage.googleapis.com/v1beta/openai"
+# model = "gemini-3.8-flash"
+# api_key_env = "GEMINI_API_KEY"
+#
 # [models.text]
 # provider = "openai_compat"
 # url = "http://127.0.0.1:11434/v1"
