@@ -9,9 +9,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import NamedTuple
 
-from probe import probe
-from probe.config import RedactConfig
-from probe.redact import (
+from manners import manners
+from manners.config import RedactConfig
+from manners.redact import (
     REDACTED,
     SecretRedactor,
     serialize_call_inputs,
@@ -155,7 +155,7 @@ def test_bounded_serialization_and_oversized_secret_scrub() -> None:
     assert len(parsed["many"]) == 6  # 5 items + truncation marker
     assert "25 more items" in str(parsed["many"][-1])
     assert "<circular>" in json.dumps(parsed["loop"])
-    assert probe.REDACTED if hasattr(probe, "REDACTED") else True
+    assert manners.REDACTED if hasattr(manners, "REDACTED") else True
 
 
 def test_redactor_edge_cases_webhooks_depth_namedtuple_slots_lock_and_subdirs(

@@ -1,4 +1,4 @@
-"""Probe runtime: synchronous inline grading, call_seq tracking, rate guard, and halt switch."""
+"""Manners runtime: synchronous inline grading, call_seq tracking, rate guard, and halt switch."""
 
 from __future__ import annotations
 
@@ -24,9 +24,9 @@ from typing import Any, ParamSpec, TypeVar
 
 import httpx
 
-from probe.backends import BackendError, CheckScore, DecisionBackend, ModelTruncatedError, TextBackend
-from probe.config import (
-    ProbeConfig,
+from manners.backends import BackendError, CheckScore, DecisionBackend, ModelTruncatedError, TextBackend
+from manners.config import (
+    MannersConfig,
     is_no_halt,
     is_no_pdb,
     is_skip_lock,
@@ -34,22 +34,22 @@ from probe.config import (
     new_ulid,
     utc_now_iso,
 )
-from probe.redact import SecretRedactor, _scrub_and_truncate, serialize_call_snapshot
-from probe.store import ProbeStore
+from manners.redact import SecretRedactor, _scrub_and_truncate, serialize_call_snapshot
+from manners.store import MannersStore
 
 P = ParamSpec("P")
 R = TypeVar("R")
 
 
-class ProbeType(StrEnum):
-    """Evaluation mode for a probe."""
+class MannersType(StrEnum):
+    """Evaluation mode for a behavioral check."""
 
     decision = "decision"
     text = "text"
 
 
-class ProbeHaltError(BaseException):
-    """Raised when a probe fails, triggers PROBE_MISUSE, or lacks lock approval."""
+class MannersHaltError(BaseException):
+    """Raised when a check fails, triggers MANNERS_MISUSE, or lacks lock approval."""
 
 
 def normalize_checks(checks: str | Sequence[str]) -> tuple[str, ...]:
@@ -59,39 +59,41 @@ def normalize_checks(checks: str | Sequence[str]) -> tuple[str, ...]:
     else:
         items = tuple(str(c) for c in checks)
     if not items or any(not c.strip() for c in items):
-        raise ValueError("Probe checks must contain at least one non-empty expectation string")
+        raise ValueError("Manners checks must contain at least one non-empty expectation string")
     return items
 
 
-def normalize_probe_type(kind: ProbeType | str) -> ProbeType:
-    """Validate and coerce kind into ProbeType."""
-    if isinstance(kind, ProbeType):
+def normalize_manners_type(kind: MannersType | str) -> MannersType:
+    """Validate and coerce kind into MannersType."""
+    if isinstance(kind, MannersType):
         return kind
     try:
-        return ProbeType(str(kind).strip().lower())
+        return MannersType(str(kind).strip().lower())
     except ValueError as exc:
-        raise ValueError(f"Unsupported probe kind: {kind!r} (expected probe.type.decision or probe.type.text)") from exc
+        raise ValueError(
+            f"Unsupported manners kind: {kind!r} (expected manners.type.decision or manners.type.text)"
+        ) from exc
 
 
 def normalize_ignore(ignore: str | Sequence[str] | None) -> tuple[str, ...]:
-    """Normalize ignored parameter name(s) for @probe into a deduplicated tuple."""
+    """Normalize ignored parameter name(s) for @manners into a deduplicated tuple."""
     if ignore is None:
         return ()
     if isinstance(ignore, str):
         if not ignore.strip():
-            raise ValueError("@probe `ignore` parameter name must not be empty")
+            raise ValueError("@manners `ignore` parameter name must not be empty")
         return (ignore,)
     if isinstance(ignore, (bytes, bytearray)) or not isinstance(ignore, Sequence):
-        raise TypeError("@probe `ignore` must be a parameter name string or sequence of parameter names")
+        raise TypeError("@manners `ignore` must be a parameter name string or sequence of parameter names")
     out: list[str] = []
     for elem in ignore:
         if not isinstance(elem, str) or not elem.strip():
-            raise ValueError("@probe `ignore` entries must be non-empty parameter name strings")
+            raise ValueError("@manners `ignore` entries must be non-empty parameter name strings")
         out.append(elem)
     return tuple(dict.fromkeys(out))
 
 
-def compute_checks_hash(kind: ProbeType | str, checks: Sequence[str]) -> str:
+def compute_checks_hash(kind: MannersType | str, checks: Sequence[str]) -> str:
     """Compute canonical SHA-256 hex digest for (kind, checks) shared between check and runtime."""
     payload = json.dumps(
         {"kind": str(kind), "checks": list(checks)},
@@ -240,9 +242,9 @@ def _here_file_line(frame: FrameType | None, *, project_root: Path | None = None
 class GradedEvent:
     """In-memory model grading result ready to be persisted and checked for halts."""
 
-    probe_id: str
+    check_id: str
     site: str
-    probe_type: ProbeType
+    check_type: MannersType
     file_line: str
     checks: tuple[str, ...]
     payload_json: str
@@ -265,13 +267,13 @@ def _is_asyncio_internal_frame(frame: FrameType) -> bool:
     return "/asyncio/" in norm
 
 
-class ProbeRuntime:
+class MannersRuntime:
     """Manages JSONL run lifecycle, redaction, rate limiting, inline grading, and halting."""
 
     def __init__(
         self,
         *,
-        config: ProbeConfig | None = None,
+        config: MannersConfig | None = None,
         transport: httpx.BaseTransport | None = None,
     ) -> None:
         self.config = config or load_config()
@@ -280,7 +282,7 @@ class ProbeRuntime:
         self.started_at = utc_now_iso()
         self._start_mono = time.monotonic()
 
-        self.store = ProbeStore(self.config.resolve_runs_dir(), create=True)
+        self.store = MannersStore(self.config.resolve_runs_dir(), create=True)
         try:
             cmd = " ".join(shlex.quote(a) for a in sys.argv) if sys.argv else "python"
             self.store.create_run(
@@ -321,7 +323,7 @@ class ProbeRuntime:
         self._rate_lock = threading.Lock()
         self._call_windows: dict[str, collections.deque[float]] = {}
         self._call_totals: dict[str, int] = {}
-        self._tripped_probes: set[str] = set()
+        self._tripped_checks: set[str] = set()
 
         self._state_lock = threading.Lock()
         self._tripped = False
@@ -340,7 +342,7 @@ class ProbeRuntime:
         self._soak_slots = threading.BoundedSemaphore(max(1, self.config.runtime.max_workers * 8))
 
     def should_halt_on_fail(self) -> bool:
-        """Return False when PROBE_NO_HALT=1 or [runtime].halt_on_fail=false runs in audit mode."""
+        """Return False when MANNERS_NO_HALT=1 or [runtime].halt_on_fail=false runs in audit mode."""
         return self.config.runtime.halt_on_fail and not is_no_halt(self.cwd)
 
     @property
@@ -354,13 +356,13 @@ class ProbeRuntime:
             return self._halted_thread
 
     def record_unhandled_thread_halt(self, message: str) -> None:
-        """Record an uncaught ProbeHaltError from a background thread so flush() can fail main."""
+        """Record an uncaught MannersHaltError from a background thread so flush() can fail main."""
         with self._state_lock:
             if self._unhandled_thread_halt is None:
                 self._unhandled_thread_halt = message
 
     def consume_unhandled_thread_halt(self) -> str | None:
-        """Return and clear any recorded uncaught thread ProbeHaltError message."""
+        """Return and clear any recorded uncaught thread MannersHaltError message."""
         with self._state_lock:
             msg = self._unhandled_thread_halt
             self._unhandled_thread_halt = None
@@ -392,13 +394,13 @@ class ProbeRuntime:
                     self._unhandled_thread_halt = None
                 else:
                     self._note_halted_thread_locked(cur_thread)
-                raise ProbeHaltError(self._halt_reason or "Probe runtime halted")
+                raise MannersHaltError(self._halt_reason or "Manners runtime halted")
 
     def verify_lock(
         self,
         *,
-        probe_id: str,
-        probe_type: ProbeType,
+        check_id: str,
+        check_type: MannersType,
         checks: tuple[str, ...],
         call_seq: int,
         elapsed_ms: float,
@@ -410,7 +412,7 @@ class ProbeRuntime:
         watched_keys: tuple[str, ...] = (),
         param_names: tuple[str, ...] | None = None,
     ) -> bool:
-        """Verify probe matches lockfile (checks_hash, site, params/watched_keys, file) unless skipped."""
+        """Verify check matches lockfile (checks_hash, site, params/watched_keys, file) unless skipped."""
         if not self.config.check.require_check or is_skip_lock(self.cwd):
             return False
 
@@ -420,15 +422,15 @@ class ProbeRuntime:
                 if lock_path.is_file():
                     try:
                         raw = json.loads(lock_path.read_text(encoding="utf-8"))
-                        probes_map = raw.get("probes") if isinstance(raw, dict) else {}
-                        self._lock_cache = probes_map if isinstance(probes_map, dict) else {}
+                        locks_map = raw.get("manners") if isinstance(raw, dict) else {}
+                        self._lock_cache = locks_map if isinstance(locks_map, dict) else {}
                     except Exception:
                         self._lock_cache = {}
                 else:
                     self._lock_cache = {}
-            entry = self._lock_cache.get(probe_id)
+            entry = self._lock_cache.get(check_id)
 
-        expected_hash = compute_checks_hash(probe_type, checks)
+        expected_hash = compute_checks_hash(check_type, checks)
         entry_site = entry.get("site") if isinstance(entry, dict) else None
         site_ok = entry_site == site
         watched_ok = True
@@ -462,12 +464,12 @@ class ProbeRuntime:
             return False
 
         msg = (
-            f"Probe '{probe_id}' failed lock check (.probes/lock.json missing or out of date). "
-            "Run `probe check` or set PROBE_SKIP_LOCK=1."
+            f"Check '{check_id}' failed lock check (.manners/lock.json missing or out of date). "
+            "Run `manners check` or set MANNERS_SKIP_LOCK=1."
         )
         return self._record_and_halt_error(
-            probe_id=probe_id,
-            probe_type=probe_type,
+            check_id=check_id,
+            check_type=check_type,
             checks=checks,
             call_seq=call_seq,
             elapsed_ms=elapsed_ms,
@@ -475,7 +477,7 @@ class ProbeRuntime:
             site=site,
             file_line=file_line,
             payload_json=payload_json,
-            error_code="UNCHECKED_PROBE",
+            error_code="UNCHECKED_MANNERS",
             analysis=msg,
             stack_excerpt=_short_stack_excerpt(caller_frame),
             caller_frame=caller_frame,
@@ -484,8 +486,8 @@ class ProbeRuntime:
     def check_rate_limit(
         self,
         *,
-        probe_id: str,
-        probe_type: ProbeType,
+        check_id: str,
+        check_type: MannersType,
         checks: tuple[str, ...],
         call_seq: int,
         elapsed_ms: float,
@@ -502,38 +504,38 @@ class ProbeRuntime:
         halt_enabled = self.should_halt_on_fail()
 
         with self._rate_lock:
-            if probe_id in self._tripped_probes:
+            if check_id in self._tripped_checks:
                 if not halt_enabled:
                     return False, True
-                breach_reason = f"PROBE_MISUSE: circuit breaker already tripped for '{probe_id}'"
+                breach_reason = f"MANNERS_MISUSE: circuit breaker already tripped for '{check_id}'"
             else:
-                window = self._call_windows.setdefault(probe_id, collections.deque())
+                window = self._call_windows.setdefault(check_id, collections.deque())
                 cutoff = now - rl.window_seconds
                 while window and window[0] < cutoff:
                     window.popleft()
                 window.append(now)
 
-                total = self._call_totals.get(probe_id, 0) + 1
-                self._call_totals[probe_id] = total
+                total = self._call_totals.get(check_id, 0) + 1
+                self._call_totals[check_id] = total
 
                 if rl.max_calls_per_run >= 0 and total > rl.max_calls_per_run:
-                    self._tripped_probes.add(probe_id)
+                    self._tripped_checks.add(check_id)
                     breach_reason = (
-                        f"PROBE_MISUSE: '{probe_id}' exceeded max_calls_per_run "
+                        f"MANNERS_MISUSE: '{check_id}' exceeded max_calls_per_run "
                         f"({total} > {rl.max_calls_per_run})"
                     )
                 elif len(window) > rl.max_calls:
-                    self._tripped_probes.add(probe_id)
+                    self._tripped_checks.add(check_id)
                     breach_reason = (
-                        f"PROBE_MISUSE: '{probe_id}' exceeded rate limit "
+                        f"MANNERS_MISUSE: '{check_id}' exceeded rate limit "
                         f"({len(window)} calls in {rl.window_seconds:.1f}s > {rl.max_calls})"
                     )
 
         if breach_reason is not None:
             if halt_enabled:
                 entered = self._record_and_halt_error(
-                    probe_id=probe_id,
-                    probe_type=probe_type,
+                    check_id=check_id,
+                    check_type=check_type,
                     checks=checks,
                     call_seq=call_seq,
                     elapsed_ms=elapsed_ms,
@@ -541,7 +543,7 @@ class ProbeRuntime:
                     site=site,
                     file_line=file_line,
                     payload_json=payload_json,
-                    error_code="PROBE_MISUSE",
+                    error_code="MANNERS_MISUSE",
                     analysis=breach_reason,
                     stack_excerpt=_short_stack_excerpt(caller_frame),
                     caller_frame=caller_frame,
@@ -554,22 +556,22 @@ class ProbeRuntime:
                 call_seq=call_seq,
                 elapsed_ms=elapsed_ms,
                 started_at=started_at,
-                probe_id=probe_id,
+                check_id=check_id,
                 site=site,
-                probe_type=probe_type.value,
+                check_type=check_type.value,
                 file_line=file_line,
                 checks=checks,
                 payload_json=payload_json,
                 check_scores=(),
                 verdict="error",
-                error_code="PROBE_MISUSE",
+                error_code="MANNERS_MISUSE",
                 text_analysis=breach_reason,
                 stack_excerpt=_short_stack_excerpt(caller_frame),
                 latency_ms=0.0,
             )
             print(
-                f"[PROBE ERROR] call #{call_seq:03d} {probe_id} ({file_line}): "
-                f"{breach_reason} (further calls to '{probe_id}' skipped)",
+                f"[MANNERS ERROR] call #{call_seq:03d} {check_id} ({file_line}): "
+                f"{breach_reason} (further calls to '{check_id}' skipped)",
                 file=sys.stderr,
                 flush=True,
             )
@@ -579,8 +581,8 @@ class ProbeRuntime:
     def _record_and_halt_error(
         self,
         *,
-        probe_id: str,
-        probe_type: ProbeType,
+        check_id: str,
+        check_type: MannersType,
         checks: tuple[str, ...],
         call_seq: int,
         elapsed_ms: float,
@@ -600,9 +602,9 @@ class ProbeRuntime:
             call_seq=call_seq,
             elapsed_ms=elapsed_ms,
             started_at=started_at,
-            probe_id=probe_id,
+            check_id=check_id,
             site=site,
-            probe_type=probe_type.value,
+            check_type=check_type.value,
             file_line=file_line,
             checks=checks,
             payload_json=payload_json,
@@ -615,7 +617,7 @@ class ProbeRuntime:
         )
         return self._trigger_halt(
             call_seq=call_seq,
-            probe_id=probe_id,
+            check_id=check_id,
             file_line=file_line,
             summary=analysis,
             caller_frame=caller_frame,
@@ -627,9 +629,9 @@ class ProbeRuntime:
         call_seq: int,
         elapsed_ms: float,
         started_at: str,
-        probe_id: str,
+        check_id: str,
         site: str,
-        probe_type: ProbeType,
+        check_type: MannersType,
         file_line: str,
         checks: tuple[str, ...],
         inputs_data: dict[str, Any],
@@ -655,9 +657,9 @@ class ProbeRuntime:
             call_seq=call_seq,
             elapsed_ms=elapsed_ms,
             started_at=started_at,
-            probe_id=probe_id,
+            check_id=check_id,
             site=site,
-            probe_type=probe_type.value,
+            check_type=check_type.value,
             file_line=file_line,
             checks=checks,
             payload_json=payload_json,
@@ -672,9 +674,9 @@ class ProbeRuntime:
     def grade_event(
         self,
         *,
-        probe_id: str,
+        check_id: str,
         site: str,
-        probe_type: ProbeType,
+        check_type: MannersType,
         file_line: str,
         checks: tuple[str, ...],
         payload_json: str,
@@ -687,21 +689,21 @@ class ProbeRuntime:
         error_code: str | None = None
 
         try:
-            if probe_type == ProbeType.text:
+            if check_type == MannersType.text:
                 analysis_text = self.text_backend.analyze_snapshot(
-                    probe_id=probe_id,
+                    check_id=check_id,
                     checks=checks,
                     snapshot_json=payload_json,
                 )
                 scores = self.decision_backend.evaluate_checks(
-                    probe_id=probe_id,
+                    check_id=check_id,
                     checks=checks,
                     snapshot_json=payload_json,
                     analysis=analysis_text,
                 )
             else:
                 scores = self.decision_backend.evaluate_checks(
-                    probe_id=probe_id,
+                    check_id=check_id,
                     checks=checks,
                     snapshot_json=payload_json,
                 )
@@ -709,10 +711,10 @@ class ProbeRuntime:
             all_passed = all(s.passed for s in scores)
             verdict = "pass" if all_passed else "fail"
 
-            if verdict == "fail" and probe_type == ProbeType.decision and self.config.text.explain_decision_failures:
+            if verdict == "fail" and check_type == MannersType.decision and self.config.text.explain_decision_failures:
                 try:
                     analysis_text = self.text_backend.explain_failure(
-                        probe_id=probe_id,
+                        check_id=check_id,
                         scores=scores,
                         snapshot_json=payload_json,
                     )
@@ -736,7 +738,7 @@ class ProbeRuntime:
                     )
         except ModelTruncatedError as exc:
             verdict = "error"
-            error_code = "PROBE_TRUNCATED"
+            error_code = "MANNERS_TRUNCATED"
             detail = f"{exc}: {exc.partial_text}" if exc.partial_text else str(exc)
             analysis_text = _scrub_and_truncate(detail, self.redactor, self.config.runtime.max_str_bytes)
         except BackendError as exc:
@@ -746,9 +748,9 @@ class ProbeRuntime:
 
         latency_ms = round((time.perf_counter() - t0) * 1000.0, 3)
         return GradedEvent(
-            probe_id=probe_id,
+            check_id=check_id,
             site=site,
-            probe_type=probe_type,
+            check_type=check_type,
             file_line=file_line,
             checks=checks,
             payload_json=payload_json,
@@ -780,9 +782,9 @@ class ProbeRuntime:
             call_seq=call_seq,
             elapsed_ms=elapsed_ms,
             started_at=started_at,
-            probe_id=graded.probe_id,
+            check_id=graded.check_id,
             site=graded.site,
-            probe_type=graded.probe_type.value,
+            check_type=graded.check_type.value,
             file_line=graded.file_line,
             checks=graded.checks,
             payload_json=graded.payload_json,
@@ -800,7 +802,7 @@ class ProbeRuntime:
 
         would_halt = (
             graded.verdict == "fail"
-            or graded.error_code == "PROBE_TRUNCATED"
+            or graded.error_code == "MANNERS_TRUNCATED"
             or (graded.verdict == "error" and self.config.runtime.strict_api)
         )
         should_halt = would_halt and self.should_halt_on_fail()
@@ -815,7 +817,7 @@ class ProbeRuntime:
 
             self._trigger_halt(
                 call_seq=call_seq,
-                probe_id=graded.probe_id,
+                check_id=graded.check_id,
                 file_line=graded.file_line,
                 summary=reason,
                 caller_frame=caller_frame,
@@ -824,14 +826,14 @@ class ProbeRuntime:
             failed = [s.check for s in graded.scores if not s.passed]
             reason = f"Check(s) failed: {'; '.join(failed)}"
             print(
-                f"[PROBE FAIL] call #{call_seq:03d} {graded.probe_id} ({graded.file_line}): {reason}",
+                f"[MANNERS FAIL] call #{call_seq:03d} {graded.check_id} ({graded.file_line}): {reason}",
                 file=sys.stderr,
                 flush=True,
             )
         elif graded.verdict == "error":
             err_detail = graded.analysis_text or graded.error_code or "Backend error"
             print(
-                f"[PROBE ERROR] call #{call_seq:03d} {graded.probe_id} ({graded.file_line}): {err_detail}",
+                f"[MANNERS ERROR] call #{call_seq:03d} {graded.check_id} ({graded.file_line}): {err_detail}",
                 file=sys.stderr,
                 flush=True,
             )
@@ -841,7 +843,7 @@ class ProbeRuntime:
             if self._soak_executor is None:
                 self._soak_executor = concurrent.futures.ThreadPoolExecutor(
                     max_workers=self.config.runtime.max_workers,
-                    thread_name_prefix="probe-soak",
+                    thread_name_prefix="manners-soak",
                 )
             return self._soak_executor
 
@@ -880,9 +882,9 @@ class ProbeRuntime:
         call_seq: int,
         elapsed_ms: float,
         started_at: str,
-        probe_id: str,
+        check_id: str,
         site: str,
-        probe_type: ProbeType,
+        check_type: MannersType,
         file_line: str,
         checks: tuple[str, ...],
         payload_json: str,
@@ -890,9 +892,9 @@ class ProbeRuntime:
         stack_excerpt: str | None,
     ) -> None:
         graded = self.grade_event(
-            probe_id=probe_id,
+            check_id=check_id,
             site=site,
-            probe_type=probe_type,
+            check_type=check_type,
             file_line=file_line,
             checks=checks,
             payload_json=payload_json,
@@ -912,9 +914,9 @@ class ProbeRuntime:
         call_seq: int,
         elapsed_ms: float,
         started_at: str,
-        probe_id: str,
+        check_id: str,
         site: str,
-        probe_type: ProbeType,
+        check_type: MannersType,
         file_line: str,
         checks: tuple[str, ...],
         payload_json: str,
@@ -936,16 +938,16 @@ class ProbeRuntime:
                         call_seq=call_seq,
                         elapsed_ms=elapsed_ms,
                         started_at=started_at,
-                        probe_id=probe_id,
+                        check_id=check_id,
                         site=site,
-                        probe_type=probe_type,
+                        check_type=check_type,
                         file_line=file_line,
                         checks=checks,
                         payload_json=payload_json,
                         caller_frame=None,
                         stack_excerpt=captured_stack,
                     )
-                except ProbeHaltError:
+                except MannersHaltError:
                     pass
                 finally:
                     self._soak_slots.release()
@@ -966,9 +968,9 @@ class ProbeRuntime:
                 call_seq=call_seq,
                 elapsed_ms=elapsed_ms,
                 started_at=started_at,
-                probe_id=probe_id,
+                check_id=check_id,
                 site=site,
-                probe_type=probe_type,
+                check_type=check_type,
                 file_line=file_line,
                 checks=checks,
                 payload_json=payload_json,
@@ -982,12 +984,12 @@ class ProbeRuntime:
         self,
         *,
         call_seq: int,
-        probe_id: str,
+        check_id: str,
         file_line: str,
         summary: str,
         caller_frame: FrameType | None,
     ) -> bool:
-        halt_msg = f"[PROBE HALT] call #{call_seq:03d} {probe_id} ({file_line}): {summary}"
+        halt_msg = f"[MANNERS HALT] call #{call_seq:03d} {check_id} ({file_line}): {summary}"
         cur_thread = threading.current_thread()
         with self._state_lock:
             is_closed = self._closed
@@ -1018,7 +1020,7 @@ class ProbeRuntime:
         if use_pdb:
             pdb.Pdb().set_trace(caller_frame)
             return True
-        raise ProbeHaltError(halt_msg)
+        raise MannersHaltError(halt_msg)
 
     def close(self) -> None:
         """Drain pending evaluations, finalize run status, and close model clients and store on exit."""

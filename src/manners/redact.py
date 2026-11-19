@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, quote, quote_plus, unquote, urlparse
 
-from probe.config import RedactConfig, parse_dotenv_file
+from manners.config import RedactConfig, parse_dotenv_file
 
 REDACTED = "[REDACTED]"
 
@@ -622,7 +622,7 @@ def serialize_here_snapshot(
     max_items: int = 50,
     max_str_bytes: int = 4096,
 ) -> str:
-    """Serialize watched variables for probe.here(...) with redaction and size bounds."""
+    """Serialize watched variables for manners.here(...) with redaction and size bounds."""
     serialized_watched = _serialize_bounded(
         watched_vars,
         redactor,

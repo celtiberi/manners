@@ -11,22 +11,22 @@ import httpx
 import pytest
 from typer.testing import CliRunner
 
-from probe import ProbeHaltError, probe, reset_for_testing
-from probe.backends import DecisionBackend
-from probe.check import run_probe_check
-from probe.cli import app
-from probe.config import (
+from manners import MannersHaltError, manners, reset_for_testing
+from manners.backends import DecisionBackend
+from manners.check import run_manners_check
+from manners.cli import app
+from manners.config import (
     CheckConfig,
+    MannersConfig,
     ModelEndpointConfig,
-    ProbeConfig,
     RuntimeConfig,
     _parse_dotenv_key,
     load_config,
 )
-from probe.store import ProbeStore
+from manners.store import MannersStore
 
-PROBE_ROOT = Path(__file__).resolve().parents[1]
-PROBE_DOTENV = PROBE_ROOT / ".env"
+MANNERS_ROOT = Path(__file__).resolve().parents[1]
+MANNERS_DOTENV = MANNERS_ROOT / ".env"
 
 pytestmark = pytest.mark.live
 
@@ -35,10 +35,10 @@ def _resolve_live_keys() -> tuple[str, str, str]:
     ts = os.environ.get("TYPESAFE_API_KEY", "").strip()
     ds = os.environ.get("DEEPSEEK_API_KEY", "").strip()
     gm = os.environ.get("GEMINI_API_KEY", "").strip()
-    if PROBE_DOTENV.is_file():
-        ts = ts or _parse_dotenv_key(PROBE_DOTENV, "TYPESAFE_API_KEY")
-        ds = ds or _parse_dotenv_key(PROBE_DOTENV, "DEEPSEEK_API_KEY")
-        gm = gm or _parse_dotenv_key(PROBE_DOTENV, "GEMINI_API_KEY")
+    if MANNERS_DOTENV.is_file():
+        ts = ts or _parse_dotenv_key(MANNERS_DOTENV, "TYPESAFE_API_KEY")
+        ds = ds or _parse_dotenv_key(MANNERS_DOTENV, "DEEPSEEK_API_KEY")
+        gm = gm or _parse_dotenv_key(MANNERS_DOTENV, "GEMINI_API_KEY")
     return ts, ds, gm
 
 
@@ -92,10 +92,10 @@ def _has_local_qwen() -> bool:
     return _LOCAL_QWEN_CACHE
 
 
-def _seed_live_project_config(tmp_path: Path, *, skip_lock_require: bool = False) -> ProbeConfig:
+def _seed_live_project_config(tmp_path: Path, *, skip_lock_require: bool = False) -> MannersConfig:
     env_lines = [
         f"TYPESAFE_API_KEY={_TYPESAFE_KEY}",
-        "SAMPLE_APP_SECRET=sk_live_probe_secret_987654321",
+        "SAMPLE_APP_SECRET=sk_live_manners_secret_987654321",
     ]
     use_deepseek = _deepseek_has_balance()
     if use_deepseek and _DEEPSEEK_KEY:
@@ -105,7 +105,7 @@ def _seed_live_project_config(tmp_path: Path, *, skip_lock_require: bool = False
     (tmp_path / ".env").write_text("\n".join(env_lines) + "\n", encoding="utf-8")
 
     (tmp_path / "pyproject.toml").write_text(
-        "[project]\nname = 'live-probe-check'\nversion = '0.1.0'\n",
+        "[project]\nname = 'live-manners-check'\nversion = '0.1.0'\n",
         encoding="utf-8",
     )
     cfg = load_config(cwd=tmp_path)
@@ -123,18 +123,18 @@ def _seed_live_project_config(tmp_path: Path, *, skip_lock_require: bool = False
 
     cfg.check = CheckConfig(require_check=not skip_lock_require)
     cfg.runtime = RuntimeConfig(
-        runs_dir=str(tmp_path / ".probes" / "runs"),
-        lock_path=str(tmp_path / ".probes" / "lock.json"),
+        runs_dir=str(tmp_path / ".manners" / "runs"),
+        lock_path=str(tmp_path / ".manners" / "lock.json"),
     )
     return cfg
 
 
 @pytest.mark.skipif(
     not _HAS_LIVE_KEYS,
-    reason="Requires TYPESAFE_API_KEY and (DEEPSEEK_API_KEY or GEMINI_API_KEY) in env or probe/.env",
+    reason="Requires TYPESAFE_API_KEY and (DEEPSEEK_API_KEY or GEMINI_API_KEY) in env or .env",
 )
 def test_live_typesafe_jev_spanish_tutor_checks(tmp_path: Path, monkeypatch) -> None:
-    monkeypatch.setenv("PROBE_CONFIG", str(tmp_path / "no_user_config.toml"))
+    monkeypatch.setenv("MANNERS_CONFIG", str(tmp_path / "no_user_config.toml"))
     monkeypatch.delenv("TYPESAFE_API_KEY", raising=False)
     monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
     (tmp_path / ".env").write_text(f"TYPESAFE_API_KEY={_TYPESAFE_KEY}\n", encoding="utf-8")
@@ -164,7 +164,7 @@ def test_live_typesafe_jev_spanish_tutor_checks(tmp_path: Path, monkeypatch) -> 
             }
         )
         good_scores = backend.evaluate_checks(
-            probe_id="tutor.opening_turn",
+            check_id="tutor.opening_turn",
             checks=spec_checks,
             snapshot_json=good_snapshot,
         )
@@ -180,7 +180,7 @@ def test_live_typesafe_jev_spanish_tutor_checks(tmp_path: Path, monkeypatch) -> 
             }
         )
         spoiler_scores = backend.evaluate_checks(
-            probe_id="tutor.opening_turn",
+            check_id="tutor.opening_turn",
             checks=spec_checks,
             snapshot_json=spoiler_snapshot,
         )
@@ -191,12 +191,12 @@ def test_live_typesafe_jev_spanish_tutor_checks(tmp_path: Path, monkeypatch) -> 
 
 @pytest.mark.skipif(
     not _HAS_LIVE_KEYS,
-    reason="Requires TYPESAFE_API_KEY and (DEEPSEEK_API_KEY or GEMINI_API_KEY) in env or probe/.env",
+    reason="Requires TYPESAFE_API_KEY and (DEEPSEEK_API_KEY or GEMINI_API_KEY) in env or .env",
 )
-def test_live_probe_check_gates_reject_math_and_calibrate_semantic_probe(
+def test_live_manners_check_gates_reject_math_and_calibrate_semantic_check(
     tmp_path: Path, monkeypatch
 ) -> None:
-    monkeypatch.setenv("PROBE_CONFIG", str(tmp_path / "no_user_config.toml"))
+    monkeypatch.setenv("MANNERS_CONFIG", str(tmp_path / "no_user_config.toml"))
     monkeypatch.delenv("TYPESAFE_API_KEY", raising=False)
     monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
     monkeypatch.delenv("GEMINI_API_KEY", raising=False)
@@ -210,9 +210,9 @@ def test_live_probe_check_gates_reject_math_and_calibrate_semantic_probe(
     target_file.write_text(
         textwrap.dedent(
             """
-            from probe import probe
+            from manners import manners
 
-            @probe("Return value equals a + b", id="math.add")
+            @manners("Return value equals a + b", id="math.add")
             def add(a: int, b: int) -> int:
                 return a + b
             """
@@ -221,7 +221,7 @@ def test_live_probe_check_gates_reject_math_and_calibrate_semantic_probe(
         encoding="utf-8",
     )
 
-    ok_bad, res_bad = run_probe_check([target_file], config=cfg)
+    ok_bad, res_bad = run_manners_check([target_file], config=cfg)
     assert ok_bad is False
     assert len(res_bad) == 1
     assert res_bad[0].status == "failed"
@@ -230,9 +230,9 @@ def test_live_probe_check_gates_reject_math_and_calibrate_semantic_probe(
     target_file.write_text(
         textwrap.dedent(
             """
-            from probe import probe
+            from manners import manners
 
-            @probe(
+            @manners(
                 [
                     "Tutor opens with a short Spanish greeting or phrase",
                     "Tutor gives brief instructions without spoiling the exact target Spanish sentence",
@@ -248,7 +248,7 @@ def test_live_probe_check_gates_reject_math_and_calibrate_semantic_probe(
         encoding="utf-8",
     )
 
-    ok_good, res_good = run_probe_check([target_file], config=cfg)
+    ok_good, res_good = run_manners_check([target_file], config=cfg)
     assert ok_good is True, f"Live check calibration failed: {res_good}"
     assert res_good[0].status == "passed"
     assert cfg.resolve_lock_path().is_file()
@@ -256,15 +256,15 @@ def test_live_probe_check_gates_reject_math_and_calibrate_semantic_probe(
 
 @pytest.mark.skipif(
     not _HAS_LIVE_KEYS,
-    reason="Requires TYPESAFE_API_KEY and (DEEPSEEK_API_KEY or GEMINI_API_KEY) in env or probe/.env",
+    reason="Requires TYPESAFE_API_KEY and (DEEPSEEK_API_KEY or GEMINI_API_KEY) in env or .env",
 )
 def test_live_runtime_decision_text_redaction_and_cli_report(
     tmp_path: Path, monkeypatch
 ) -> None:
-    monkeypatch.setenv("PROBE_CONFIG", str(tmp_path / "no_user_config.toml"))
-    monkeypatch.setenv("PROBES", "1")
-    monkeypatch.setenv("PROBE_NO_PDB", "1")
-    monkeypatch.setenv("PROBE_SKIP_LOCK", "1")
+    monkeypatch.setenv("MANNERS_CONFIG", str(tmp_path / "no_user_config.toml"))
+    monkeypatch.setenv("MANNERS", "1")
+    monkeypatch.setenv("MANNERS_NO_PDB", "1")
+    monkeypatch.setenv("MANNERS_SKIP_LOCK", "1")
     monkeypatch.delenv("TYPESAFE_API_KEY", raising=False)
     monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
     monkeypatch.delenv("GEMINI_API_KEY", raising=False)
@@ -273,49 +273,49 @@ def test_live_runtime_decision_text_redaction_and_cli_report(
     cfg = _seed_live_project_config(tmp_path, skip_lock_require=True)
     reset_for_testing(config=cfg)
 
-    @probe(
+    @manners(
         [
             "Output includes a Spanish greeting",
             "Output invites the student to respond in Spanish",
         ],
         id="tutor.live_turn",
-        kind=probe.type.decision,
+        kind=manners.type.decision,
     )
     def live_tutor_turn(student: str, debug_secret: str) -> str:
         return "¡Hola! Today let's practice ordering breakfast. How would you ask for eggs in Spanish?"
 
     try:
-        out = live_tutor_turn("Sam", "sk_live_probe_secret_987654321")
+        out = live_tutor_turn("Sam", "sk_live_manners_secret_987654321")
         assert "¡Hola!" in out
 
-        probe.here(
+        manners.here(
             [
                 "Draft answer matches the price stated in retrieved_chunks without inventing numbers",
             ],
             id="rag.live_draft",
-            kind=probe.type.text,
+            kind=manners.type.text,
             retrieved_chunks=["Menu note: Espresso at Cafe Sol costs $3.75."],
             draft="Espresso at Cafe Sol costs $3.75.",
         )
 
-        @probe(
+        @manners(
             [
                 "Tutor avoids giving the student the exact full Spanish sentence verbatim",
             ],
             id="tutor.live_fail",
-            kind=probe.type.decision,
+            kind=manners.type.decision,
         )
         def live_spoiler_turn(topic: str) -> str:
             return "Say this exact sentence in Spanish verbatim: Quiero un café con leche por favor."
 
-        with pytest.raises(ProbeHaltError):
+        with pytest.raises(MannersHaltError):
             live_spoiler_turn("coffee")
     finally:
-        rt = probe.flush_for_testing()
+        rt = manners.flush_for_testing()
         reset_for_testing()
 
     assert rt is not None
-    store = ProbeStore(cfg.resolve_runs_dir(), create=False)
+    store = MannersStore(cfg.resolve_runs_dir(), create=False)
     try:
         run = store.get_run(rt.run_id)
         events = store.list_events(rt.run_id)
@@ -330,7 +330,7 @@ def test_live_runtime_decision_text_redaction_and_cli_report(
 
     # Redaction check: secret value collected from .env must never appear in persisted snapshot.
     assert "[REDACTED]" in events[0].payload_json
-    assert "sk_live_probe_secret_987654321" not in events[0].payload_json
+    assert "sk_live_manners_secret_987654321" not in events[0].payload_json
     assert (_TYPESAFE_KEY not in events[0].payload_json), "API key leaked into snapshot"
     if _DEEPSEEK_KEY:
         assert (_DEEPSEEK_KEY not in events[0].payload_json), "API key leaked into snapshot"
@@ -357,15 +357,15 @@ def test_live_runtime_decision_text_redaction_and_cli_report(
 
 @pytest.mark.skipif(
     not _TYPESAFE_KEY,
-    reason="Requires TYPESAFE_API_KEY in env or probe/.env",
+    reason="Requires TYPESAFE_API_KEY in env or .env",
 )
 def test_live_jev_decision_with_local_qwen_text_pipeline(tmp_path: Path, monkeypatch) -> None:
     if not _has_local_qwen():
         pytest.skip("Requires local Ollama at http://127.0.0.1:11434 with qwen3.5:9b")
-    monkeypatch.setenv("PROBE_CONFIG", str(tmp_path / "no_user_config.toml"))
-    monkeypatch.setenv("PROBES", "1")
-    monkeypatch.setenv("PROBE_NO_PDB", "1")
-    monkeypatch.setenv("PROBE_SKIP_LOCK", "1")
+    monkeypatch.setenv("MANNERS_CONFIG", str(tmp_path / "no_user_config.toml"))
+    monkeypatch.setenv("MANNERS", "1")
+    monkeypatch.setenv("MANNERS_NO_PDB", "1")
+    monkeypatch.setenv("MANNERS_SKIP_LOCK", "1")
     monkeypatch.delenv("TYPESAFE_API_KEY", raising=False)
     monkeypatch.chdir(tmp_path)
 
@@ -391,11 +391,12 @@ def test_live_jev_decision_with_local_qwen_text_pipeline(tmp_path: Path, monkeyp
     )
     cfg.check = CheckConfig(require_check=False)
     cfg.runtime = RuntimeConfig(
-        runs_dir=str(tmp_path / ".probes" / "runs"),
-        lock_path=str(tmp_path / ".probes" / "lock.json"),
+        runs_dir=str(tmp_path / ".manners" / "runs"),
+        lock_path=str(tmp_path / ".manners" / "lock.json"),
     )
 
-    # 1. Pre-run check: Gate 2 rejects deterministic math & mixed lists; Gates 2-3 pass semantic @probe + probe.here.
+    # 1. Pre-run check: Gate 2 rejects deterministic math & mixed lists;
+    #    Gates 2-3 pass semantic @manners + manners.here.
     src_dir = tmp_path / "app"
     src_dir.mkdir(parents=True)
     (src_dir / "__init__.py").write_text("", encoding="utf-8")
@@ -404,9 +405,9 @@ def test_live_jev_decision_with_local_qwen_text_pipeline(tmp_path: Path, monkeyp
     target.write_text(
         textwrap.dedent(
             """
-            from probe import probe
+            from manners import manners
 
-            @probe("Return value equals a + b", id="math.add")
+            @manners("Return value equals a + b", id="math.add")
             def add(a: int, b: int) -> int:
                 return a + b
             """
@@ -414,16 +415,16 @@ def test_live_jev_decision_with_local_qwen_text_pipeline(tmp_path: Path, monkeyp
         + "\n",
         encoding="utf-8",
     )
-    ok_math, res_math = run_probe_check([target], config=cfg)
+    ok_math, res_math = run_manners_check([target], config=cfg)
     assert ok_math is False
     assert res_math[0].gate == "gate2"
 
     target.write_text(
         textwrap.dedent(
             """
-            from probe import probe
+            from manners import manners
 
-            @probe(["Summary captures key risks from filing", "len(output) > 0"], id="summary.mixed")
+            @manners(["Summary captures key risks from filing", "len(output) > 0"], id="summary.mixed")
             def summarize(filing: str) -> str:
                 return filing
             """
@@ -431,16 +432,16 @@ def test_live_jev_decision_with_local_qwen_text_pipeline(tmp_path: Path, monkeyp
         + "\n",
         encoding="utf-8",
     )
-    ok_mixed, res_mixed = run_probe_check([target], config=cfg)
+    ok_mixed, res_mixed = run_manners_check([target], config=cfg)
     assert ok_mixed is False
     assert res_mixed[0].gate == "gate2"
 
     target.write_text(
         textwrap.dedent(
             """
-            from probe import probe
+            from manners import manners
 
-            @probe(
+            @manners(
                 [
                     "Tutor opens with a short Spanish greeting or phrase",
                     "Tutor prompts student to respond in Spanish without spoiling the exact sentence",
@@ -454,10 +455,10 @@ def test_live_jev_decision_with_local_qwen_text_pipeline(tmp_path: Path, monkeyp
 
             def check_policy_draft(draft: str) -> str:
                 \"\"\"Verify policy draft stays aligned with source exclusion rules.\"\"\"
-                probe.here(
+                manners.here(
                     "Draft stays faithful to source_rule without flipping exclusions",
                     id="rag.draft",
-                    kind=probe.type.text,
+                    kind=manners.type.text,
                     source_rule="Tier B is excluded",
                     draft=draft,
                 )
@@ -467,7 +468,7 @@ def test_live_jev_decision_with_local_qwen_text_pipeline(tmp_path: Path, monkeyp
         + "\n",
         encoding="utf-8",
     )
-    ok_sem, res_sem = run_probe_check([target], config=cfg)
+    ok_sem, res_sem = run_manners_check([target], config=cfg)
     assert ok_sem is True, f"Jev + local qwen3.5:9b calibration failed: {res_sem}"
     assert [r.status for r in res_sem] == ["passed", "passed"]
     assert cfg.resolve_lock_path().is_file()
@@ -475,13 +476,13 @@ def test_live_jev_decision_with_local_qwen_text_pipeline(tmp_path: Path, monkeyp
     # 2. Live runtime: decision pass, text pipeline pass, and decision spoiler halt with Qwen explanation.
     reset_for_testing(config=cfg)
 
-    @probe(
+    @manners(
         [
             "Output opens with a short Spanish greeting",
             "Output asks the student to order in Spanish",
         ],
         id="tutor.local_pass",
-        kind=probe.type.decision,
+        kind=manners.type.decision,
     )
     def local_good_turn(topic: str) -> str:
         return (
@@ -492,30 +493,30 @@ def test_live_jev_decision_with_local_qwen_text_pipeline(tmp_path: Path, monkeyp
     try:
         assert "¡Hola!" in local_good_turn("breakfast")
 
-        probe.here(
+        manners.here(
             ["Draft states that tier B is excluded instead of saying tier B qualifies"],
             id="rag.local_draft",
-            kind=probe.type.text,
+            kind=manners.type.text,
             retrieved_chunks=["Policy rule: Tier A qualifies for reimbursement; Tier B is excluded."],
             draft="Tier B is excluded from reimbursement under this policy.",
         )
 
-        @probe(
+        @manners(
             ["Tutor does NOT give away the exact complete Spanish sentence for the student to say"],
             id="tutor.local_fail",
-            kind=probe.type.decision,
+            kind=manners.type.decision,
         )
         def local_bad_turn(topic: str) -> str:
             return "¡Hola! Say this exact Spanish sentence verbatim: Quiero un café con leche por favor."
 
-        with pytest.raises(ProbeHaltError):
+        with pytest.raises(MannersHaltError):
             local_bad_turn("coffee")
     finally:
-        rt = probe.flush_for_testing()
+        rt = manners.flush_for_testing()
         reset_for_testing()
 
     assert rt is not None
-    store = ProbeStore(cfg.resolve_runs_dir(), create=False)
+    store = MannersStore(cfg.resolve_runs_dir(), create=False)
     try:
         run = store.get_run(rt.run_id)
         events = store.list_events(rt.run_id)

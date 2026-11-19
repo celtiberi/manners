@@ -1,4 +1,4 @@
-"""Tests for stackable probe.enabled()/disabled() and the built-in pytest11 plugin."""
+"""Tests for stackable manners.enabled()/disabled() and the built-in pytest11 plugin."""
 
 from __future__ import annotations
 
@@ -14,44 +14,44 @@ from pathlib import Path
 
 import pytest
 
-import probe
-from probe.config import clear_env_cache, is_probes_enabled
+import manners
+from manners.config import clear_env_cache, is_manners_enabled
 
 
 def test_stackable_enabled_and_disabled_scopes(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.chdir(tmp_path)
-    monkeypatch.delenv("PROBES", raising=False)
+    monkeypatch.delenv("MANNERS", raising=False)
     clear_env_cache()
 
-    assert is_probes_enabled(tmp_path) is False
+    assert is_manners_enabled(tmp_path) is False
 
     # Process-wide stack: enabled() -> disabled() -> enabled() works across ThreadPoolExecutor workers.
     def worker_check(_idx: int) -> bool:
-        return is_probes_enabled(tmp_path)
+        return is_manners_enabled(tmp_path)
 
-    with probe.enabled():
+    with manners.enabled():
         with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
             assert list(pool.map(worker_check, [1, 2])) == [True, True]
-        with probe.disabled():
+        with manners.disabled():
             with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
                 assert list(pool.map(worker_check, [1, 2])) == [False, False]
-            with probe.enabled():
+            with manners.enabled():
                 with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
                     assert list(pool.map(worker_check, [1, 2])) == [True, True]
-            assert is_probes_enabled(tmp_path) is False
-        assert is_probes_enabled(tmp_path) is True
-    assert is_probes_enabled(tmp_path) is False
+            assert is_manners_enabled(tmp_path) is False
+        assert is_manners_enabled(tmp_path) is True
+    assert is_manners_enabled(tmp_path) is False
 
     # Context scope stays local to current context without changing worker threads.
-    with probe.enabled(scope="context"):
-        assert is_probes_enabled(tmp_path) is True
-        with probe.disabled(scope="context"):
-            assert is_probes_enabled(tmp_path) is False
-        assert is_probes_enabled(tmp_path) is True
-    assert is_probes_enabled(tmp_path) is False
+    with manners.enabled(scope="context"):
+        assert is_manners_enabled(tmp_path) is True
+        with manners.disabled(scope="context"):
+            assert is_manners_enabled(tmp_path) is False
+        assert is_manners_enabled(tmp_path) is True
+    assert is_manners_enabled(tmp_path) is False
 
     with pytest.raises(ValueError, match="Invalid enabled scope"):
-        with probe.enabled(scope="bogus"):
+        with manners.enabled(scope="bogus"):
             pass
 
 
@@ -89,7 +89,7 @@ def test_pytest_plugin_markers_flags_and_daemon_thread_halt(tmp_path: Path) -> N
     try:
         proj = tmp_path / "proj"
         proj.mkdir()
-        (proj / ".env").write_text("PROBES=1\nPROBE_NO_PDB=1\n", encoding="utf-8")
+        (proj / ".env").write_text("MANNERS=1\nMANNERS_NO_PDB=1\n", encoding="utf-8")
         (proj / "pyproject.toml").write_text(
             textwrap.dedent(
                 f"""
@@ -98,17 +98,17 @@ def test_pytest_plugin_markers_flags_and_daemon_thread_halt(tmp_path: Path) -> N
                 version = "0.1.0"
 
                 [tool.pytest.ini_options]
-                addopts = "--no-probes"
+                addopts = "--no-manners"
 
-                [tool.probe.models.decision]
+                [tool.manners.models.decision]
                 provider = "http_decision"
                 url = "http://127.0.0.1:{port}/decision"
                 model = "jev"
 
-                [tool.probe.text]
+                [tool.manners.text]
                 explain_decision_failures = false
 
-                [tool.probe.check]
+                [tool.manners.check]
                 require_check = false
                 """
             ).strip()
@@ -121,31 +121,31 @@ def test_pytest_plugin_markers_flags_and_daemon_thread_halt(tmp_path: Path) -> N
                 import threading
                 import time
                 import pytest
-                from probe import probe
+                from manners import manners
 
 
-                def test_mocked_unit_skips_under_no_probes():
-                    probe.here("Output is GOOD", id="sub.unit", reply="BAD canned stub")
+                def test_mocked_unit_skips_under_no_manners():
+                    manners.here("Output is GOOD", id="sub.unit", reply="BAD canned stub")
 
 
-                @pytest.mark.probes
-                def test_probed_marker_overrides_no_probes():
-                    probe.here("Output is GOOD", id="sub.live_ok", reply="GOOD verified reply")
+                @pytest.mark.manners
+                def test_manners_marker_overrides_no_manners():
+                    manners.here("Output is GOOD", id="sub.live_ok", reply="GOOD verified reply")
 
 
-                @pytest.mark.no_probes
-                def test_no_probes_marker_wins_over_cli_flag():
-                    probe.here("Output is GOOD", id="sub.no_probes", reply="BAD canned stub")
+                @pytest.mark.no_manners
+                def test_no_manners_marker_wins_over_cli_flag():
+                    manners.here("Output is GOOD", id="sub.no_manners", reply="BAD canned stub")
 
 
-                @pytest.mark.probes
+                @pytest.mark.manners
                 def test_daemon_thread_halt_fails_test():
                     in_call = threading.Event()
 
                     def bg() -> None:
                         in_call.set()
                         time.sleep(0.02)
-                        probe.here("Output is GOOD", id="sub.daemon_bad", reply="BAD async failure")
+                        manners.here("Output is GOOD", id="sub.daemon_bad", reply="BAD async failure")
 
                     t = threading.Thread(target=bg, daemon=True)
                     t.start()
@@ -155,18 +155,18 @@ def test_pytest_plugin_markers_flags_and_daemon_thread_halt(tmp_path: Path) -> N
 
                 @pytest.fixture
                 def mocked_setup_teardown_fixture():
-                    probe.here("Output is GOOD", id="sub.fix_setup", reply="BAD setup stub")
+                    manners.here("Output is GOOD", id="sub.fix_setup", reply="BAD setup stub")
                     yield "ok"
-                    probe.here("Output is GOOD", id="sub.fix_teardown", reply="BAD teardown stub")
+                    manners.here("Output is GOOD", id="sub.fix_teardown", reply="BAD teardown stub")
 
 
-                def test_fixture_setup_and_teardown_skip_under_no_probes(mocked_setup_teardown_fixture):
+                def test_fixture_setup_and_teardown_skip_under_no_manners(mocked_setup_teardown_fixture):
                     assert mocked_setup_teardown_fixture == "ok"
 
 
                 @pytest.fixture
                 def failing_setup_fixture():
-                    probe.here("Output is GOOD", id="sub.shared_fix", reply="BAD shared setup")
+                    manners.here("Output is GOOD", id="sub.shared_fix", reply="BAD shared setup")
                     return "never"
 
 
@@ -178,24 +178,25 @@ def test_pytest_plugin_markers_flags_and_daemon_thread_halt(tmp_path: Path) -> N
                     assert failing_setup_fixture == "never"
 
 
-                @pytest.mark.probes(force=True)
-                def test_forced_probes_marker_runs_even_without_env():
-                    probe.here("Output is GOOD", id="sub.forced_mark", reply="GOOD forced")
+                @pytest.mark.manners(force=True)
+                def test_forced_manners_marker_runs_even_without_env():
+                    manners.here("Output is GOOD", id="sub.forced_mark", reply="GOOD forced")
                 """
             ).strip()
             + "\n",
             encoding="utf-8",
         )
 
-        # 1. Under addopts="--no-probes": unmarked + fixture setup/teardown skip HTTP; @pytest.mark.probes runs.
+        # 1. Under addopts="--no-manners": unmarked + fixture setup/teardown skip HTTP; @pytest.mark.manners runs.
         res_ok = subprocess.run(
             [
                 sys.executable,
                 "-m",
                 "pytest",
                 "-k",
-                "test_mocked_unit_skips_under_no_probes or test_probed_marker_overrides_no_probes "
-                "or test_no_probes_marker_wins_over_cli_flag or test_fixture_setup_and_teardown_skip_under_no_probes",
+                "test_mocked_unit_skips_under_no_manners or test_manners_marker_overrides_no_manners "
+                "or test_no_manners_marker_wins_over_cli_flag "
+                "or test_fixture_setup_and_teardown_skip_under_no_manners",
                 "-q",
             ],
             cwd=proj,
@@ -207,16 +208,16 @@ def test_pytest_plugin_markers_flags_and_daemon_thread_halt(tmp_path: Path) -> N
         assert len(seen_snapshots) == 1
         assert "GOOD verified reply" in seen_snapshots[0]
 
-        # 2. Passing --probes overrides addopts="--no-probes", while @pytest.mark.no_probes still wins!
+        # 2. Passing --manners overrides addopts="--no-manners", while @pytest.mark.no_manners still wins!
         seen_snapshots.clear()
         res_cli = subprocess.run(
             [
                 sys.executable,
                 "-m",
                 "pytest",
-                "--probes",
+                "--manners",
                 "-k",
-                "test_mocked_unit_skips_under_no_probes or test_no_probes_marker_wins_over_cli_flag",
+                "test_mocked_unit_skips_under_no_manners or test_no_manners_marker_wins_over_cli_flag",
                 "-q",
             ],
             cwd=proj,
@@ -227,9 +228,9 @@ def test_pytest_plugin_markers_flags_and_daemon_thread_halt(tmp_path: Path) -> N
         assert res_cli.returncode == 1
         assert len(seen_snapshots) == 1
         assert "sub.unit" in res_cli.stdout + res_cli.stderr
-        assert "sub.no_probes" not in res_cli.stdout + res_cli.stderr
+        assert "sub.no_manners" not in res_cli.stdout + res_cli.stderr
 
-        # 3. Unjoined daemon thread ProbeHaltError fails with zero Pluggy/Thread warnings even when treated as errors.
+        # 3. Unjoined daemon thread MannersHaltError fails with zero Pluggy/Thread warnings even when treated as errors.
         seen_snapshots.clear()
         bad_request_seen.clear()
         res_daemon = subprocess.run(
@@ -256,10 +257,11 @@ def test_pytest_plugin_markers_flags_and_daemon_thread_halt(tmp_path: Path) -> N
         assert "PluggyTeardownRaisedWarning" not in combined
         assert "PytestUnhandledThreadExceptionWarning" not in combined
 
-        # 4. Shared fixture failing with ProbeHaltError during setup cleanly fails both tests without _finalizers crash.
+        # 4. Shared fixture failing with MannersHaltError during setup cleanly fails both tests
+        #    without _finalizers crash.
         seen_snapshots.clear()
         res_shared = subprocess.run(
-            [sys.executable, "-m", "pytest", "--probes", "-k", "test_shared_failing_fixture_", "-q"],
+            [sys.executable, "-m", "pytest", "--manners", "-k", "test_shared_failing_fixture_", "-q"],
             cwd=proj,
             capture_output=True,
             text=True,
@@ -270,11 +272,11 @@ def test_pytest_plugin_markers_flags_and_daemon_thread_halt(tmp_path: Path) -> N
         assert "2 errors" in shared_out
         assert "_finalizers" not in shared_out
 
-        # 5. Explicit PROBES=0 in env suppresses @pytest.mark.probes (honors env override cleanly).
+        # 5. Explicit MANNERS=0 in env suppresses @pytest.mark.manners (honors env override cleanly).
         seen_snapshots.clear()
-        env_off = {**os.environ, "PROBES": "0"}
+        env_off = {**os.environ, "MANNERS": "0"}
         res_env_off = subprocess.run(
-            [sys.executable, "-m", "pytest", "-k", "test_probed_marker_overrides_no_probes", "-q"],
+            [sys.executable, "-m", "pytest", "-k", "test_manners_marker_overrides_no_manners", "-q"],
             cwd=proj,
             env=env_off,
             capture_output=True,
@@ -284,12 +286,13 @@ def test_pytest_plugin_markers_flags_and_daemon_thread_halt(tmp_path: Path) -> N
         assert res_env_off.returncode == 0, res_env_off.stdout + res_env_off.stderr
         assert seen_snapshots == []
 
-        # 6. Keyless/offline CI (no .env, PROBES unset): @pytest.mark.probes skips; --probes and force=True still run.
+        # 6. Keyless/offline CI (no .env, MANNERS unset): @pytest.mark.manners skips;
+        #    --manners and force=True still run.
         (proj / ".env").unlink()
         seen_snapshots.clear()
-        env_ci = {k: v for k, v in os.environ.items() if k != "PROBES"}
+        env_ci = {k: v for k, v in os.environ.items() if k != "MANNERS"}
         res_ci = subprocess.run(
-            [sys.executable, "-m", "pytest", "-k", "test_probed_marker_overrides_no_probes", "-q"],
+            [sys.executable, "-m", "pytest", "-k", "test_manners_marker_overrides_no_manners", "-q"],
             cwd=proj,
             env=env_ci,
             capture_output=True,
@@ -300,7 +303,7 @@ def test_pytest_plugin_markers_flags_and_daemon_thread_halt(tmp_path: Path) -> N
         assert seen_snapshots == []
 
         res_forced = subprocess.run(
-            [sys.executable, "-m", "pytest", "-k", "test_forced_probes_marker_runs_even_without_env", "-q"],
+            [sys.executable, "-m", "pytest", "-k", "test_forced_manners_marker_runs_even_without_env", "-q"],
             cwd=proj,
             env=env_ci,
             capture_output=True,

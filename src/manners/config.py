@@ -20,9 +20,9 @@ _ULID_LOCK = threading.Lock()
 _LAST_MS = 0
 _LAST_RAND = 0
 
-_DEFAULT_USER_CONFIG_PATH = Path.home() / ".config" / "probe" / "config.toml"
+_DEFAULT_USER_CONFIG_PATH = Path.home() / ".config" / "manners" / "config.toml"
 _EXPORT_PREFIX_RE = re.compile(r"^export\s+")
-_OVERRIDE_CTX: ContextVar[bool | None] = ContextVar("probe_override", default=None)
+_OVERRIDE_CTX: ContextVar[bool | None] = ContextVar("manners_override", default=None)
 _DISABLED_LOCK = threading.Lock()
 _PROCESS_OVERRIDES: list[tuple[object, bool]] = []
 _TRUSTED_DEFAULT_HOSTS = frozenset(
@@ -180,7 +180,7 @@ _FALSE_VALUES = frozenset({"0", "false", "no", "off"})
 
 
 def push_process_override(enabled_state: bool) -> object:
-    """Push a process-wide probe enable/disable override (thread-safe across executors)."""
+    """Push a process-wide enable/disable override (thread-safe across executors)."""
     token = object()
     with _DISABLED_LOCK:
         _PROCESS_OVERRIDES.append((token, enabled_state))
@@ -243,30 +243,30 @@ def _read_env_flag(var_name: str, cwd: Path | None = None) -> str:
     return ""
 
 
-def is_probes_enabled(cwd: Path | None = None) -> bool:
-    """Return True when PROBES is enabled in os.environ or project .env (unless overridden)."""
+def is_manners_enabled(cwd: Path | None = None) -> bool:
+    """Return True when MANNERS is enabled in os.environ or project .env (unless overridden)."""
     ctx_val = _OVERRIDE_CTX.get()
     if ctx_val is not None:
         return ctx_val
     with _DISABLED_LOCK:
         if _PROCESS_OVERRIDES:
             return _PROCESS_OVERRIDES[-1][1]
-    return _read_env_flag("PROBES", cwd).lower() in _TRUE_VALUES
+    return _read_env_flag("MANNERS", cwd).lower() in _TRUE_VALUES
 
 
 def is_skip_lock(cwd: Path | None = None) -> bool:
-    """Return True when PROBE_SKIP_LOCK=1 bypasses .probes/lock.json checks."""
-    return _read_env_flag("PROBE_SKIP_LOCK", cwd).lower() in _TRUE_VALUES
+    """Return True when MANNERS_SKIP_LOCK=1 bypasses .manners/lock.json checks."""
+    return _read_env_flag("MANNERS_SKIP_LOCK", cwd).lower() in _TRUE_VALUES
 
 
 def is_no_pdb(cwd: Path | None = None) -> bool:
-    """Return True when PROBE_NO_PDB=1 disables interactive pdb halts."""
-    return _read_env_flag("PROBE_NO_PDB", cwd).lower() in _TRUE_VALUES
+    """Return True when MANNERS_NO_PDB=1 disables interactive pdb halts."""
+    return _read_env_flag("MANNERS_NO_PDB", cwd).lower() in _TRUE_VALUES
 
 
 def is_no_halt(cwd: Path | None = None) -> bool:
-    """Return True when PROBE_NO_HALT=1 keeps execution running after fail/error events."""
-    return _read_env_flag("PROBE_NO_HALT", cwd).lower() in _TRUE_VALUES
+    """Return True when MANNERS_NO_HALT=1 keeps execution running after fail/error events."""
+    return _read_env_flag("MANNERS_NO_HALT", cwd).lower() in _TRUE_VALUES
 
 
 @dataclass(slots=True)
@@ -337,7 +337,7 @@ class TextConfig:
 
 @dataclass(slots=True)
 class RateLimitConfig:
-    """Per-probe sliding-window and optional per-run call caps (-1 = unlimited)."""
+    """Per-check sliding-window and optional per-run call caps (-1 = unlimited)."""
 
     max_calls: int = 20
     window_seconds: float = 10.0
@@ -346,7 +346,7 @@ class RateLimitConfig:
 
 @dataclass(slots=True)
 class CheckConfig:
-    """Pre-run probe check budgets and lockfile enforcement."""
+    """Pre-run check budgets and lockfile enforcement."""
 
     max_checks: int = 12
     max_check_chars: int = 200
@@ -366,8 +366,8 @@ class RedactConfig:
 class RuntimeConfig:
     """Storage paths, snapshot caps, and strict API / halt handling."""
 
-    runs_dir: str = ".probes/runs"
-    lock_path: str = ".probes/lock.json"
+    runs_dir: str = ".manners/runs"
+    lock_path: str = ".manners/lock.json"
     strict_api: bool = True
     halt_on_fail: bool = True
     max_depth: int = 4
@@ -377,8 +377,8 @@ class RuntimeConfig:
 
 
 @dataclass(slots=True)
-class ProbeConfig:
-    """Top-level resolved configuration for probe."""
+class MannersConfig:
+    """Top-level resolved configuration for manners."""
 
     models_decision: ModelEndpointConfig = field(
         default_factory=lambda: ModelEndpointConfig(
@@ -415,10 +415,10 @@ class ProbeConfig:
 
 
 def _find_auto_project_root(start: Path | None = None) -> Path:
-    """Locate nearest directory with pyproject.toml, .probes, or .git; fallback to start."""
+    """Locate nearest directory with pyproject.toml, .manners, or .git; fallback to start."""
     cur = (start or Path.cwd()).resolve()
     for candidate in (cur, *cur.parents):
-        if (candidate / "pyproject.toml").is_file() or (candidate / ".probes").is_dir():
+        if (candidate / "pyproject.toml").is_file() or (candidate / ".manners").is_dir():
             return candidate
         if (candidate / ".git").exists():
             return candidate
@@ -455,7 +455,7 @@ def find_project_root(
     *,
     explicit_root: Path | None = None,
 ) -> Path:
-    """Resolve project root from explicit path, PROBE_PROJECT_ROOT, or nearest marker."""
+    """Resolve project root from explicit path, MANNERS_PROJECT_ROOT, or nearest marker."""
     if explicit_root is not None:
         p = Path(explicit_root).expanduser()
         resolved = p.resolve() if p.is_absolute() else (Path.cwd() / p).resolve()
@@ -463,8 +463,8 @@ def find_project_root(
             raise ValueError(f"Project root directory does not exist: {explicit_root}")
         return resolved
 
-    if "PROBE_PROJECT_ROOT" in os.environ:
-        raw_env = os.environ["PROBE_PROJECT_ROOT"].strip()
+    if "MANNERS_PROJECT_ROOT" in os.environ:
+        raw_env = os.environ["MANNERS_PROJECT_ROOT"].strip()
         if raw_env:
             p = Path(raw_env).expanduser()
             if p.is_absolute():
@@ -474,21 +474,21 @@ def find_project_root(
                 start_cand = (start.resolve() / p).resolve() if start is not None else cwd_cand
                 resolved = cwd_cand if cwd_cand.is_dir() or start is None else start_cand
             if not resolved.is_dir():
-                raise ValueError(f"PROBE_PROJECT_ROOT directory does not exist: {raw_env}")
+                raise ValueError(f"MANNERS_PROJECT_ROOT directory does not exist: {raw_env}")
             return resolved
         return _find_auto_project_root(start)
 
     cur = (start or Path.cwd()).resolve()
     auto_root = _find_auto_project_root(cur)
     for env_dir in find_env_search_dirs(auto_root):
-        raw_val = _read_dotenv_cached(env_dir / ".env", "PROBE_PROJECT_ROOT")
+        raw_val = _read_dotenv_cached(env_dir / ".env", "MANNERS_PROJECT_ROOT")
         if raw_val is not None:
             if not raw_val:
                 break
             p = Path(raw_val).expanduser()
             resolved = p.resolve() if p.is_absolute() else (env_dir / p).resolve()
             if not resolved.is_dir():
-                raise ValueError(f"PROBE_PROJECT_ROOT directory does not exist: {raw_val}")
+                raise ValueError(f"MANNERS_PROJECT_ROOT directory does not exist: {raw_val}")
             return resolved
     return auto_root
 
@@ -634,12 +634,12 @@ def _merge_endpoint_config(
                 proj_hostname
                 and proj_hostname not in trusted_hosts
                 and (ep.api_key or ep.api_key_env)
-                and os.environ.get("PROBE_TRUST_PROJECT_ENDPOINTS", "").strip().lower() not in _TRUE_VALUES
+                and os.environ.get("MANNERS_TRUST_PROJECT_ENDPOINTS", "").strip().lower() not in _TRUE_VALUES
             ):
                 raise ValueError(
                     f"Refusing to attach credentials (api_key/api_key_env) to project-defined "
                     f"endpoint host {proj_hostname!r} in pyproject.toml; configure it in "
-                    "~/.config/probe/config.toml or set PROBE_TRUST_PROJECT_ENDPOINTS=1."
+                    "~/.config/manners/config.toml or set MANNERS_TRUST_PROJECT_ENDPOINTS=1."
                 )
     return ep
 
@@ -669,14 +669,14 @@ def load_config(
     cwd: Path | None = None,
     config_path: Path | None = None,
     project_root: Path | None = None,
-) -> ProbeConfig:
-    """Load default config merged with ~/.config/probe/config.toml (or PROBE_CONFIG) and pyproject.toml."""
+) -> MannersConfig:
+    """Load default config merged with ~/.config/manners/config.toml (or MANNERS_CONFIG) and pyproject.toml."""
     work_dir = (cwd or Path.cwd()).resolve()
     resolved_root = find_project_root(work_dir, explicit_root=project_root)
-    cfg = ProbeConfig(project_root=resolved_root)
+    cfg = MannersConfig(project_root=resolved_root)
 
     raw_user: dict[str, Any] = {}
-    env_cfg = _read_env_flag("PROBE_CONFIG", resolved_root)
+    env_cfg = _read_env_flag("MANNERS_CONFIG", resolved_root)
     user_path = config_path or (Path(env_cfg).expanduser() if env_cfg else _DEFAULT_USER_CONFIG_PATH)
     if user_path.is_file():
         raw_user = _load_toml_file(user_path)
@@ -686,10 +686,10 @@ def load_config(
     pyproject = _find_pyproject(resolved_root)
     if pyproject is not None:
         parsed = _load_toml_file(pyproject)
-        tool_probe = parsed.get("tool", {}).get("probe")
-        if isinstance(tool_probe, dict):
-            _validate_top_level_keys(tool_probe, str(pyproject))
-            raw_proj = tool_probe
+        tool_manners = parsed.get("tool", {}).get("manners")
+        if isinstance(tool_manners, dict):
+            _validate_top_level_keys(tool_manners, str(pyproject))
+            raw_proj = tool_manners
 
     user_models = raw_user.get("models") if isinstance(raw_user.get("models"), dict) else {}
     proj_models = raw_proj.get("models") if isinstance(raw_proj.get("models"), dict) else {}

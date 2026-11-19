@@ -1,4 +1,4 @@
-"""Thread-safe per-run JSONL storage for probe runs and call-ordered events."""
+"""Thread-safe per-run JSONL storage for manners runs and call-ordered events."""
 
 from __future__ import annotations
 
@@ -13,15 +13,15 @@ from fnmatch import fnmatchcase
 from pathlib import Path
 from typing import Any
 
-from probe.backends import CheckScore
-from probe.config import utc_now_iso
+from manners.backends import CheckScore
+from manners.config import utc_now_iso
 
 _RUN_ID_RE = re.compile(r"[A-Za-z0-9._-]+")
 
 
 @dataclass(slots=True, frozen=True)
 class RunRecord:
-    """Summary metadata and verdict counts for a single probed process run."""
+    """Summary metadata and verdict counts for a single checked process run."""
 
     id: str
     started_at: str
@@ -35,20 +35,20 @@ class RunRecord:
     pass_count: int = 0
     fail_count: int = 0
     error_count: int = 0
-    active_probes: int = 0
+    active_checks: int = 0
 
 
 @dataclass(slots=True, frozen=True)
 class EventRecord:
-    """Single evaluated probe call ordered by call_seq."""
+    """Single evaluated manners call ordered by call_seq."""
 
     run_id: str
     call_seq: int
     elapsed_ms: float
     started_at: str
-    probe_id: str
+    check_id: str
     site: str
-    probe_type: str
+    check_type: str
     file_line: str
     checks: tuple[str, ...]
     payload_json: str
@@ -61,7 +61,7 @@ class EventRecord:
     latency_ms: float
 
 
-def _ensure_probes_gitignore(runs_dir: Path) -> None:
+def _ensure_manners_gitignore(runs_dir: Path) -> None:
     runs_dir.mkdir(parents=True, exist_ok=True)
     try:
         os.chmod(runs_dir, 0o700)
@@ -74,7 +74,7 @@ def _ensure_probes_gitignore(runs_dir: Path) -> None:
         except OSError:
             pass
     parent = runs_dir.parent
-    if parent.name == ".probes":
+    if parent.name == ".manners":
         gi = parent / ".gitignore"
         if not gi.exists():
             try:
@@ -101,9 +101,9 @@ def _parse_event_record(rec: dict[str, Any], default_run_id: str) -> EventRecord
         call_seq = int(rec["call_seq"])
         elapsed_ms = _finite_float(rec["elapsed_ms"])
         started_at = str(rec["started_at"])
-        probe_id = str(rec["probe_id"])
+        check_id = str(rec["check_id"])
         site = str(rec["site"])
-        probe_type = str(rec["probe_type"])
+        check_type = str(rec["check_type"])
         file_line = str(rec["file_line"])
         verdict = str(rec["verdict"])
         judged_at = str(rec.get("judged_at") or started_at)
@@ -142,9 +142,9 @@ def _parse_event_record(rec: dict[str, Any], default_run_id: str) -> EventRecord
         call_seq=call_seq,
         elapsed_ms=elapsed_ms,
         started_at=started_at,
-        probe_id=probe_id,
+        check_id=check_id,
         site=site,
-        probe_type=probe_type,
+        check_type=check_type,
         file_line=file_line,
         checks=checks,
         payload_json=payload_json,
@@ -255,7 +255,7 @@ def _read_run_file(path: Path) -> tuple[RunRecord | None, list[EventRecord]]:
     pass_count = sum(1 for e in events if e.verdict == "pass")
     fail_count = sum(1 for e in events if e.verdict == "fail")
     error_count = sum(1 for e in events if e.verdict == "error")
-    active_probes = len({e.probe_id for e in events})
+    active_checks = len({e.check_id for e in events})
 
     run = RunRecord(
         id=run_id,
@@ -270,19 +270,19 @@ def _read_run_file(path: Path) -> tuple[RunRecord | None, list[EventRecord]]:
         pass_count=pass_count,
         fail_count=fail_count,
         error_count=error_count,
-        active_probes=active_probes,
+        active_checks=active_checks,
     )
     return run, events
 
 
-class ProbeStore:
-    """Thread-safe per-run JSONL store backing .probes/runs/<run_id>.jsonl."""
+class MannersStore:
+    """Thread-safe per-run JSONL store backing .manners/runs/<run_id>.jsonl."""
 
     def __init__(self, runs_dir: Path | str, *, create: bool = True) -> None:
         self.runs_dir = Path(runs_dir)
         self._lock = threading.Lock()
         if create:
-            _ensure_probes_gitignore(self.runs_dir)
+            _ensure_manners_gitignore(self.runs_dir)
 
     def close(self) -> None:
         return None
@@ -377,9 +377,9 @@ class ProbeStore:
         call_seq: int,
         elapsed_ms: float,
         started_at: str,
-        probe_id: str,
+        check_id: str,
         site: str,
-        probe_type: str,
+        check_type: str,
         file_line: str,
         checks: Sequence[str],
         payload_json: str,
@@ -404,9 +404,9 @@ class ProbeStore:
             "call_seq": call_seq,
             "elapsed_ms": elapsed_ms,
             "started_at": started_at,
-            "probe_id": probe_id,
+            "check_id": check_id,
             "site": site,
-            "probe_type": probe_type,
+            "check_type": check_type,
             "file_line": file_line,
             "checks": list(checks),
             "payload": parsed_payload,
@@ -477,7 +477,7 @@ class ProbeStore:
         self,
         run_id: str,
         *,
-        probe_patterns: Sequence[str] | None = None,
+        check_patterns: Sequence[str] | None = None,
     ) -> list[EventRecord]:
         """Return events for a run sorted strictly by call_seq ASC."""
         try:
@@ -485,10 +485,10 @@ class ProbeStore:
         except ValueError:
             return []
         _, events = _read_run_file(path)
-        patterns = [p for p in (probe_patterns or ()) if p]
+        patterns = [p for p in (check_patterns or ()) if p]
         if not patterns:
             return events
-        return [e for e in events if any(fnmatchcase(e.probe_id, pat) for pat in patterns)]
+        return [e for e in events if any(fnmatchcase(e.check_id, pat) for pat in patterns)]
 
     def clean_runs(self, keep: int = 20) -> int:
         """Delete run logs older than the most recent `keep` runs."""

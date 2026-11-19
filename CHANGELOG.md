@@ -1,9 +1,18 @@
 # Changelog
 
-All notable changes to `probe` will be documented in this file.
+All notable changes to `manners` will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [0.7.0] - 2026-11-19
+
+### Changed
+- **Breaking:** Rebranded the package, repository (`celtiberi/manners`), and CLI from `probe` to `manners` for PyPI distribution (`pip install manners` / `uv add manners` / `uv tool install manners`).
+- **Breaking (Python API):** Imports and runtime entrypoints changed from `from probe import probe`, `@probe(...)`, `probe.here(...)`, `probe.type.*`, `ProbeHaltError`, `ProbeType`, `ProbeConfig`, `ProbeStore`, `discover_probes`, `run_probe_check`, `upsert_probe_fixture`, and `is_probes_enabled` to `from manners import manners`, `@manners(...)`, `manners.here(...)`, `manners.type.*`, `MannersHaltError`, `MannersType`, `MannersConfig`, `MannersStore`, `discover_manners`, `run_manners_check`, `upsert_manners_fixture`, and `is_manners_enabled`.
+- **Breaking (CLI, pytest, Config, & Paths):** Renamed the CLI binary to `manners`, pytest options/markers to `--manners` / `--no-manners` / `@pytest.mark.manners` / `@pytest.mark.no_manners`, environment variables to `MANNERS`, `MANNERS_SKIP_LOCK`, `MANNERS_NO_PDB`, `MANNERS_NO_HALT`, `MANNERS_PROJECT_ROOT`, `MANNERS_CONFIG`, and `MANNERS_TRUST_PROJECT_ENDPOINTS`, project/user config to `[tool.manners]` and `~/.config/manners/config.toml`, and artifact directory to `.manners/`.
+- **Breaking (JSONL / Lockfile / Decision Backend Keys):** Renamed serialized keys `probe_id` -> `check_id`, `probe_type` -> `check_type`, `active_probes` -> `active_checks`, the lockfile top-level `"probes"` map to `"manners"`, and JSONL error/halt prefixes to `MANNERS_MISUSE`, `MANNERS_TRUNCATED`, `UNCHECKED_MANNERS`, `[MANNERS HALT]`, `[MANNERS FAIL]`, and `[MANNERS ERROR]`.
+- Added `.github/workflows/publish.yml` for automated PyPI publishing via GitHub Actions Trusted Publishing (OIDC) on published releases.
 
 ## [0.6.2] - 2026-11-18
 

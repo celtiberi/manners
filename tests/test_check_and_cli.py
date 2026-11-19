@@ -1,4 +1,4 @@
-"""Tests for AST discovery, probe check Gates 1-3, lockfile caching, and all CLI commands."""
+"""Tests for AST discovery, manners check Gates 1-3, lockfile caching, and all CLI commands."""
 
 from __future__ import annotations
 
@@ -14,21 +14,27 @@ import httpx
 import pytest
 from typer.testing import CliRunner
 
-import probe
-from probe import ProbeHaltError
-from probe.backends import BackendError, CheckScore
-from probe.check import _load_manual_fixture, _sha256_text, _validate_gate3_snapshot, discover_probes, run_probe_check
-from probe.cli import app
-from probe.config import (
+import manners
+from manners import MannersHaltError
+from manners.backends import BackendError, CheckScore
+from manners.check import (
+    _load_manual_fixture,
+    _sha256_text,
+    _validate_gate3_snapshot,
+    discover_manners,
+    run_manners_check,
+)
+from manners.cli import app
+from manners.config import (
     CheckConfig,
     DecisionConfig,
+    MannersConfig,
     ModelEndpointConfig,
-    ProbeConfig,
     RuntimeConfig,
     TextConfig,
 )
-from probe.runtime import ProbeType, resolve_module_name
-from probe.store import ProbeStore
+from manners.runtime import MannersType, resolve_module_name
+from manners.store import MannersStore
 
 
 def _write_sample_project(root: Path) -> Path:
@@ -39,12 +45,12 @@ def _write_sample_project(root: Path) -> Path:
             name = "sample-app"
             version = "0.1.0"
 
-            [tool.probe.models.decision]
+            [tool.manners.models.decision]
             provider = "http_decision"
             url = "http://mock.local/decision"
             model = "local-decision"
 
-            [tool.probe.models.text]
+            [tool.manners.models.text]
             provider = "openai_compat"
             url = "http://mock.local/v1"
             model = "qwen3.5:9b"
@@ -60,9 +66,9 @@ def _write_sample_project(root: Path) -> Path:
     mod.write_text(
         textwrap.dedent(
             """
-            from probe import probe
+            from manners import manners
 
-            @probe(
+            @manners(
                 [
                     "Tutor opens with a short Spanish greeting",
                     "Tutor does NOT give away the target Spanish sentence",
@@ -70,10 +76,10 @@ def _write_sample_project(root: Path) -> Path:
                 id="tutor.opening_turn",
             )
             def generate_opening_turn(lesson: str) -> str:
-                probe.here(
+                manners.here(
                     "Draft stays grounded in lesson vocabulary",
                     id="tutor.draft",
-                    kind=probe.type.text,
+                    kind=manners.type.text,
                     lesson=lesson,
                     draft="Hola",
                 )
@@ -88,14 +94,14 @@ def _write_sample_project(root: Path) -> Path:
 
 def test_discover_and_gates_with_caching_and_fixtures(tmp_path: Path) -> None:
     _write_sample_project(tmp_path)
-    discovered = discover_probes(root=tmp_path)
-    assert [(d.probe_id, d.site, d.probe_type.value) for d in discovered] == [
+    discovered = discover_manners(root=tmp_path)
+    assert [(d.check_id, d.site, d.check_type.value) for d in discovered] == [
         ("tutor.opening_turn", "decorator", "decision"),
         ("tutor.draft", "here", "text"),
     ]
 
     # Add a manual fixture for tutor.draft so Gate 3 tests both fixture and synthetic paths.
-    fixtures_dir = tmp_path / ".probes" / "fixtures"
+    fixtures_dir = tmp_path / ".manners" / "fixtures"
     fixtures_dir.mkdir(parents=True)
     (fixtures_dir / "tutor.draft.json").write_text(
         json.dumps(
@@ -115,7 +121,7 @@ def test_discover_and_gates_with_caching_and_fixtures(tmp_path: Path) -> None:
         body = json.loads(request.content.decode("utf-8"))
         if url.endswith("/chat/completions"):
             sys_msg = body["messages"][0]["content"]
-            if "audit @probe and probe.here" in sys_msg:
+            if "audit @manners and manners.here" in sys_msg:
                 return httpx.Response(
                     200,
                     json={
@@ -159,7 +165,7 @@ def test_discover_and_gates_with_caching_and_fixtures(tmp_path: Path) -> None:
                 json={"choices": [{"message": {"content": f"Analysis of {body['messages'][1]['content'][:80]}"}}]},
             )
         if url.endswith("/decision"):
-            if body["probe_id"].endswith("#gate2"):
+            if body["check_id"].endswith("#gate2"):
                 return httpx.Response(200, json={"probabilities": [0.05 for _ in body["checks"]]})
             snap = body["snapshot"]
             ok = "GOOD" in snap
@@ -167,34 +173,34 @@ def test_discover_and_gates_with_caching_and_fixtures(tmp_path: Path) -> None:
             return httpx.Response(200, json={"probabilities": probs})
         raise AssertionError(f"Unexpected URL: {url}")
 
-    cfg = ProbeConfig(
+    cfg = MannersConfig(
         models_decision=ModelEndpointConfig(provider="http_decision", url="http://mock.local/decision", model="jev"),
         models_text=ModelEndpointConfig(provider="openai_compat", url="http://mock.local/v1", model="qwen3.5:9b"),
         decision=DecisionConfig(pass_threshold=0.50),
         text=TextConfig(),
         check=CheckConfig(),
         runtime=RuntimeConfig(
-            runs_dir=str(tmp_path / ".probes" / "runs"),
-            lock_path=str(tmp_path / ".probes" / "lock.json"),
+            runs_dir=str(tmp_path / ".manners" / "runs"),
+            lock_path=str(tmp_path / ".manners" / "lock.json"),
         ),
         project_root=tmp_path,
     )
 
-    ok, results = run_probe_check(config=cfg, transport=httpx.MockTransport(handler))
+    ok, results = run_manners_check(config=cfg, transport=httpx.MockTransport(handler))
     assert ok is True
     assert [r.status for r in results] == ["passed", "passed"]
     first_calls = http_calls["n"]
     assert first_calls > 0
-    assert (tmp_path / ".probes" / "lock.json").is_file()
+    assert (tmp_path / ".manners" / "lock.json").is_file()
 
     # Second run skips Gates 2-3 cleanly via cache (zero HTTP calls).
-    ok2, results2 = run_probe_check(config=cfg, transport=httpx.MockTransport(handler))
+    ok2, results2 = run_manners_check(config=cfg, transport=httpx.MockTransport(handler))
     assert ok2 is True
     assert [r.status for r in results2] == ["cached", "cached"]
     assert http_calls["n"] == first_calls
 
     # --force re-runs Gates 2-3.
-    ok3, results3 = run_probe_check(force=True, config=cfg, transport=httpx.MockTransport(handler))
+    ok3, results3 = run_manners_check(force=True, config=cfg, transport=httpx.MockTransport(handler))
     assert ok3 is True
     assert [r.status for r in results3] == ["passed", "passed"]
     assert http_calls["n"] > first_calls
@@ -204,13 +210,13 @@ def test_gate1_and_gate2_rejections(tmp_path: Path) -> None:
     (tmp_path / "bad.py").write_text(
         textwrap.dedent(
             """
-            from probe import probe
+            from manners import manners
 
-            @probe(["x > 0", "y > 0", "z > 0"], id="dup.id")
+            @manners(["x > 0", "y > 0", "z > 0"], id="dup.id")
             def fn_a(x: int, y: int, z: int) -> int:
                 return x
 
-            @probe("still dup", id="dup.id")
+            @manners("still dup", id="dup.id")
             def fn_b() -> int:
                 return 1
             """
@@ -219,17 +225,17 @@ def test_gate1_and_gate2_rejections(tmp_path: Path) -> None:
         encoding="utf-8",
     )
 
-    cfg = ProbeConfig(
+    cfg = MannersConfig(
         models_decision=ModelEndpointConfig(provider="http_decision", url="http://mock.local/decision", model="jev"),
         models_text=ModelEndpointConfig(provider="openai_compat", url="http://mock.local/v1", model="qwen"),
         check=CheckConfig(max_checks=2, max_check_chars=200),
         runtime=RuntimeConfig(
-            runs_dir=str(tmp_path / ".probes" / "runs"),
-            lock_path=str(tmp_path / ".probes" / "lock.json"),
+            runs_dir=str(tmp_path / ".manners" / "runs"),
+            lock_path=str(tmp_path / ".manners" / "lock.json"),
         ),
         project_root=tmp_path,
     )
-    ok, results = run_probe_check(config=cfg)
+    ok, results = run_manners_check(config=cfg)
     assert ok is False
     assert all(r.status == "failed" and r.gate == "gate1" for r in results)
 
@@ -237,9 +243,9 @@ def test_gate1_and_gate2_rejections(tmp_path: Path) -> None:
     (tmp_path / "bad.py").write_text(
         textwrap.dedent(
             """
-            from probe import probe
+            from manners import manners
 
-            @probe("Sum equals a + b", id="math.add")
+            @manners("Sum equals a + b", id="math.add")
             def add(a: int, b: int) -> int:
                 return a + b
             """
@@ -269,7 +275,7 @@ def test_gate1_and_gate2_rejections(tmp_path: Path) -> None:
             return httpx.Response(200, json={"probabilities": [0.95, 0.05, 0.05]})
         raise AssertionError(f"Unexpected URL: {url}")
 
-    ok_g2, res_g2 = run_probe_check(config=cfg, transport=httpx.MockTransport(reject_handler))
+    ok_g2, res_g2 = run_manners_check(config=cfg, transport=httpx.MockTransport(reject_handler))
     assert ok_g2 is False
     assert len(res_g2) == 1
     assert res_g2[0].gate == "gate2"
@@ -280,8 +286,8 @@ def test_cli_list_report_log_runs_clean(tmp_path: Path, monkeypatch) -> None:
     _write_sample_project(tmp_path)
     monkeypatch.chdir(tmp_path)
 
-    runs_dir = tmp_path / ".probes" / "runs"
-    store = ProbeStore(runs_dir, create=True)
+    runs_dir = tmp_path / ".manners" / "runs"
+    store = MannersStore(runs_dir, create=True)
     try:
         # Older run + newer run with out-of-order insertion to verify call_seq ASC ordering.
         store.create_run(
@@ -309,9 +315,9 @@ def test_cli_list_report_log_runs_clean(tmp_path: Path, monkeypatch) -> None:
             call_seq=2,
             elapsed_ms=412.0,
             started_at="2026-11-18T15:10:04.412Z",
-            probe_id="tutor.opening_turn",
+            check_id="tutor.opening_turn",
             site="decorator",
-            probe_type="decision",
+            check_type="decision",
             file_line="src/tutor/turn.py:3",
             checks=("Opens Spanish", "No spoiler"),
             payload_json='{"output": "Hola, dime algo en español."}',
@@ -323,9 +329,9 @@ def test_cli_list_report_log_runs_clean(tmp_path: Path, monkeypatch) -> None:
             call_seq=1,
             elapsed_ms=88.0,
             started_at="2026-11-18T15:10:04.088Z",
-            probe_id="rag.draft_answer",
+            check_id="rag.draft_answer",
             site="here",
-            probe_type="text",
+            check_type="text",
             file_line="src/rag/synth.py:94",
             checks=("Grounded",),
             payload_json='{"watched": {"draft": "Chunk #1"}}',
@@ -338,9 +344,9 @@ def test_cli_list_report_log_runs_clean(tmp_path: Path, monkeypatch) -> None:
             call_seq=3,
             elapsed_ms=785.0,
             started_at="2026-11-18T15:10:04.785Z",
-            probe_id="tutor.opening_turn",
+            check_id="tutor.opening_turn",
             site="decorator",
-            probe_type="decision",
+            check_type="decision",
             file_line="src/tutor/turn.py:3",
             checks=("Opens Spanish", "No spoiler"),
             payload_json='{"output": "Try saying: Quiero un café"}',
@@ -357,8 +363,8 @@ def test_cli_list_report_log_runs_clean(tmp_path: Path, monkeypatch) -> None:
     list_res = runner.invoke(app, ["list", "--json"])
     assert list_res.exit_code == 0
     list_data = json.loads(list_res.stdout)
-    assert [p["probe_id"] for p in list_data["probes"]] == ["tutor.opening_turn", "tutor.draft"]
-    assert all(p["lock_status"] == "unlocked" for p in list_data["probes"])
+    assert [p["check_id"] for p in list_data["manners"]] == ["tutor.opening_turn", "tutor.draft"]
+    assert all(p["lock_status"] == "unlocked" for p in list_data["manners"])
 
     rep_default = runner.invoke(app, ["report"])
     assert rep_default.exit_code == 0
@@ -399,7 +405,7 @@ def test_cli_list_report_log_runs_clean(tmp_path: Path, monkeypatch) -> None:
     broken_cfg_project = tmp_path / "bad_cli_cfg"
     broken_cfg_project.mkdir()
     (broken_cfg_project / "pyproject.toml").write_text(
-        "[project]\nname = 'bad-cfg'\n[tool.probe.decision]\npass_threshold = 1.0\n",
+        "[project]\nname = 'bad-cfg'\n[tool.manners.decision]\npass_threshold = 1.0\n",
         encoding="utf-8",
     )
     monkeypatch.chdir(broken_cfg_project)
@@ -424,7 +430,7 @@ def test_cli_list_report_log_runs_clean(tmp_path: Path, monkeypatch) -> None:
     assert runner.invoke(app, ["runs", "--limit", "0"]).exit_code != 0
     assert runner.invoke(app, ["clean", "--keep", "-1"]).exit_code != 0
 
-    assert (tmp_path / ".probes" / ".gitignore").read_text(encoding="utf-8") == "runs/\n"
+    assert (tmp_path / ".manners" / ".gitignore").read_text(encoding="utf-8") == "runs/\n"
     run_jsonl = runs_dir / f"{run_id}.jsonl"
     assert run_jsonl.is_file()
     parsed_lines = [json.loads(line) for line in run_jsonl.read_text(encoding="utf-8").splitlines()]
@@ -435,7 +441,7 @@ def test_cli_list_report_log_runs_clean(tmp_path: Path, monkeypatch) -> None:
     # Partial trailing JSON lines and traversal run_ids do not crash readers.
     with run_jsonl.open("a", encoding="utf-8") as fh:
         fh.write('{"type":"event","partial":')
-    ro_store = ProbeStore(runs_dir, create=False)
+    ro_store = MannersStore(runs_dir, create=False)
     assert len(ro_store.list_events(run_id)) == 3
     assert ro_store.get_run("../escape") is None
     assert ro_store.list_events("../escape") == []
@@ -459,15 +465,15 @@ def test_auto_derived_ids_zero_imports_gate1_failures_syntax_errors_and_subdir_c
             name = "sample-stage4"
             version = "0.1.0"
 
-            [tool.probe.check]
+            [tool.manners.check]
             require_check = true
 
-            [tool.probe.models.decision]
+            [tool.manners.models.decision]
             provider = "http_decision"
             url = "http://mock.local/decision"
             model = "jev"
 
-            [tool.probe.models.text]
+            [tool.manners.models.text]
             provider = "openai_compat"
             url = "http://mock.local/v1"
             model = "qwen3.5:9b"
@@ -481,13 +487,13 @@ def test_auto_derived_ids_zero_imports_gate1_failures_syntax_errors_and_subdir_c
     script_py.write_text(
         textwrap.dedent(
             """
-            from probe import probe
+            from manners import manners
 
-            @probe("Greets user politely")
+            @manners("Greets user politely")
             def top_fn(name: str) -> str:
-                @probe("Formats greeting nicely")
+                @manners("Formats greeting nicely")
                 def nested_fn(inner: str) -> str:
-                    probe.here("Greeting includes user name", msg=f"Hello {inner}")
+                    manners.here("Greeting includes user name", msg=f"Hello {inner}")
                     return f"Hello {inner}"
                 return nested_fn(name)
             """
@@ -500,10 +506,10 @@ def test_auto_derived_ids_zero_imports_gate1_failures_syntax_errors_and_subdir_c
     unrelated_py.write_text(
         textwrap.dedent(
             """
-            def probe(_msg: str):
+            def manners(_msg: str):
                 return lambda fn: fn
 
-            @probe("Custom non-probe decorator")
+            @manners("Custom non-manners decorator")
             def custom(x: int) -> int:
                 return x
             """
@@ -511,7 +517,7 @@ def test_auto_derived_ids_zero_imports_gate1_failures_syntax_errors_and_subdir_c
         + "\n",
         encoding="utf-8",
     )
-    assert discover_probes([unrelated_py], root=tmp_path) == []
+    assert discover_manners([unrelated_py], root=tmp_path) == []
 
     def handler(request: httpx.Request) -> httpx.Response:
         url = str(request.url)
@@ -541,71 +547,71 @@ def test_auto_derived_ids_zero_imports_gate1_failures_syntax_errors_and_subdir_c
                 return httpx.Response(200, json={"choices": [{"message": {"content": json.dumps(payload)}}]})
             return httpx.Response(200, json={"choices": [{"message": {"content": "Factual check audit."}}]})
         if url.endswith("/decision"):
-            if body["probe_id"].endswith("#gate2"):
+            if body["check_id"].endswith("#gate2"):
                 return httpx.Response(200, json={"probabilities": [0.05 for _ in body["checks"]]})
             ok = "GOOD" in body["snapshot"] or "Hello Ana" in body["snapshot"]
             return httpx.Response(200, json={"probabilities": [0.95 if ok else 0.10 for _ in body["checks"]]})
         raise AssertionError(f"Unexpected URL: {url}")
 
-    cfg = ProbeConfig(
+    cfg = MannersConfig(
         models_decision=ModelEndpointConfig(provider="http_decision", url="http://mock.local/decision", model="jev"),
         models_text=ModelEndpointConfig(provider="openai_compat", url="http://mock.local/v1", model="qwen3.5:9b"),
         decision=DecisionConfig(pass_threshold=0.50),
         check=CheckConfig(require_check=True),
         runtime=RuntimeConfig(
-            runs_dir=str(tmp_path / ".probes" / "runs"),
-            lock_path=str(tmp_path / ".probes" / "lock.json"),
+            runs_dir=str(tmp_path / ".manners" / "runs"),
+            lock_path=str(tmp_path / ".manners" / "lock.json"),
         ),
         project_root=tmp_path,
     )
 
-    ok, results = run_probe_check([script_py], config=cfg, transport=httpx.MockTransport(handler))
+    ok, results = run_manners_check([script_py], config=cfg, transport=httpx.MockTransport(handler))
     assert ok is True
-    assert [r.probe_id for r in results] == [
+    assert [r.check_id for r in results] == [
         "script.top_fn",
         "script.top_fn.<locals>.nested_fn",
         "script.top_fn.<locals>.nested_fn:L7",
     ]
 
-    # Runtime execution as simulated __main__ must match auto-derived lock IDs without PROBE_SKIP_LOCK.
-    monkeypatch.setenv("PROBES", "1")
-    monkeypatch.delenv("PROBE_SKIP_LOCK", raising=False)
-    monkeypatch.setenv("PROBE_NO_PDB", "1")
+    # Runtime execution as simulated __main__ must match auto-derived lock IDs without MANNERS_SKIP_LOCK.
+    monkeypatch.setenv("MANNERS", "1")
+    monkeypatch.delenv("MANNERS_SKIP_LOCK", raising=False)
+    monkeypatch.setenv("MANNERS_NO_PDB", "1")
     spec = importlib.util.spec_from_file_location("__main__", script_py)
     assert spec is not None and spec.loader is not None
     mod = importlib.util.module_from_spec(spec)
     old_main = sys.modules.get("__main__")
     sys.modules["__main__"] = mod
     spec.loader.exec_module(mod)
-    probe.reset_for_testing(config=cfg, transport=httpx.MockTransport(handler))
+    manners.reset_for_testing(config=cfg, transport=httpx.MockTransport(handler))
     try:
         assert mod.top_fn("Ana") == "Hello Ana"
     finally:
-        probe.probe.flush_for_testing()
-        probe.reset_for_testing()
+        manners.manners.flush_for_testing()
+        manners.reset_for_testing()
         if old_main is not None:
             sys.modules["__main__"] = old_main
 
-    # Invalid Gate 1 patterns: empty probe.here and generator @probe.
+    # Invalid Gate 1 patterns: empty manners.here and generator @manners.
     bad_py = tmp_path / "pkg" / "bad_patterns.py"
     bad_py.parent.mkdir()
     bad_py.write_text(
         textwrap.dedent(
             """
-            from probe import probe
+            from manners import manners
 
-            @probe("Yields integers politely")
+            @manners("Yields integers politely")
             def gen_fn():
                 yield 1
 
             def empty_here() -> None:
-                probe.here("Missing watched variables")
+                manners.here("Missing watched variables")
             """
         ).strip()
         + "\n",
         encoding="utf-8",
     )
-    ok_bad, res_bad = run_probe_check([bad_py], config=cfg, transport=httpx.MockTransport(handler))
+    ok_bad, res_bad = run_manners_check([bad_py], config=cfg, transport=httpx.MockTransport(handler))
     assert ok_bad is False
     assert all(r.status == "failed" and r.gate == "gate1" for r in res_bad)
     assert len(res_bad) == 2
@@ -613,10 +619,10 @@ def test_auto_derived_ids_zero_imports_gate1_failures_syntax_errors_and_subdir_c
     # SyntaxError fails Gate 1 without wiping previously approved lock entries.
     syntax_py = tmp_path / "broken_syntax.py"
     syntax_py.write_text("def broken(:\n", encoding="utf-8")
-    ok_syn, res_syn = run_probe_check([syntax_py, script_py], config=cfg, transport=httpx.MockTransport(handler))
+    ok_syn, res_syn = run_manners_check([syntax_py, script_py], config=cfg, transport=httpx.MockTransport(handler))
     assert ok_syn is False
-    assert any(r.probe_id == "<parse_error>" and r.gate == "gate1" for r in res_syn)
-    lock_after = json.loads((tmp_path / ".probes" / "lock.json").read_text(encoding="utf-8"))["probes"]
+    assert any(r.check_id == "<parse_error>" and r.gate == "gate1" for r in res_syn)
+    lock_after = json.loads((tmp_path / ".manners" / "lock.json").read_text(encoding="utf-8"))["manners"]
     assert "script.top_fn" in lock_after
 
     # Subdirectory CLI invocation resolves relative paths against CWD and fails on missing paths.
@@ -624,13 +630,13 @@ def test_auto_derived_ids_zero_imports_gate1_failures_syntax_errors_and_subdir_c
     runner = CliRunner()
     sub_res = runner.invoke(app, ["list", "bad_patterns.py", "--json"])
     assert sub_res.exit_code == 0
-    assert len(json.loads(sub_res.stdout)["probes"]) == 2
+    assert len(json.loads(sub_res.stdout)["manners"]) == 2
     missing_res = runner.invoke(app, ["check", "missing_file.py"])
     assert missing_res.exit_code == 1
 
     # Path traversal in manual fixture names is rejected.
     with pytest.raises(BackendError, match="path separators"):
-        _load_manual_fixture(tmp_path / ".probes" / "fixtures", "../secret")
+        _load_manual_fixture(tmp_path / ".manners" / "fixtures", "../secret")
 
 
 def _stage3_mock_handler(request: httpx.Request) -> httpx.Response:
@@ -665,7 +671,7 @@ def _stage3_mock_handler(request: httpx.Request) -> httpx.Response:
             return httpx.Response(200, json={"choices": [{"message": {"content": json.dumps(payload)}}]})
         return httpx.Response(200, json={"choices": [{"message": {"content": "Factual check audit."}}]})
     if url.endswith("/decision"):
-        if body["probe_id"].endswith("#gate2"):
+        if body["check_id"].endswith("#gate2"):
             return httpx.Response(200, json={"probabilities": [0.05 for _ in body["checks"]]})
         ok = "GOOD" in body["snapshot"]
         return httpx.Response(200, json={"probabilities": [0.95 if ok else 0.10 for _ in body["checks"]]})
@@ -679,9 +685,9 @@ def test_stage3_discovery_scoping_namespace_and_stacking(tmp_path: Path, monkeyp
     turn_py.write_text(
         textwrap.dedent(
             """
-            from probe import probe
+            from manners import manners
 
-            @probe("Responds warmly in Spanish")
+            @manners("Responds warmly in Spanish")
             def greet(name: str) -> str:
                 return f"Hola {name}"
             """
@@ -690,8 +696,8 @@ def test_stage3_discovery_scoping_namespace_and_stacking(tmp_path: Path, monkeyp
         encoding="utf-8",
     )
     assert resolve_module_name(turn_py, tmp_path) == "acme.tutor.turn"
-    ns_discovered = discover_probes([turn_py], root=tmp_path)
-    assert [(d.probe_id, d.file_line, d.param_names) for d in ns_discovered] == [
+    ns_discovered = discover_manners([turn_py], root=tmp_path)
+    assert [(d.check_id, d.file_line, d.param_names) for d in ns_discovered] == [
         ("acme.tutor.turn.greet", "src/acme/tutor/turn.py:4", ("name",))
     ]
 
@@ -701,12 +707,12 @@ def test_stage3_discovery_scoping_namespace_and_stacking(tmp_path: Path, monkeyp
         textwrap.dedent(
             """
             import functools
-            from probe import probe
+            from manners import manners
 
-            @probe("Greets cleanly without leaking system tokens")
+            @manners("Greets cleanly without leaking system tokens")
             @functools.lru_cache(maxsize=4)
             def cached_greet(name: str) -> str:
-                gen = (probe.here("Non-empty greeting value", val=f"GOOD {ch}") for ch in [name])
+                gen = (manners.here("Non-empty greeting value", val=f"GOOD {ch}") for ch in [name])
                 list(gen)
                 return f"GOOD {name}"
             """
@@ -714,72 +720,72 @@ def test_stage3_discovery_scoping_namespace_and_stacking(tmp_path: Path, monkeyp
         + "\n",
         encoding="utf-8",
     )
-    disc_stacked = discover_probes([stacked_py], root=tmp_path)
-    assert [d.probe_id for d in disc_stacked] == [
+    disc_stacked = discover_manners([stacked_py], root=tmp_path)
+    assert [d.check_id for d in disc_stacked] == [
         "stacked_main.cached_greet",
         "stacked_main.cached_greet.<locals>.<genexpr>:L7",
     ]
     assert disc_stacked[0].param_names == ("name",)
     assert disc_stacked[0].signature == "def cached_greet(name: str) -> str"
 
-    cfg = ProbeConfig(
+    cfg = MannersConfig(
         models_decision=ModelEndpointConfig(provider="http_decision", url="http://mock.local/decision", model="jev"),
         models_text=ModelEndpointConfig(provider="openai_compat", url="http://mock.local/v1", model="qwen3.5:9b"),
         decision=DecisionConfig(pass_threshold=0.50),
         check=CheckConfig(require_check=True),
         runtime=RuntimeConfig(
-            runs_dir=str(tmp_path / ".probes" / "runs"),
-            lock_path=str(tmp_path / ".probes" / "lock.json"),
+            runs_dir=str(tmp_path / ".manners" / "runs"),
+            lock_path=str(tmp_path / ".manners" / "lock.json"),
         ),
         project_root=tmp_path,
     )
-    ok_st, _ = run_probe_check([stacked_py], config=cfg, transport=httpx.MockTransport(_stage3_mock_handler))
+    ok_st, _ = run_manners_check([stacked_py], config=cfg, transport=httpx.MockTransport(_stage3_mock_handler))
     assert ok_st is True
 
-    monkeypatch.setenv("PROBES", "1")
-    monkeypatch.delenv("PROBE_SKIP_LOCK", raising=False)
-    monkeypatch.setenv("PROBE_NO_PDB", "1")
+    monkeypatch.setenv("MANNERS", "1")
+    monkeypatch.delenv("MANNERS_SKIP_LOCK", raising=False)
+    monkeypatch.setenv("MANNERS_NO_PDB", "1")
     spec = importlib.util.spec_from_file_location("__main__", stacked_py)
     assert spec is not None and spec.loader is not None
     mod = importlib.util.module_from_spec(spec)
     old_main = sys.modules.get("__main__")
     sys.modules["__main__"] = mod
     spec.loader.exec_module(mod)
-    probe.reset_for_testing(config=cfg, transport=httpx.MockTransport(_stage3_mock_handler))
+    manners.reset_for_testing(config=cfg, transport=httpx.MockTransport(_stage3_mock_handler))
     try:
         assert mod.cached_greet("Ana") == "GOOD Ana"
     finally:
-        probe.probe.flush_for_testing()
-        probe.reset_for_testing()
+        manners.manners.flush_for_testing()
+        manners.reset_for_testing()
         if old_main is not None:
             sys.modules["__main__"] = old_main
 
-    # 3. Lexical shadowing ignores non-probe decorators; @probe on class fails; id=None ok; literal before dup ID.
+    # 3. Lexical shadowing ignores non-manners decorators; @manners on class fails; id=None ok; literal before dup ID.
     scope_py = tmp_path / "scoping_cases.py"
     scope_py.write_text(
         textwrap.dedent(
             """
-            from probe import probe
+            from manners import manners
 
             def outer():
-                probe = lambda *a, **kw: (lambda fn: fn)
-                @probe("Shadowed local decorator")
+                manners = lambda *a, **kw: (lambda fn: fn)
+                @manners("Shadowed local decorator")
                 def shadowed_fn(x: str) -> str:
                     return x
 
-            @probe("Class decorators are rejected")
+            @manners("Class decorators are rejected")
             class BadClass:
                 pass
 
-            @probe("Explicit None id uses auto-derived ID", id=None)
+            @manners("Explicit None id uses auto-derived ID", id=None)
             def none_id_fn(topic: str) -> str:
                 return topic
 
-            @probe(123, id="dup.case")
+            @manners(123, id="dup.case")
             def bad_lit_dup(x: str) -> str:
                 return x
 
-            @probe("Valid semantic rule", id="dup.case")
+            @manners("Valid semantic rule", id="dup.case")
             def good_dup(x: str) -> str:
                 return x
             """
@@ -787,17 +793,17 @@ def test_stage3_discovery_scoping_namespace_and_stacking(tmp_path: Path, monkeyp
         + "\n",
         encoding="utf-8",
     )
-    ok_sc, res_sc = run_probe_check([scope_py], config=cfg, transport=httpx.MockTransport(_stage3_mock_handler))
+    ok_sc, res_sc = run_manners_check([scope_py], config=cfg, transport=httpx.MockTransport(_stage3_mock_handler))
     assert ok_sc is False
-    by_id = {r.probe_id: r for r in res_sc}
+    by_id = {r.check_id: r for r in res_sc}
     assert "scoping_cases.outer.<locals>.shadowed_fn" not in by_id
     assert by_id["scoping_cases.BadClass"].gate == "gate1"
     assert "classes" in by_id["scoping_cases.BadClass"].reason
     assert by_id["scoping_cases.none_id_fn"].status == "passed"
-    dup_res = [r for r in res_sc if r.probe_id == "dup.case"]
+    dup_res = [r for r in res_sc if r.check_id == "dup.case"]
     assert len(dup_res) == 2
     assert any("literal" in r.reason or "string literal" in r.reason for r in dup_res)
-    assert any("Duplicate probe_id" in r.reason for r in dup_res)
+    assert any("Duplicate check_id" in r.reason for r in dup_res)
 
 
 def test_stage3_pruning_moves_fixtures_list_and_verify_lock(tmp_path: Path, monkeypatch) -> None:
@@ -807,17 +813,17 @@ def test_stage3_pruning_moves_fixtures_list_and_verify_lock(tmp_path: Path, monk
                 "[project]",
                 'name = "stage3-app"',
                 "",
-                "[tool.probe.models.decision]",
+                "[tool.manners.models.decision]",
                 'provider = "http_decision"',
                 'url = "http://mock.local/decision"',
                 'model = "jev"',
                 "",
-                "[tool.probe.models.text]",
+                "[tool.manners.models.text]",
                 'provider = "openai_compat"',
                 'url = "http://mock.local/v1"',
                 'model = "qwen3.5:9b"',
                 "",
-                "[tool.probe.check]",
+                "[tool.manners.check]",
                 "require_check = true",
             ]
         )
@@ -832,72 +838,73 @@ def test_stage3_pruning_moves_fixtures_list_and_verify_lock(tmp_path: Path, monk
     old_py = pkg / "old.py"
     keep_py = other / "keep.py"
     a_py.write_text(
-        'from probe import probe\n'
-        '@probe("Responds politely", id="p.a")\n'
+        'from manners import manners\n'
+        '@manners("Responds politely", id="p.a")\n'
         'def fa(x: str) -> str:\n    return "GOOD " + x\n',
         encoding="utf-8",
     )
     old_py.write_text(
-        'from probe import probe\n'
-        '@probe("Responds politely", id="p.old")\n'
+        'from manners import manners\n'
+        '@manners("Responds politely", id="p.old")\n'
         'def fold(x: str) -> str:\n    return "GOOD " + x\n',
         encoding="utf-8",
     )
     keep_py.write_text(
-        'from probe import probe\n'
-        '@probe("Responds politely", id="p.keep")\n'
+        'from manners import manners\n'
+        '@manners("Responds politely", id="p.keep")\n'
         'def fkeep(x: str) -> str:\n    return "GOOD " + x\n',
         encoding="utf-8",
     )
 
-    cfg = ProbeConfig(
+    cfg = MannersConfig(
         models_decision=ModelEndpointConfig(provider="http_decision", url="http://mock.local/decision", model="jev"),
         models_text=ModelEndpointConfig(provider="openai_compat", url="http://mock.local/v1", model="qwen3.5:9b"),
         decision=DecisionConfig(pass_threshold=0.50),
         check=CheckConfig(require_check=True),
         runtime=RuntimeConfig(
-            runs_dir=str(tmp_path / ".probes" / "runs"),
-            lock_path=str(tmp_path / ".probes" / "lock.json"),
+            runs_dir=str(tmp_path / ".manners" / "runs"),
+            lock_path=str(tmp_path / ".manners" / "lock.json"),
         ),
         project_root=tmp_path,
     )
     lock_path = cfg.resolve_lock_path()
     transport = httpx.MockTransport(_stage3_mock_handler)
-    ok_all, _ = run_probe_check(config=cfg, transport=transport)
+    ok_all, _ = run_manners_check(config=cfg, transport=transport)
     assert ok_all is True
 
     # 1. Directory scan prunes deleted pkg/old.py while keeping other/keep.py.
     old_py.unlink()
-    ok_dir, _ = run_probe_check([pkg], config=cfg, transport=transport)
+    ok_dir, _ = run_manners_check([pkg], config=cfg, transport=transport)
     assert ok_dir is True
-    locks = json.loads(lock_path.read_text(encoding="utf-8"))["probes"]
+    locks = json.loads(lock_path.read_text(encoding="utf-8"))["manners"]
     assert "p.old" not in locks and "p.a" in locks and "p.keep" in locks
     assert locks["p.a"]["param_names"] == ["x"]
 
     # 2. Explicit CLI check on deleted locked file prunes it; non-existent untracked file still exits 1.
     temp_py = pkg / "temp_del.py"
     temp_py.write_text(
-        'from probe import probe\n@probe("Responds politely", id="p.temp")\ndef ftmp(x: str) -> str:\n    return x\n',
+        'from manners import manners\n@manners("Responds politely", id="p.temp")\n'
+        "def ftmp(x: str) -> str:\n    return x\n",
         encoding="utf-8",
     )
-    assert run_probe_check([temp_py], config=cfg, transport=transport)[0] is True
-    assert "p.temp" in json.loads(lock_path.read_text(encoding="utf-8"))["probes"]
+    assert run_manners_check([temp_py], config=cfg, transport=transport)[0] is True
+    assert "p.temp" in json.loads(lock_path.read_text(encoding="utf-8"))["manners"]
     temp_py.unlink()
     monkeypatch.chdir(tmp_path)
     runner = CliRunner()
     del_res = runner.invoke(app, ["check", "pkg/temp_del.py"])
     assert del_res.exit_code == 0, del_res.stdout + del_res.stderr
-    assert "p.temp" not in json.loads(lock_path.read_text(encoding="utf-8"))["probes"]
+    assert "p.temp" not in json.loads(lock_path.read_text(encoding="utf-8"))["manners"]
     assert runner.invoke(app, ["check", "never_existed.py"]).exit_code == 1
 
     # 3. Parse-error file protects its locked entry against both pruning and cross-file theft.
     a_py.write_text("def broken(:\n", encoding="utf-8")
-    ok_err, _ = run_probe_check(config=cfg, transport=transport)
+    ok_err, _ = run_manners_check(config=cfg, transport=transport)
     assert ok_err is False
-    assert "p.a" in json.loads(lock_path.read_text(encoding="utf-8"))["probes"]
+    assert "p.a" in json.loads(lock_path.read_text(encoding="utf-8"))["manners"]
     a_py.write_text(
-        'from probe import probe\n'
-        '@probe("Responds politely", id="p.a")\n'
+        'from manners import manners\n'
+        '@manners("Responds politely", id="p.a")\n'
         'def fa(x: str) -> str:\n    return "GOOD " + x\n',
         encoding="utf-8",
     )
@@ -907,13 +914,13 @@ def test_stage3_pruning_moves_fixtures_list_and_verify_lock(tmp_path: Path, monk
     a_py.write_text(
         textwrap.dedent(
             """
-            from probe import probe
+            from manners import manners
 
-            @probe("Responds politely", id="p.a")
+            @manners("Responds politely", id="p.a")
             def fa(x: str) -> str:
                 return "GOOD " + x
 
-            @probe("Responds politely", id="p.keep")
+            @manners("Responds politely", id="p.keep")
             def moved_keep(x: str) -> str:
                 return "GOOD " + x
             """
@@ -921,32 +928,32 @@ def test_stage3_pruning_moves_fixtures_list_and_verify_lock(tmp_path: Path, monk
         + "\n",
         encoding="utf-8",
     )
-    ok_move, _ = run_probe_check([a_py], config=cfg, transport=transport)
+    ok_move, _ = run_manners_check([a_py], config=cfg, transport=transport)
     assert ok_move is True
-    locks_after_move = json.loads(lock_path.read_text(encoding="utf-8"))["probes"]
+    locks_after_move = json.loads(lock_path.read_text(encoding="utf-8"))["manners"]
     assert locks_after_move["p.keep"]["file_line"].startswith("pkg/a.py:")
 
-    # Duplicate probe_id in existing keep_py blocks checking keep_py against a_py.
+    # Duplicate check_id in existing keep_py blocks checking keep_py against a_py.
     keep_py.write_text(
-        'from probe import probe\n'
-        '@probe("Responds politely", id="p.keep")\n'
+        'from manners import manners\n'
+        '@manners("Responds politely", id="p.keep")\n'
         'def dup_keep(x: str) -> str:\n    return x\n',
         encoding="utf-8",
     )
-    ok_dup_partial, res_dup_partial = run_probe_check([keep_py], config=cfg, transport=transport)
+    ok_dup_partial, res_dup_partial = run_manners_check([keep_py], config=cfg, transport=transport)
     assert ok_dup_partial is False
     assert res_dup_partial[0].gate == "gate1"
     assert "already locked" in res_dup_partial[0].reason
     keep_py.write_text("# clean again\n", encoding="utf-8")
 
-    # 5. Manual fixture hash disambiguation, wrong probe_id rejection, and strict Gate 3 snapshot validation.
-    fixtures_dir = tmp_path / ".probes" / "fixtures"
+    # 5. Manual fixture hash disambiguation, wrong check_id rejection, and strict Gate 3 snapshot validation.
+    fixtures_dir = tmp_path / ".manners" / "fixtures"
     fixtures_dir.mkdir(parents=True, exist_ok=True)
     hashed_name = f"pkg_colon-{_sha256_text('pkg:colon')[:6]}.json"
     (fixtures_dir / hashed_name).write_text(
         json.dumps(
             {
-                "probe_id": "pkg:colon",
+                "check_id": "pkg:colon",
                 "pass": {"inputs": {"x": "hi"}, "output": "GOOD hi"},
                 "fail": {"inputs": {"x": "hi"}, "output": "BAD"},
             }
@@ -957,7 +964,7 @@ def test_stage3_pruning_moves_fixtures_list_and_verify_lock(tmp_path: Path, monk
     (fixtures_dir / "wrong_pid.json").write_text(
         json.dumps(
             {
-                "probe_id": "other.id",
+                "check_id": "other.id",
                 "pass": {"inputs": {"x": "hi"}, "output": "GOOD"},
                 "fail": {"inputs": {"x": "hi"}, "output": "BAD"},
             }
@@ -967,7 +974,7 @@ def test_stage3_pruning_moves_fixtures_list_and_verify_lock(tmp_path: Path, monk
     with pytest.raises(BackendError, match="does not match"):
         _load_manual_fixture(fixtures_dir, "wrong_pid")
 
-    dec_item = discover_probes([a_py], root=tmp_path)[0]
+    dec_item = discover_manners([a_py], root=tmp_path)[0]
     with pytest.raises(BackendError, match="must not use 'exception'"):
         _validate_gate3_snapshot('{"inputs": {"x": "a"}, "exception": "boom"}', item=dec_item, label="pass")
     with pytest.raises(BackendError, match="missing required input"):
@@ -975,53 +982,55 @@ def test_stage3_pruning_moves_fixtures_list_and_verify_lock(tmp_path: Path, monk
 
     here_py = tmp_path / "here_item.py"
     here_py.write_text(
-        'from probe import probe\ndef f(a, b):\n    probe.here("Warm reply", id="h.val", a=a, b=b)\n',
+        'from manners import manners\ndef f(a, b):\n    manners.here("Warm reply", id="h.val", a=a, b=b)\n',
         encoding="utf-8",
     )
-    here_item = discover_probes([here_py], root=tmp_path)[0]
+    here_item = discover_manners([here_py], root=tmp_path)[0]
     with pytest.raises(BackendError, match="must not include 'output'"):
         _validate_gate3_snapshot('{"watched": {"a": 1, "b": 2}, "output": "no"}', item=here_item, label="pass")
     with pytest.raises(BackendError, match="unexpected watched key"):
         _validate_gate3_snapshot('{"watched": {"a": 1, "b": 2, "c": 3}}', item=here_item, label="pass")
 
-    # 6. probe list: invalid status, threshold change invalidation, and SyntaxError exit 1.
+    # 6. manners list: invalid status, threshold change invalidation, and SyntaxError exit 1.
     list_ok = runner.invoke(app, ["list", "pkg/a.py", "--json"])
     assert list_ok.exit_code == 0
-    rows = json.loads(list_ok.stdout)["probes"]
+    rows = json.loads(list_ok.stdout)["manners"]
     assert all(r["lock_status"] == "locked" for r in rows)
 
     (tmp_path / "pyproject.toml").write_text(
-        (tmp_path / "pyproject.toml").read_text(encoding="utf-8") + "\n[tool.probe.decision]\npass_threshold = 0.65\n",
+        (tmp_path / "pyproject.toml").read_text(encoding="utf-8")
+        + "\n[tool.manners.decision]\npass_threshold = 0.65\n",
         encoding="utf-8",
     )
     list_thresh = runner.invoke(app, ["list", "pkg/a.py", "--json"])
     assert list_thresh.exit_code == 0
-    assert all(r["lock_status"] != "locked" for r in json.loads(list_thresh.stdout)["probes"])
+    assert all(r["lock_status"] != "locked" for r in json.loads(list_thresh.stdout)["manners"])
 
     dup_file = tmp_path / "dups.py"
     dup_file.write_text(
-        'from probe import probe\n@probe(123, id="d1")\ndef f1(): pass\n@probe("ok", id="d1")\ndef f2(): pass\n',
+        'from manners import manners\n@manners(123, id="d1")\ndef f1(): pass\n'
+        '@manners("ok", id="d1")\ndef f2(): pass\n',
         encoding="utf-8",
     )
     list_inv = runner.invoke(app, ["list", "dups.py", "--json"])
     assert list_inv.exit_code == 0
-    assert [r["lock_status"] for r in json.loads(list_inv.stdout)["probes"]] == ["invalid", "invalid"]
+    assert [r["lock_status"] for r in json.loads(list_inv.stdout)["manners"]] == ["invalid", "invalid"]
 
     syn_file = tmp_path / "syn_bad.py"
     syn_file.write_text("def x(:\n", encoding="utf-8")
     assert runner.invoke(app, ["list", "syn_bad.py"]).exit_code == 1
 
     # 7. Runtime verify_lock rejects param_names mismatch and wrong-file spoofing.
-    monkeypatch.setenv("PROBES", "1")
-    monkeypatch.delenv("PROBE_SKIP_LOCK", raising=False)
-    monkeypatch.setenv("PROBE_NO_PDB", "1")
-    probe.reset_for_testing(config=cfg, transport=transport)
+    monkeypatch.setenv("MANNERS", "1")
+    monkeypatch.delenv("MANNERS_SKIP_LOCK", raising=False)
+    monkeypatch.setenv("MANNERS_NO_PDB", "1")
+    manners.reset_for_testing(config=cfg, transport=transport)
     try:
-        rt = probe._get_runtime()
-        with pytest.raises(ProbeHaltError):
+        rt = manners._get_runtime()
+        with pytest.raises(MannersHaltError):
             rt.verify_lock(
-                probe_id="p.a",
-                probe_type=ProbeType.decision,
+                check_id="p.a",
+                check_type=MannersType.decision,
                 checks=("Responds politely",),
                 call_seq=1,
                 elapsed_ms=1.0,
@@ -1033,16 +1042,16 @@ def test_stage3_pruning_moves_fixtures_list_and_verify_lock(tmp_path: Path, monk
                 param_names=("renamed_param",),
             )
     finally:
-        probe.probe.flush_for_testing()
-        probe.reset_for_testing()
+        manners.manners.flush_for_testing()
+        manners.reset_for_testing()
 
-    probe.reset_for_testing(config=cfg, transport=transport)
+    manners.reset_for_testing(config=cfg, transport=transport)
     try:
-        rt2 = probe._get_runtime()
-        with pytest.raises(ProbeHaltError):
+        rt2 = manners._get_runtime()
+        with pytest.raises(MannersHaltError):
             rt2.verify_lock(
-                probe_id="p.a",
-                probe_type=ProbeType.decision,
+                check_id="p.a",
+                check_type=MannersType.decision,
                 checks=("Responds politely",),
                 call_seq=1,
                 elapsed_ms=1.0,
@@ -1054,8 +1063,8 @@ def test_stage3_pruning_moves_fixtures_list_and_verify_lock(tmp_path: Path, monk
                 param_names=("x",),
             )
     finally:
-        probe.probe.flush_for_testing()
-        probe.reset_for_testing()
+        manners.manners.flush_for_testing()
+        manners.reset_for_testing()
 
 
 def test_stage4_gate3_synthetic_retry_and_manual_fixture_no_retry(tmp_path: Path) -> None:
@@ -1063,13 +1072,13 @@ def test_stage4_gate3_synthetic_retry_and_manual_fixture_no_retry(tmp_path: Path
     target_py.write_text(
         textwrap.dedent(
             """
-            from probe import probe
+            from manners import manners
 
-            @probe("Responds warmly in Spanish without leaking answers", id="retry.syn")
+            @manners("Responds warmly in Spanish without leaking answers", id="retry.syn")
             def syn_fn(topic: str) -> str:
                 return topic
 
-            @probe("Stays grounded in context", id="retry.manual")
+            @manners("Stays grounded in context", id="retry.manual")
             def manual_fn(topic: str) -> str:
                 return topic
             """
@@ -1078,7 +1087,7 @@ def test_stage4_gate3_synthetic_retry_and_manual_fixture_no_retry(tmp_path: Path
         encoding="utf-8",
     )
 
-    fixtures_dir = tmp_path / ".probes" / "fixtures"
+    fixtures_dir = tmp_path / ".manners" / "fixtures"
     fixtures_dir.mkdir(parents=True)
     # Manual fixture that fails calibration (both pass & fail look BAD) — must NOT retry!
     (fixtures_dir / "retry.manual.json").write_text(
@@ -1117,28 +1126,28 @@ def test_stage4_gate3_synthetic_retry_and_manual_fixture_no_retry(tmp_path: Path
                 return httpx.Response(200, json={"choices": [{"message": {"content": json.dumps(payload)}}]})
             return httpx.Response(200, json={"choices": [{"message": {"content": "Factual check audit."}}]})
         if url.endswith("/decision"):
-            if body["probe_id"].endswith("#gate2"):
+            if body["check_id"].endswith("#gate2"):
                 return httpx.Response(200, json={"probabilities": [0.05 for _ in body["checks"]]})
             ok = "GOOD" in body["snapshot"]
             return httpx.Response(200, json={"probabilities": [0.95 if ok else 0.15 for _ in body["checks"]]})
         raise AssertionError(f"Unexpected URL: {url}")
 
-    cfg = ProbeConfig(
+    cfg = MannersConfig(
         models_decision=ModelEndpointConfig(provider="http_decision", url="http://mock.local/decision", model="jev"),
         models_text=ModelEndpointConfig(provider="openai_compat", url="http://mock.local/v1", model="qwen3.5:9b"),
         decision=DecisionConfig(pass_threshold=0.50),
         domain_context="Custom pedagogical tag rules.",
         check=CheckConfig(require_check=True),
         runtime=RuntimeConfig(
-            runs_dir=str(tmp_path / ".probes" / "runs"),
-            lock_path=str(tmp_path / ".probes" / "lock.json"),
+            runs_dir=str(tmp_path / ".manners" / "runs"),
+            lock_path=str(tmp_path / ".manners" / "lock.json"),
         ),
         project_root=tmp_path,
     )
 
-    ok, results = run_probe_check([target_py], config=cfg, transport=httpx.MockTransport(handler))
+    ok, results = run_manners_check([target_py], config=cfg, transport=httpx.MockTransport(handler))
     assert ok is False  # retry.manual failed as intended
-    by_id = {r.probe_id: r for r in results}
+    by_id = {r.check_id: r for r in results}
     assert by_id["retry.syn"].status == "passed"
     assert by_id["retry.manual"].status == "failed" and by_id["retry.manual"].gate == "gate3"
     # Exactly 2 Gate 3 synthesis calls: attempt 1 + 1x retry for retry.syn, 0 synthesis calls for retry.manual.
@@ -1151,25 +1160,25 @@ def test_stage4_gate3_synthetic_retry_and_manual_fixture_no_retry(tmp_path: Path
     assert "failed checks" in gate3_calls[1]["messages"][1]["content"]
 
 
-def test_v03_parallel_probe_check_and_no_body_lock_churn(tmp_path: Path, monkeypatch) -> None:
+def test_v03_parallel_manners_check_and_no_body_lock_churn(tmp_path: Path, monkeypatch) -> None:
     target_py = tmp_path / "app_mod.py"
     target_py.write_text(
         textwrap.dedent(
             """
-            from probe import probe
+            from manners import manners
 
-            @probe("First check returns warm greeting", id="par.p1")
+            @manners("First check returns warm greeting", id="par.p1")
             def p1(name: str) -> str:
                 \"\"\"Greet the learner.\"\"\"
                 return f"GOOD {name}"
 
-            @probe("Second check returns warm farewell", id="par.p2")
+            @manners("Second check returns warm farewell", id="par.p2")
             def p2(name: str) -> str:
                 \"\"\"Farewell message.\"\"\"
                 return f"GOOD {name}"
 
             def p3_wrap(draft: str) -> str:
-                probe.here("Third check watches draft inline", id="par.p3", draft=draft)
+                manners.here("Third check watches draft inline", id="par.p3", draft=draft)
                 return draft
             """
         ).strip()
@@ -1192,20 +1201,20 @@ def test_v03_parallel_probe_check_and_no_body_lock_churn(tmp_path: Path, monkeyp
                 gate2_barrier.wait()
         return resp
 
-    cfg = ProbeConfig(
+    cfg = MannersConfig(
         models_decision=ModelEndpointConfig(provider="http_decision", url="http://mock.local/decision", model="jev"),
         models_text=ModelEndpointConfig(provider="openai_compat", url="http://mock.local/v1", model="qwen3.5:9b"),
         decision=DecisionConfig(pass_threshold=0.50),
         check=CheckConfig(require_check=True, max_workers=4),
         runtime=RuntimeConfig(
-            runs_dir=str(tmp_path / ".probes" / "runs"),
-            lock_path=str(tmp_path / ".probes" / "lock.json"),
+            runs_dir=str(tmp_path / ".manners" / "runs"),
+            lock_path=str(tmp_path / ".manners" / "lock.json"),
         ),
         project_root=tmp_path,
     )
-    ok, results = run_probe_check([target_py], config=cfg, transport=httpx.MockTransport(parallel_handler))
+    ok, results = run_manners_check([target_py], config=cfg, transport=httpx.MockTransport(parallel_handler))
     assert ok is True
-    assert [(r.probe_id, r.status) for r in results] == [
+    assert [(r.check_id, r.status) for r in results] == [
         ("par.p1", "passed"),
         ("par.p2", "passed"),
         ("par.p3", "passed"),
@@ -1215,24 +1224,24 @@ def test_v03_parallel_probe_check_and_no_body_lock_churn(tmp_path: Path, monkeyp
     target_py.write_text(
         textwrap.dedent(
             """
-            from probe import probe
+            from manners import manners
 
-            @probe("First check returns warm greeting", id="par.p1")
+            @manners("First check returns warm greeting", id="par.p1")
             def p1(name: str) -> str:
                 \"\"\"Greet the learner.\"\"\"
                 tmp = name.strip()
                 # unrelated comment and refactor inside body
                 return f"GOOD {tmp}!"
 
-            @probe("Second check returns warm farewell", id="par.p2")
+            @manners("Second check returns warm farewell", id="par.p2")
             def p2(name: str) -> str:
                 \"\"\"Farewell message.\"\"\"
                 return f"GOOD bye {name}"
 
             def p3_wrap(draft: str) -> str:
-                # extra comment line above probe.here
+                # extra comment line above manners.here
                 note = draft.strip()
-                probe.here("Third check watches draft inline", id="par.p3", draft=draft)
+                manners.here("Third check watches draft inline", id="par.p3", draft=draft)
                 return note
             """
         ).strip()
@@ -1241,7 +1250,7 @@ def test_v03_parallel_probe_check_and_no_body_lock_churn(tmp_path: Path, monkeyp
     )
 
     calls_before = http_calls["n"]
-    ok_cached, res_cached = run_probe_check([target_py], config=cfg, transport=httpx.MockTransport(parallel_handler))
+    ok_cached, res_cached = run_manners_check([target_py], config=cfg, transport=httpx.MockTransport(parallel_handler))
     assert ok_cached is True
     assert [r.status for r in res_cached] == ["cached", "cached", "cached"]
     assert http_calls["n"] == calls_before
@@ -1250,7 +1259,7 @@ def test_v03_parallel_probe_check_and_no_body_lock_churn(tmp_path: Path, monkeyp
     runner = CliRunner()
     list_cached = runner.invoke(app, ["list", "app_mod.py", "--json"])
     assert list_cached.exit_code == 0
-    assert [p["lock_status"] for p in json.loads(list_cached.stdout)["probes"]] == ["locked", "locked", "locked"]
+    assert [p["lock_status"] for p in json.loads(list_cached.stdout)["manners"]] == ["locked", "locked", "locked"]
 
     # Changing a function signature / docstring marks par.p1 as source_changed and triggers re-calibration.
     target_py.write_text(
@@ -1259,7 +1268,7 @@ def test_v03_parallel_probe_check_and_no_body_lock_churn(tmp_path: Path, monkeyp
     )
     list_changed = runner.invoke(app, ["list", "app_mod.py", "--json"])
     assert list_changed.exit_code == 0
-    assert [p["lock_status"] for p in json.loads(list_changed.stdout)["probes"]] == [
+    assert [p["lock_status"] for p in json.loads(list_changed.stdout)["manners"]] == [
         "source_changed",
         "locked",
         "locked",
@@ -1271,9 +1280,9 @@ def test_multi_case_manual_fixtures_backtest_and_hash_invalidation(tmp_path: Pat
     target_py.write_text(
         textwrap.dedent(
             """
-            from probe import probe
+            from manners import manners
 
-            @probe(["Greets warmly", "Uses Spanish phrase"], id="tutor.multi")
+            @manners(["Greets warmly", "Uses Spanish phrase"], id="tutor.multi")
             def greet(name: str) -> str:
                 return f"Hola {name}"
             """
@@ -1282,13 +1291,13 @@ def test_multi_case_manual_fixtures_backtest_and_hash_invalidation(tmp_path: Pat
         encoding="utf-8",
     )
 
-    fixtures_dir = tmp_path / ".probes" / "fixtures"
+    fixtures_dir = tmp_path / ".manners" / "fixtures"
     fixtures_dir.mkdir(parents=True, exist_ok=True)
     fixture_file = fixtures_dir / "tutor.multi.json"
     fixture_file.write_text(
         json.dumps(
             {
-                "probe_id": "tutor.multi",
+                "check_id": "tutor.multi",
                 "pass": [
                     {"inputs": {"name": "Ana"}, "output": "GOOD Hola Ana!"},
                     {"inputs": {"name": "Luis"}, "output": "GOOD Buenos dias Luis!"},
@@ -1303,20 +1312,20 @@ def test_multi_case_manual_fixtures_backtest_and_hash_invalidation(tmp_path: Pat
         encoding="utf-8",
     )
 
-    cfg = ProbeConfig(
+    cfg = MannersConfig(
         models_decision=ModelEndpointConfig(provider="http_decision", url="http://mock.local/decision", model="jev"),
         models_text=ModelEndpointConfig(provider="openai_compat", url="http://mock.local/v1", model="qwen3.5:9b"),
         decision=DecisionConfig(pass_threshold=0.50),
         check=CheckConfig(require_check=True),
         runtime=RuntimeConfig(
-            runs_dir=str(tmp_path / ".probes" / "runs"),
-            lock_path=str(tmp_path / ".probes" / "lock.json"),
+            runs_dir=str(tmp_path / ".manners" / "runs"),
+            lock_path=str(tmp_path / ".manners" / "lock.json"),
         ),
         project_root=tmp_path,
     )
 
     transport = httpx.MockTransport(_stage3_mock_handler)
-    ok, results = run_probe_check([target_py], config=cfg, transport=transport)
+    ok, results = run_manners_check([target_py], config=cfg, transport=transport)
     assert ok is True
     assert results[0].status == "passed"
     assert len(results[0].pass_scores) == 4  # 2 pass cases x 2 checks
@@ -1325,7 +1334,7 @@ def test_multi_case_manual_fixtures_backtest_and_hash_invalidation(tmp_path: Pat
     assert {entry["case"] for entry in results[0].fail_scores} == {0, 1, 2}
 
     # Unchanged fixture hits cache.
-    ok_cached, res_cached = run_probe_check([target_py], config=cfg, transport=transport)
+    ok_cached, res_cached = run_manners_check([target_py], config=cfg, transport=transport)
     assert ok_cached is True
     assert res_cached[0].status == "cached"
 
@@ -1333,7 +1342,7 @@ def test_multi_case_manual_fixtures_backtest_and_hash_invalidation(tmp_path: Pat
     fixture_file.write_text(
         json.dumps(
             {
-                "probe_id": "tutor.multi",
+                "check_id": "tutor.multi",
                 "pass": [
                     {"inputs": {"name": "Ana"}, "output": "GOOD Hola Ana!"},
                     {"inputs": {"name": "Luis"}, "output": "BAD regressed output"},
@@ -1347,7 +1356,7 @@ def test_multi_case_manual_fixtures_backtest_and_hash_invalidation(tmp_path: Pat
         ),
         encoding="utf-8",
     )
-    ok_bad_pass, res_bad_pass = run_probe_check([target_py], config=cfg, transport=transport)
+    ok_bad_pass, res_bad_pass = run_manners_check([target_py], config=cfg, transport=transport)
     assert ok_bad_pass is False
     assert res_bad_pass[0].gate == "gate3"
     assert "case(s) [1]" in res_bad_pass[0].reason
@@ -1356,7 +1365,7 @@ def test_multi_case_manual_fixtures_backtest_and_hash_invalidation(tmp_path: Pat
     fixture_file.write_text(
         json.dumps(
             {
-                "probe_id": "tutor.multi",
+                "check_id": "tutor.multi",
                 "pass": [
                     {"inputs": {"name": "Ana"}, "output": "GOOD Hola Ana!"},
                     {"inputs": {"name": "Luis"}, "output": "GOOD Buenos dias Luis!"},
@@ -1370,7 +1379,7 @@ def test_multi_case_manual_fixtures_backtest_and_hash_invalidation(tmp_path: Pat
         ),
         encoding="utf-8",
     )
-    ok_bad_fail, res_bad_fail = run_probe_check([target_py], config=cfg, transport=transport)
+    ok_bad_fail, res_bad_fail = run_manners_check([target_py], config=cfg, transport=transport)
     assert ok_bad_fail is False
     assert res_bad_fail[0].gate == "gate3"
     assert "case(s) [2]" in res_bad_fail[0].reason
@@ -1379,7 +1388,7 @@ def test_multi_case_manual_fixtures_backtest_and_hash_invalidation(tmp_path: Pat
     fixture_file.write_text(
         json.dumps(
             {
-                "probe_id": "tutor.multi",
+                "check_id": "tutor.multi",
                 "pass": [],
                 "fail": [{"inputs": {"name": "Ana"}, "output": "BAD"}],
             }
@@ -1390,7 +1399,7 @@ def test_multi_case_manual_fixtures_backtest_and_hash_invalidation(tmp_path: Pat
         _load_manual_fixture(fixtures_dir, "tutor.multi")
 
 
-def test_v05_here_rich_excerpt_and_probe_fixture_cli(tmp_path: Path, monkeypatch) -> None:
+def test_v05_here_rich_excerpt_and_manners_fixture_cli(tmp_path: Path, monkeypatch) -> None:
     (tmp_path / "pyproject.toml").write_text(
         textwrap.dedent(
             """
@@ -1398,12 +1407,12 @@ def test_v05_here_rich_excerpt_and_probe_fixture_cli(tmp_path: Path, monkeypatch
             name = "fixture-app"
             version = "0.1.0"
 
-            [tool.probe.models.decision]
+            [tool.manners.models.decision]
             provider = "http_decision"
             url = "http://mock.local/decision"
             model = "jev"
 
-            [tool.probe.models.text]
+            [tool.manners.models.text]
             provider = "openai_compat"
             url = "http://mock.local/v1"
             model = "qwen3.5:9b"
@@ -1416,7 +1425,7 @@ def test_v05_here_rich_excerpt_and_probe_fixture_cli(tmp_path: Path, monkeypatch
     app_py.write_text(
         textwrap.dedent(
             """
-            from probe import probe
+            from manners import manners
 
             def build_teach_turn(user_msg: str) -> str:
                 \"\"\"Assemble a beginner lesson with coupled warmup flags.\"\"\"
@@ -1431,10 +1440,10 @@ def test_v05_here_rich_excerpt_and_probe_fixture_cli(tmp_path: Path, monkeypatch
                 step2 = step1.lower()
                 step3 = f"{target_phrase} {step2}"
                 reply = f"GOOD {step3}"
-                probe.here(
+                manners.here(
                     "Reply aligns with target_phrase and coupled flags",
                     id="tutor.teach_turn",
-                    kind=probe.type.text,
+                    kind=manners.type.text,
                     also_introduce=also_introduce,
                     warmup_recall_only=warmup_recall_only,
                     target_phrase=target_phrase,
@@ -1447,7 +1456,7 @@ def test_v05_here_rich_excerpt_and_probe_fixture_cli(tmp_path: Path, monkeypatch
 
             from typing import Any
 
-            @probe("Recorded items stay coherent", id="tutor.typed_dec")
+            @manners("Recorded items stay coherent", id="tutor.typed_dec")
             def record_state(items: list[str], meta: dict[str, Any], count: int) -> None:
                 return None
             """
@@ -1456,15 +1465,15 @@ def test_v05_here_rich_excerpt_and_probe_fixture_cli(tmp_path: Path, monkeypatch
         encoding="utf-8",
     )
 
-    items = discover_probes([app_py], root=tmp_path)
+    items = discover_manners([app_py], root=tmp_path)
     assert len(items) == 2
-    item = next(p for p in items if p.probe_id == "tutor.teach_turn")
+    item = next(p for p in items if p.check_id == "tutor.teach_turn")
     assert "Assemble a beginner lesson with coupled warmup flags." in item.source_excerpt
     assert 'also_introduce = "gracias"' in item.source_excerpt
     assert "warmup_recall_only = True" in item.source_excerpt
     orig_source_hash = item.source_hash
 
-    # Unrelated body refactor preserves probe.here source_hash.
+    # Unrelated body refactor preserves manners.here source_hash.
     app_py.write_text(
         app_py.read_text(encoding="utf-8").replace(
             "# padding setup lines to exceed 6-line old window",
@@ -1472,19 +1481,19 @@ def test_v05_here_rich_excerpt_and_probe_fixture_cli(tmp_path: Path, monkeypatch
         ),
         encoding="utf-8",
     )
-    items_after = discover_probes([app_py], root=tmp_path)
-    assert next(p for p in items_after if p.probe_id == "tutor.teach_turn").source_hash == orig_source_hash
+    items_after = discover_manners([app_py], root=tmp_path)
+    assert next(p for p in items_after if p.check_id == "tutor.teach_turn").source_hash == orig_source_hash
 
     monkeypatch.chdir(tmp_path)
     runner = CliRunner()
 
-    # --init scaffolds type-aware starter fixtures matching all 7 watched keys and typed @probe params/None return.
+    # --init scaffolds type-aware starter fixtures matching all 7 watched keys and typed @manners params/None return.
     init_res = runner.invoke(app, ["fixture", "tutor.teach_turn", "--init", "--json"])
     assert init_res.exit_code == 0, init_res.stderr
     init_data = json.loads(init_res.stdout)
     assert init_data["pass_count"] == 1
     assert init_data["fail_count"] == 1
-    fixture_fp = tmp_path / ".probes" / "fixtures" / "tutor.teach_turn.json"
+    fixture_fp = tmp_path / ".manners" / "fixtures" / "tutor.teach_turn.json"
     assert fixture_fp.is_file()
     fixture_json = json.loads(fixture_fp.read_text(encoding="utf-8"))
     assert set(fixture_json["pass"][0]["watched"].keys()) == set(item.watched_keys)
@@ -1493,7 +1502,7 @@ def test_v05_here_rich_excerpt_and_probe_fixture_cli(tmp_path: Path, monkeypatch
 
     dec_init = runner.invoke(app, ["fixture", "tutor.typed_dec", "--init", "--json"])
     assert dec_init.exit_code == 0, dec_init.stderr
-    dec_fp = tmp_path / ".probes" / "fixtures" / "tutor.typed_dec.json"
+    dec_fp = tmp_path / ".manners" / "fixtures" / "tutor.typed_dec.json"
     dec_json = json.loads(dec_fp.read_text(encoding="utf-8"))
     assert dec_json["pass"][0]["inputs"] == {
         "items": ["<PASS:items>"],
@@ -1509,16 +1518,16 @@ def test_v05_here_rich_excerpt_and_probe_fixture_cli(tmp_path: Path, monkeypatch
     assert dec_json["fail"][0]["output"] is None
     dec_fp.unlink()
 
-    # Drop the extra typed decorator probe before running fixture promotion + Gate 3 check on tutor.teach_turn.
+    # Drop the extra typed decorator check before running fixture promotion + Gate 3 check on tutor.teach_turn.
     app_py.write_text(
         app_py.read_text(encoding="utf-8").split("\nfrom typing import Any")[0].rstrip() + "\n",
         encoding="utf-8",
     )
 
-    # Clear fixture and verify `probe fixture` promotes recorded pass + fail snapshots across runs.
+    # Clear fixture and verify `manners fixture` promotes recorded pass + fail snapshots across runs.
     fixture_fp.unlink()
-    runs_dir = tmp_path / ".probes" / "runs"
-    store = ProbeStore(runs_dir, create=True)
+    runs_dir = tmp_path / ".manners" / "runs"
+    store = MannersStore(runs_dir, create=True)
     try:
         r_fail = "01FIXTURE00000000000000001"
         store.create_run(
@@ -1534,9 +1543,9 @@ def test_v05_here_rich_excerpt_and_probe_fixture_cli(tmp_path: Path, monkeypatch
             call_seq=1,
             elapsed_ms=10.0,
             started_at="2026-11-18T10:00:00.010000Z",
-            probe_id="tutor.teach_turn",
+            check_id="tutor.teach_turn",
             site="here",
-            probe_type="text",
+            check_type="text",
             file_line="teach.py:16",
             checks=item.checks,
             payload_json=json.dumps({"watched": {k: "BAD" for k in item.watched_keys}}),
@@ -1551,7 +1560,7 @@ def test_v05_here_rich_excerpt_and_probe_fixture_cli(tmp_path: Path, monkeypatch
         assert "found 0 pass, 1 fail" in incomplete_res.stderr
         assert not fixture_fp.exists()
 
-        # Second run records a passing snapshot -> `probe fixture` promotes both into pass + fail lists.
+        # Second run records a passing snapshot -> `manners fixture` promotes both into pass + fail lists.
         r_pass = "01FIXTURE00000000000000002"
         store.create_run(
             r_pass,
@@ -1566,9 +1575,9 @@ def test_v05_here_rich_excerpt_and_probe_fixture_cli(tmp_path: Path, monkeypatch
             call_seq=1,
             elapsed_ms=12.0,
             started_at="2026-11-18T10:05:00.012000Z",
-            probe_id="tutor.teach_turn",
+            check_id="tutor.teach_turn",
             site="here",
-            probe_type="text",
+            check_type="text",
             file_line="teach.py:16",
             checks=item.checks,
             payload_json=json.dumps({"watched": {k: "GOOD ok" for k in item.watched_keys}}),
@@ -1589,7 +1598,7 @@ def test_v05_here_rich_excerpt_and_probe_fixture_cli(tmp_path: Path, monkeypatch
     assert json.loads(promo_again.stdout)["pass_count"] == 1
     assert json.loads(promo_again.stdout)["fail_count"] == 1
 
-    # Promoted fixture passes `probe check` Gate 3 directly without synthetic synthesis.
+    # Promoted fixture passes `manners check` Gate 3 directly without synthetic synthesis.
     synth_called = {"n": 0}
 
     def check_handler(request: httpx.Request) -> httpx.Response:
@@ -1599,23 +1608,23 @@ def test_v05_here_rich_excerpt_and_probe_fixture_cli(tmp_path: Path, monkeypatch
             if "passing_snapshot" in body["messages"][0]["content"]:
                 synth_called["n"] += 1
             return httpx.Response(200, json={"choices": [{"message": {"content": "Factual check audit."}}]})
-        if body["probe_id"].endswith("#gate2"):
+        if body["check_id"].endswith("#gate2"):
             return httpx.Response(200, json={"probabilities": [0.05 for _ in body["checks"]]})
         ok = "GOOD" in body["snapshot"]
         return httpx.Response(200, json={"probabilities": [0.95 if ok else 0.10 for _ in body["checks"]]})
 
-    cfg = ProbeConfig(
+    cfg = MannersConfig(
         models_decision=ModelEndpointConfig(provider="http_decision", url="http://mock.local/decision", model="jev"),
         models_text=ModelEndpointConfig(provider="openai_compat", url="http://mock.local/v1", model="qwen3.5:9b"),
         decision=DecisionConfig(pass_threshold=0.50),
         check=CheckConfig(require_check=True),
         runtime=RuntimeConfig(
             runs_dir=str(runs_dir),
-            lock_path=str(tmp_path / ".probes" / "lock.json"),
+            lock_path=str(tmp_path / ".manners" / "lock.json"),
         ),
         project_root=tmp_path,
     )
-    ok_check, res_check = run_probe_check([app_py], config=cfg, transport=httpx.MockTransport(check_handler))
+    ok_check, res_check = run_manners_check([app_py], config=cfg, transport=httpx.MockTransport(check_handler))
     assert ok_check is True
     assert res_check[0].status == "passed"
     assert synth_called["n"] == 0
@@ -1626,13 +1635,13 @@ def test_v051_gate2_retry_recovers_transient_disagreement(tmp_path: Path) -> Non
     target_py.write_text(
         textwrap.dedent(
             """
-            from probe import probe
+            from manners import manners
 
             def cycle_grade(progress_note: str) -> str:
-                probe.here(
+                manners.here(
                     "When progress_note is non-empty, its summary accurately reflects learner turns",
                     id="tutor.cycle_grade",
-                    kind=probe.type.text,
+                    kind=manners.type.text,
                     progress_note=progress_note,
                 )
                 return progress_note
@@ -1649,7 +1658,7 @@ def test_v051_gate2_retry_recovers_transient_disagreement(tmp_path: Path) -> Non
         body = json.loads(request.content.decode("utf-8"))
         if url.endswith("/chat/completions"):
             sys_msg = body["messages"][0]["content"]
-            if "Gate 2" in body["messages"][0]["content"] or "audit @probe" in sys_msg:
+            if "Gate 2" in body["messages"][0]["content"] or "audit @manners" in sys_msg:
                 gate2_temps.append(body["temperature"])
                 return httpx.Response(
                     200,
@@ -1663,7 +1672,7 @@ def test_v051_gate2_retry_recovers_transient_disagreement(tmp_path: Path) -> Non
                 }
                 return httpx.Response(200, json={"choices": [{"message": {"content": json.dumps(payload)}}]})
             return httpx.Response(200, json={"choices": [{"message": {"content": "Evidence summary."}}]})
-        if body["probe_id"].endswith("#gate2"):
+        if body["check_id"].endswith("#gate2"):
             # Attempt 1 fails transiently (0.62 >= 0.50); attempt 2 passes (0.05 < 0.50).
             if len(gate2_temps) == 1:
                 return httpx.Response(200, json={"probabilities": [0.62, 0.05, 0.05]})
@@ -1671,18 +1680,18 @@ def test_v051_gate2_retry_recovers_transient_disagreement(tmp_path: Path) -> Non
         ok = "GOOD" in body["snapshot"]
         return httpx.Response(200, json={"probabilities": [0.95 if ok else 0.10]})
 
-    cfg = ProbeConfig(
+    cfg = MannersConfig(
         models_decision=ModelEndpointConfig(provider="http_decision", url="http://mock.local/decision", model="jev"),
         models_text=ModelEndpointConfig(provider="openai_compat", url="http://mock.local/v1", model="qwen3.5:9b"),
         decision=DecisionConfig(pass_threshold=0.50),
         check=CheckConfig(require_check=True),
         runtime=RuntimeConfig(
-            runs_dir=str(tmp_path / ".probes" / "runs"),
-            lock_path=str(tmp_path / ".probes" / "lock.json"),
+            runs_dir=str(tmp_path / ".manners" / "runs"),
+            lock_path=str(tmp_path / ".manners" / "lock.json"),
         ),
         project_root=tmp_path,
     )
-    ok, results = run_probe_check([target_py], config=cfg, transport=httpx.MockTransport(retry_handler))
+    ok, results = run_manners_check([target_py], config=cfg, transport=httpx.MockTransport(retry_handler))
     assert ok is True
     assert results[0].status == "passed"
     assert gate2_temps == [0.0, 0.2]
@@ -1693,7 +1702,7 @@ def test_v051_gate2_retry_recovers_transient_disagreement(tmp_path: Path) -> Non
             return httpx.Response(200, json={"choices": [{"message": {"content": "Mechanical length check."}}]})
         return httpx.Response(200, json={"probabilities": [0.95, 0.05, 0.05]})
 
-    ok_fail, res_fail = run_probe_check(
+    ok_fail, res_fail = run_manners_check(
         [target_py],
         force=True,
         config=cfg,
@@ -1704,23 +1713,23 @@ def test_v051_gate2_retry_recovers_transient_disagreement(tmp_path: Path) -> Non
 
 
 def test_v06_decorator_ignore_gate1_gate2_gate3_and_margins(tmp_path: Path, monkeypatch) -> None:
-    # 1. Gate 1 rejects unknown/empty/dynamic `ignore` on @probe.
+    # 1. Gate 1 rejects unknown/empty/dynamic `ignore` on @manners.
     bad_py = tmp_path / "bad_ignore.py"
     bad_py.write_text(
         textwrap.dedent(
             """
-            from probe import probe
+            from manners import manners
 
-            @probe("Output summarizes metrics", id="bad.unknown", ignore=("missing_param",))
+            @manners("Output summarizes metrics", id="bad.unknown", ignore=("missing_param",))
             def fn_a(account: str) -> str:
                 return account
 
-            @probe("Output summarizes metrics", id="bad.empty", ignore="")
+            @manners("Output summarizes metrics", id="bad.empty", ignore="")
             def fn_b(account: str) -> str:
                 return account
 
             DYN = ("x",)
-            @probe("Output summarizes metrics", id="bad.dyn", ignore=DYN)
+            @manners("Output summarizes metrics", id="bad.dyn", ignore=DYN)
             def fn_c(account: str) -> str:
                 return account
             """
@@ -1728,33 +1737,33 @@ def test_v06_decorator_ignore_gate1_gate2_gate3_and_margins(tmp_path: Path, monk
         + "\n",
         encoding="utf-8",
     )
-    cfg = ProbeConfig(
+    cfg = MannersConfig(
         models_decision=ModelEndpointConfig(provider="http_decision", url="http://mock.local/decision", model="jev"),
         models_text=ModelEndpointConfig(provider="openai_compat", url="http://mock.local/v1", model="qwen3.5:9b"),
         decision=DecisionConfig(pass_threshold=0.50),
         check=CheckConfig(require_check=True),
         runtime=RuntimeConfig(
-            runs_dir=str(tmp_path / ".probes" / "runs"),
-            lock_path=str(tmp_path / ".probes" / "lock.json"),
+            runs_dir=str(tmp_path / ".manners" / "runs"),
+            lock_path=str(tmp_path / ".manners" / "lock.json"),
         ),
         project_root=tmp_path,
     )
-    ok_bad, res_bad = run_probe_check([bad_py], config=cfg)
+    ok_bad, res_bad = run_manners_check([bad_py], config=cfg)
     assert ok_bad is False
-    by_id = {r.probe_id: r for r in res_bad}
+    by_id = {r.check_id: r for r in res_bad}
     assert by_id["bad.unknown"].gate == "gate1" and "unknown parameter" in by_id["bad.unknown"].reason
     assert by_id["bad.empty"].gate == "gate1" and "empty" in by_id["bad.empty"].reason
     assert by_id["bad.dyn"].gate == "gate1" and "literal" in by_id["bad.dyn"].reason
 
-    # 2. Valid @probe(..., ignore=...) filters params, prompts, --init skeletons, and surfaces margins.
+    # 2. Valid @manners(..., ignore=...) filters params, prompts, --init skeletons, and surfaces margins.
     good_py = tmp_path / "svc.py"
     good_py.write_text(
         textwrap.dedent(
             """
             from pathlib import Path
-            from probe import probe
+            from manners import manners
 
-            @probe("Output summarizes portfolio metrics cleanly", id="svc.summary", ignore=("data_dir", "llm_client"))
+            @manners("Output summarizes portfolio metrics cleanly", id="svc.summary", ignore=("data_dir", "llm_client"))
             def run_report(account: str, data_dir: Path, llm_client: object) -> str:
                 return account
             """
@@ -1773,7 +1782,7 @@ def test_v06_decorator_ignore_gate1_gate2_gate3_and_margins(tmp_path: Path, monk
             sys_msg = body["messages"][0]["content"]
             user_msg = body["messages"][1]["content"]
             seen_text_users.append(user_msg)
-            if "audit @probe" in sys_msg:
+            if "audit @manners" in sys_msg:
                 return httpx.Response(200, json={"choices": [{"message": {"content": "Check [0] checks output."}}]})
             payload = {
                 "notes": "ok",
@@ -1781,12 +1790,12 @@ def test_v06_decorator_ignore_gate1_gate2_gate3_and_margins(tmp_path: Path, monk
                 "failing_snapshot": {"inputs": {"account": "acct-1"}, "output": "BAD garbled text."},
             }
             return httpx.Response(200, json={"choices": [{"message": {"content": json.dumps(payload)}}]})
-        if body["probe_id"].endswith("#gate2"):
+        if body["check_id"].endswith("#gate2"):
             return httpx.Response(200, json={"probabilities": [0.04, 0.04, 0.04]})
         ok = "GOOD" in body["snapshot"]
         return httpx.Response(200, json={"probabilities": [0.93 if ok else 0.12]})
 
-    ok_good, res_good = run_probe_check(
+    ok_good, res_good = run_manners_check(
         [good_py], config=cfg, transport=httpx.MockTransport(ok_handler)
     )
     assert ok_good is True
@@ -1799,14 +1808,14 @@ def test_v06_decorator_ignore_gate1_gate2_gate3_and_margins(tmp_path: Path, monk
     assert expected_hdr in seen_text_users[1]
 
     lock_data = json.loads(cfg.resolve_lock_path().read_text(encoding="utf-8"))
-    entry = lock_data["probes"]["svc.summary"]
+    entry = lock_data["manners"]["svc.summary"]
     assert entry["param_names"] == ["account"]
     assert entry["ignored_params"] == ["data_dir", "llm_client"]
     assert entry["pass_min_p"] == pytest.approx(0.93)
     assert entry["fail_max_p"] == pytest.approx(0.12)
 
     # Cached run also surfaces stored calibration margins.
-    ok_cached, res_cached = run_probe_check(
+    ok_cached, res_cached = run_manners_check(
         [good_py], config=cfg, transport=httpx.MockTransport(ok_handler)
     )
     assert ok_cached is True
@@ -1814,7 +1823,7 @@ def test_v06_decorator_ignore_gate1_gate2_gate3_and_margins(tmp_path: Path, monk
     assert "pass min p=0.93, fail max p=0.12" in res_cached[0].reason
 
     # Snapshot validation rejects accidental ignored keys.
-    disc_item = discover_probes([good_py], root=tmp_path)[0]
+    disc_item = discover_manners([good_py], root=tmp_path)[0]
     with pytest.raises(BackendError, match="must omit ignored input"):
         _validate_gate3_snapshot(
             json.dumps({"inputs": {"account": "acct-1", "data_dir": "/tmp"}, "output": "ok"}),
@@ -1827,7 +1836,7 @@ def test_v06_decorator_ignore_gate1_gate2_gate3_and_margins(tmp_path: Path, monk
     monkeypatch.chdir(tmp_path)
     fix_res = CliRunner().invoke(app, ["fixture", "svc.summary", "--init", "--json"])
     assert fix_res.exit_code == 0, fix_res.stdout
-    fix_payload = json.loads((tmp_path / ".probes" / "fixtures" / "svc.summary.json").read_text(encoding="utf-8"))
+    fix_payload = json.loads((tmp_path / ".manners" / "fixtures" / "svc.summary.json").read_text(encoding="utf-8"))
     assert fix_payload["pass"] == [{"inputs": {"account": "<PASS:account>"}, "output": "<PASS:output>"}]
     assert fix_payload["fail"] == [{"inputs": {"account": "<FAIL:account>"}, "output": "<FAIL:output>"}]
 
@@ -1839,7 +1848,7 @@ def test_v06_cli_root_and_monorepo_check_list_fixture_report(tmp_path: Path, mon
     pkg_dir = sub / "src" / "portfolio"
     pkg_dir.mkdir(parents=True)
 
-    # Local loopback mock server for full CLI `probe check --root services/portfolio` verification.
+    # Local loopback mock server for full CLI `manners check --root services/portfolio` verification.
     class MockHandler(http.server.BaseHTTPRequestHandler):
         def log_message(self, format: str, *args: object) -> None:
             return
@@ -1849,7 +1858,7 @@ def test_v06_cli_root_and_monorepo_check_list_fixture_report(tmp_path: Path, mon
             body = json.loads(self.rfile.read(length).decode("utf-8"))
             if self.path.endswith("/chat/completions"):
                 sys_msg = body["messages"][0]["content"]
-                if "audit @probe" in sys_msg:
+                if "audit @manners" in sys_msg:
                     resp = {"choices": [{"message": {"content": "Check [0] evaluates reply quality."}}]}
                 else:
                     snap = {
@@ -1859,7 +1868,7 @@ def test_v06_cli_root_and_monorepo_check_list_fixture_report(tmp_path: Path, mon
                     }
                     resp = {"choices": [{"message": {"content": json.dumps(snap)}}]}
             else:
-                if body.get("probe_id", "").endswith("#gate2"):
+                if body.get("check_id", "").endswith("#gate2"):
                     resp = {"probabilities": [0.03, 0.03, 0.03]}
                 else:
                     ok = "GOOD" in body.get("snapshot", "")
@@ -1882,11 +1891,11 @@ def test_v06_cli_root_and_monorepo_check_list_fixture_report(tmp_path: Path, mon
                 f"""
                 [project]
                 name = "portfolio"
-                [tool.probe.models.decision]
+                [tool.manners.models.decision]
                 provider = "http_decision"
                 url = "{base_url}/decision"
                 model = "local-decision"
-                [tool.probe.models.text]
+                [tool.manners.models.text]
                 provider = "openai_compat"
                 url = "{base_url}/v1"
                 model = "qwen3.5:9b"
@@ -1899,9 +1908,9 @@ def test_v06_cli_root_and_monorepo_check_list_fixture_report(tmp_path: Path, mon
         (pkg_dir / "app.py").write_text(
             textwrap.dedent(
                 """
-                from probe import probe
+                from manners import manners
 
-                @probe("Reply states clear metric summary", id="portfolio.app.summary")
+                @manners("Reply states clear metric summary", id="portfolio.app.summary")
                 def summarize(ticker: str) -> str:
                     return f"{ticker}: ok"
                 """
@@ -1910,8 +1919,8 @@ def test_v06_cli_root_and_monorepo_check_list_fixture_report(tmp_path: Path, mon
             encoding="utf-8",
         )
 
-        # Populate two runs in services/portfolio/.probes/runs for report/log/runs/clean.
-        store = ProbeStore(sub / ".probes" / "runs", create=True)
+        # Populate two runs in services/portfolio/.manners/runs for report/log/runs/clean.
+        store = MannersStore(sub / ".manners" / "runs", create=True)
         try:
             store.create_run(
                 "01RUNA00000000000000000001",
@@ -1935,9 +1944,9 @@ def test_v06_cli_root_and_monorepo_check_list_fixture_report(tmp_path: Path, mon
                 call_seq=1,
                 elapsed_ms=10.0,
                 started_at="2026-11-18T11:00:00.010Z",
-                probe_id="portfolio.app.summary",
+                check_id="portfolio.app.summary",
                 site="decorator",
-                probe_type="decision",
+                check_type="decision",
                 file_line="src/portfolio/app.py:4",
                 checks=("Reply states clear metric summary",),
                 payload_json='{"inputs": {"ticker": "AAPL"}, "output": "AAPL: ok"}',
@@ -1948,25 +1957,25 @@ def test_v06_cli_root_and_monorepo_check_list_fixture_report(tmp_path: Path, mon
         finally:
             store.close()
 
-        monkeypatch.setenv("PROBE_CONFIG", str(tmp_path / "no_user.toml"))
-        monkeypatch.delenv("PROBE_PROJECT_ROOT", raising=False)
+        monkeypatch.setenv("MANNERS_CONFIG", str(tmp_path / "no_user.toml"))
+        monkeypatch.delenv("MANNERS_PROJECT_ROOT", raising=False)
         monkeypatch.chdir(mono)
         runner = CliRunner()
 
         list_global = runner.invoke(app, ["--root", "services/portfolio", "list", "--json"])
         assert list_global.exit_code == 0, list_global.stdout
-        assert [p["probe_id"] for p in json.loads(list_global.stdout)["probes"]] == ["portfolio.app.summary"]
+        assert [p["check_id"] for p in json.loads(list_global.stdout)["manners"]] == ["portfolio.app.summary"]
 
         chk = runner.invoke(app, ["check", "--root", "services/portfolio"])
         assert chk.exit_code == 0, chk.stdout + chk.stderr
         assert "[PASSED] portfolio.app.summary (src/portfolio/app.py:4)" in chk.stdout
         assert "Passed Gate 2 audit & Gate 3 synthetic calibration (pass min p=0.91, fail max p=0.08)" in chk.stdout
-        assert (sub / ".probes" / "lock.json").is_file()
-        assert not (mono / ".probes").exists()
+        assert (sub / ".manners" / "lock.json").is_file()
+        assert not (mono / ".manners").exists()
 
         fix = runner.invoke(app, ["fixture", "portfolio.app.summary", "--init", "--root", "services/portfolio"])
         assert fix.exit_code == 0, fix.stdout
-        assert (sub / ".probes" / "fixtures" / "portfolio.app.summary.json").is_file()
+        assert (sub / ".manners" / "fixtures" / "portfolio.app.summary.json").is_file()
 
         rep = runner.invoke(app, ["report", "--all", "--root", "services/portfolio"])
         assert rep.exit_code == 0 and "portfolio.app.summary" in rep.stdout
@@ -1985,16 +1994,16 @@ def test_v06_cli_root_and_monorepo_check_list_fixture_report(tmp_path: Path, mon
 
 
 def test_v061_gate3_truncation_retry_max_items_50_and_import_hint(tmp_path: Path) -> None:
-    from probe.redact import SecretRedactor, serialize_call_snapshot
+    from manners.redact import SecretRedactor, serialize_call_snapshot
 
     # 1. Gate 3 omits max_tokens by default and retries once with concise-output feedback on finish_reason='length'.
     app_py = tmp_path / "summary.py"
     app_py.write_text(
         textwrap.dedent(
             """
-            from probe import probe
+            from manners import manners
 
-            @probe("Summary captures all key action items", id="app.summary")
+            @manners("Summary captures all key action items", id="app.summary")
             def make_summary(notes: str) -> dict[str, str]:
                 return {"summary": notes}
             """
@@ -2034,24 +2043,24 @@ def test_v061_gate3_truncation_retry_max_items_50_and_import_hint(tmp_path: Path
                 200,
                 json={"choices": [{"message": {"content": "Check evaluates summary completeness."}}]},
             )
-        if body["probe_id"].endswith("#gate2"):
+        if body["check_id"].endswith("#gate2"):
             return httpx.Response(200, json={"probabilities": [0.05 for _ in body["checks"]]})
         ok = "GOOD" in body["snapshot"]
         return httpx.Response(200, json={"probabilities": [0.94 if ok else 0.08]})
 
-    cfg = ProbeConfig(
+    cfg = MannersConfig(
         models_decision=ModelEndpointConfig(provider="http_decision", url="http://mock.local/decision", model="jev"),
         models_text=ModelEndpointConfig(provider="openai_compat", url="http://mock.local/v1", model="qwen3.5:9b"),
         decision=DecisionConfig(pass_threshold=0.50),
         text=TextConfig(),
         check=CheckConfig(require_check=True),
         runtime=RuntimeConfig(
-            runs_dir=str(tmp_path / ".probes" / "runs"),
-            lock_path=str(tmp_path / ".probes" / "lock.json"),
+            runs_dir=str(tmp_path / ".manners" / "runs"),
+            lock_path=str(tmp_path / ".manners" / "lock.json"),
         ),
         project_root=tmp_path,
     )
-    ok_check, results = run_probe_check([app_py], config=cfg, transport=httpx.MockTransport(handler))
+    ok_check, results = run_manners_check([app_py], config=cfg, transport=httpx.MockTransport(handler))
     assert ok_check is True
     assert results[0].status == "passed"
     assert len(gate3_calls) == 2
@@ -2083,14 +2092,14 @@ def test_v061_gate3_truncation_retry_max_items_50_and_import_hint(tmp_path: Path
     )
     assert snap_55["output"]["__truncated_items__"] == 5
 
-    # 3. Gate 1 import hint explicitly mentions `from probe import probe` and `probe.type`.
+    # 3. Gate 1 import hint explicitly mentions `from manners import manners` and `manners.type`.
     bad_import_py = tmp_path / "bad_import.py"
     bad_import_py.write_text(
         textwrap.dedent(
             """
-            import probe
+            import manners
 
-            @probe("Output summarizes metrics", id="app.bad")
+            @manners("Output summarizes metrics", id="app.bad")
             def bad(x: str) -> str:
                 return x
             """
@@ -2098,8 +2107,8 @@ def test_v061_gate3_truncation_retry_max_items_50_and_import_hint(tmp_path: Path
         + "\n",
         encoding="utf-8",
     )
-    ok_bad, res_bad = run_probe_check([bad_import_py], config=cfg, transport=httpx.MockTransport(handler))
+    ok_bad, res_bad = run_manners_check([bad_import_py], config=cfg, transport=httpx.MockTransport(handler))
     assert ok_bad is False
     assert res_bad[0].gate == "gate1"
-    assert "from probe import probe" in res_bad[0].reason
-    assert "probe.type" in res_bad[0].reason
+    assert "from manners import manners" in res_bad[0].reason
+    assert "manners.type" in res_bad[0].reason
