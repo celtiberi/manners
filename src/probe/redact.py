@@ -559,7 +559,7 @@ def serialize_call_inputs(
     *,
     ignore: Sequence[str] = (),
     max_depth: int = 4,
-    max_items: int = 25,
+    max_items: int = 50,
     max_str_bytes: int = 4096,
 ) -> dict[str, Any]:
     """Bind function arguments by parameter name, drop ignored handles, mask secrets, and bound sizes."""
@@ -595,7 +595,7 @@ def serialize_call_snapshot(
     has_return: bool = False,
     exception: BaseException | None = None,
     max_depth: int = 4,
-    max_items: int = 25,
+    max_items: int = 50,
     max_str_bytes: int = 4096,
 ) -> str:
     """Build redacted JSON payload combining entry inputs and exit return/exception."""
@@ -619,7 +619,7 @@ def serialize_here_snapshot(
     redactor: SecretRedactor,
     *,
     max_depth: int = 4,
-    max_items: int = 25,
+    max_items: int = 50,
     max_str_bytes: int = 4096,
 ) -> str:
     """Serialize watched variables for probe.here(...) with redaction and size bounds."""

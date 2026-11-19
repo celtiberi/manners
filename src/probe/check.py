@@ -16,7 +16,7 @@ from typing import Any
 
 import httpx
 
-from probe.backends import BackendError, CheckScore, DecisionBackend, TextBackend
+from probe.backends import BackendError, CheckScore, DecisionBackend, ModelTruncatedError, TextBackend
 from probe.config import ProbeConfig, load_config, utc_now_iso
 from probe.prompts import get_noul_expected, get_nouls
 from probe.redact import SecretRedactor
@@ -176,7 +176,11 @@ def _classify_probe_decorator(
             if role == "module":
                 return (
                     node,
-                    "Module `probe` is not callable; use `@probe.probe(...)` or `from probe import probe`",
+                    (
+                        "Module `probe` is not callable; use `from probe import probe` "
+                        "(which also exposes `probe.type`, `probe.here`, and `probe.disabled`) "
+                        "or `@probe.probe(...)`"
+                    ),
                     True,
                 )
         elif (
@@ -1607,6 +1611,7 @@ def _evaluate_uncached_probe(
     fixture_source = "fixture" if fixture is not None else "synthetic"
     max_attempts = 1 if fixture is not None else 2
     retry_feedback = ""
+    gate3_max_tokens: int | None = None
     pass_case_scores: list[list[CheckScore]] = []
     fail_case_scores: list[list[CheckScore]] = []
     bad_pass_indices: list[int] = []
@@ -1631,9 +1636,17 @@ def _evaluate_uncached_probe(
                     captured_params=item.param_names,
                     temperature=0.0 if attempt == 1 else 0.3,
                     retry_feedback=retry_feedback,
+                    max_tokens=gate3_max_tokens,
                 )
                 raw_pass_cases, raw_fail_cases = (p_snap,), (f_snap,)
         except BackendError as exc:
+            if fixture is None and attempt == 1 and isinstance(exc, ModelTruncatedError):
+                gate3_max_tokens = max(4096, cfg.text.max_tokens * 2)
+                retry_feedback = (
+                    "Previous synthetic fixture JSON truncated at max_tokens; "
+                    "keep field values concise while satisfying every check."
+                )
+                continue
             err_msg = str(exc)
             is_shape_err = (
                 "Gate 3 synthesis missing" in err_msg or "Expected JSON object" in err_msg

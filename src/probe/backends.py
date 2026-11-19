@@ -36,7 +36,7 @@ _LEGACY_JEV_MODELS = frozenset({"", "jev", "typesafe-ai/jev"})
 _RETRY_STATUS_CODES = frozenset({429, 500, 502, 503, 504, 529})
 _MAX_HTTP_ATTEMPTS = 2
 _RETRY_BACKOFF_S = 0.4
-_USER_AGENT = "probe/0.5"
+_USER_AGENT = "probe/0.6"
 
 
 class BackendError(RuntimeError):
@@ -866,6 +866,7 @@ class TextBackend:
         captured_params: Sequence[str] | None = None,
         temperature: float = 0.0,
         retry_feedback: str = "",
+        max_tokens: int | None = None,
     ) -> tuple[str, str]:
         """Gate 3 synthesis: create one valid passing snapshot and one realistic near-miss failing snapshot."""
         system, user = format_gate3_fixtures_prompts(
@@ -880,10 +881,13 @@ class TextBackend:
             domain_context=self.domain_context,
             retry_feedback=retry_feedback,
         )
+        effective_max_tokens = (
+            max_tokens if max_tokens is not None else max(2400, self.text_cfg.max_tokens)
+        )
         content = self._chat(
             system,
             user,
-            max_tokens=max(1200, self.text_cfg.max_tokens),
+            max_tokens=effective_max_tokens,
             include_user_system=False,
             output_schema=get_output_schema("check_gate3_fixtures"),
             temperature=temperature,
