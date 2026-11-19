@@ -5,6 +5,7 @@ from __future__ import annotations
 import concurrent.futures
 import http.server
 import json
+import os
 import subprocess
 import sys
 import textwrap
@@ -150,15 +151,53 @@ def test_pytest_plugin_markers_flags_and_daemon_thread_halt(tmp_path: Path) -> N
                     t.start()
                     assert in_call.wait(timeout=2.0)
                     time.sleep(0.15)
+
+
+                @pytest.fixture
+                def mocked_setup_teardown_fixture():
+                    probe.here("Output is GOOD", id="sub.fix_setup", reply="BAD setup stub")
+                    yield "ok"
+                    probe.here("Output is GOOD", id="sub.fix_teardown", reply="BAD teardown stub")
+
+
+                def test_fixture_setup_and_teardown_skip_under_no_probes(mocked_setup_teardown_fixture):
+                    assert mocked_setup_teardown_fixture == "ok"
+
+
+                @pytest.fixture
+                def failing_setup_fixture():
+                    probe.here("Output is GOOD", id="sub.shared_fix", reply="BAD shared setup")
+                    return "never"
+
+
+                def test_shared_failing_fixture_first(failing_setup_fixture):
+                    assert failing_setup_fixture == "never"
+
+
+                def test_shared_failing_fixture_second(failing_setup_fixture):
+                    assert failing_setup_fixture == "never"
+
+
+                @pytest.mark.probes(force=True)
+                def test_forced_probes_marker_runs_even_without_env():
+                    probe.here("Output is GOOD", id="sub.forced_mark", reply="GOOD forced")
                 """
             ).strip()
             + "\n",
             encoding="utf-8",
         )
 
-        # 1. Under addopts="--no-probes": unmarked + no_probes skip HTTP; @pytest.mark.probes runs HTTP and passes.
+        # 1. Under addopts="--no-probes": unmarked + fixture setup/teardown skip HTTP; @pytest.mark.probes runs.
         res_ok = subprocess.run(
-            [sys.executable, "-m", "pytest", "-k", "not test_daemon_thread_halt_fails_test", "-q"],
+            [
+                sys.executable,
+                "-m",
+                "pytest",
+                "-k",
+                "test_mocked_unit_skips_under_no_probes or test_probed_marker_overrides_no_probes "
+                "or test_no_probes_marker_wins_over_cli_flag or test_fixture_setup_and_teardown_skip_under_no_probes",
+                "-q",
+            ],
             cwd=proj,
             capture_output=True,
             text=True,
@@ -190,11 +229,22 @@ def test_pytest_plugin_markers_flags_and_daemon_thread_halt(tmp_path: Path) -> N
         assert "sub.unit" in res_cli.stdout + res_cli.stderr
         assert "sub.no_probes" not in res_cli.stdout + res_cli.stderr
 
-        # 3. Unjoined daemon thread ProbeHaltError is drained at test teardown without warning noise and fails test.
+        # 3. Unjoined daemon thread ProbeHaltError fails with zero Pluggy/Thread warnings even when treated as errors.
         seen_snapshots.clear()
         bad_request_seen.clear()
         res_daemon = subprocess.run(
-            [sys.executable, "-m", "pytest", "-k", "test_daemon_thread_halt_fails_test", "-q"],
+            [
+                sys.executable,
+                "-m",
+                "pytest",
+                "-W",
+                "error::pluggy.PluggyTeardownRaisedWarning",
+                "-W",
+                "error::pytest.PytestUnhandledThreadExceptionWarning",
+                "-k",
+                "test_daemon_thread_halt_fails_test",
+                "-q",
+            ],
             cwd=proj,
             capture_output=True,
             text=True,
@@ -203,7 +253,63 @@ def test_pytest_plugin_markers_flags_and_daemon_thread_halt(tmp_path: Path) -> N
         assert res_daemon.returncode == 1
         combined = res_daemon.stdout + res_daemon.stderr
         assert "sub.daemon_bad" in combined
+        assert "PluggyTeardownRaisedWarning" not in combined
         assert "PytestUnhandledThreadExceptionWarning" not in combined
+
+        # 4. Shared fixture failing with ProbeHaltError during setup cleanly fails both tests without _finalizers crash.
+        seen_snapshots.clear()
+        res_shared = subprocess.run(
+            [sys.executable, "-m", "pytest", "--probes", "-k", "test_shared_failing_fixture_", "-q"],
+            cwd=proj,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert res_shared.returncode == 1
+        shared_out = res_shared.stdout + res_shared.stderr
+        assert "2 errors" in shared_out
+        assert "_finalizers" not in shared_out
+
+        # 5. Explicit PROBES=0 in env suppresses @pytest.mark.probes (honors env override cleanly).
+        seen_snapshots.clear()
+        env_off = {**os.environ, "PROBES": "0"}
+        res_env_off = subprocess.run(
+            [sys.executable, "-m", "pytest", "-k", "test_probed_marker_overrides_no_probes", "-q"],
+            cwd=proj,
+            env=env_off,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert res_env_off.returncode == 0, res_env_off.stdout + res_env_off.stderr
+        assert seen_snapshots == []
+
+        # 6. Keyless/offline CI (no .env, PROBES unset): @pytest.mark.probes skips; --probes and force=True still run.
+        (proj / ".env").unlink()
+        seen_snapshots.clear()
+        env_ci = {k: v for k, v in os.environ.items() if k != "PROBES"}
+        res_ci = subprocess.run(
+            [sys.executable, "-m", "pytest", "-k", "test_probed_marker_overrides_no_probes", "-q"],
+            cwd=proj,
+            env=env_ci,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert res_ci.returncode == 0, res_ci.stdout + res_ci.stderr
+        assert seen_snapshots == []
+
+        res_forced = subprocess.run(
+            [sys.executable, "-m", "pytest", "-k", "test_forced_probes_marker_runs_even_without_env", "-q"],
+            cwd=proj,
+            env=env_ci,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert res_forced.returncode == 0, res_forced.stdout + res_forced.stderr
+        assert len(seen_snapshots) == 1
+        assert "GOOD forced" in seen_snapshots[0]
     finally:
         server.shutdown()
         server.server_close()

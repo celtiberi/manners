@@ -829,6 +829,7 @@ class TextBackend:
         signature: str,
         source_excerpt: str,
         watched_keys: Sequence[str] = (),
+        temperature: float = 0.0,
     ) -> str:
         """Gate 2 step 1: produce factual analysis of checks before decision noul scoring."""
         system, user = format_gate2_analysis_prompts(
@@ -843,6 +844,7 @@ class TextBackend:
         return self._chat(
             system,
             user,
+            temperature=temperature,
             max_tokens=max(260, self.text_cfg.max_tokens),
             include_user_system=False,
         )

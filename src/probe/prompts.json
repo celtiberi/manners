@@ -5,7 +5,7 @@
     "description": "Positive defect questions evaluated by [models.decision] over the probe definition and `check_gate2_analysis`. With `expected: false`, every defect question must score strictly below `0.50` (`needs no`) for the probe to pass Gate 2.",
     "expected": false,
     "nouls": [
-      "Does any check test purely deterministic Python logic or embed code expressions (such as math, len(), None/type checks, key lookups, JSON syntax, or regexes)?",
+      "Does the analysis say any check tests ONLY deterministic Python logic or embeds literal code expressions (such as math, len(), None/type checks, key lookups, JSON syntax, or regexes) with no semantic judgment?",
       "Is any check an empty generic approval phrase with no specific rule (such as 'works well', 'is good', or 'high quality')?",
       "Does any check inspect uncaptured local variables, external side effects, or runtime metrics outside inputs/output or watched variables (such as database, network, disk, or latency)?"
     ]
@@ -21,7 +21,7 @@
       "At runtime, probe captures ONLY function `inputs` + `output` (for `Site: decorator`) or `watched` keyword arguments (for `Site: here`).",
       "For each numbered check, write 1-2 factual sentences stating:",
       "1) Captured target: which captured runtime value (`output`, `inputs`, or named `watched` variable) the check inspects—or state explicitly if it tries to inspect uncaptured local variable names, external side effects (database commits, network/email delivery, disk writes), or runtime latency.",
-      "2) Behavioral rule vs defect: state the concrete semantic/behavioral rule tested (such as natural-language meaning, greeting/language choice, phrasing, tone, conciseness, pedagogical/role behavior, avoiding spoilers, grounding, or claims). State explicitly ONLY IF the check tests ONLY exact deterministic Python operations (`a + b`, `is None`, `isinstance`, `len()`, dict key/status lookup, JSON syntax, literal regex), embeds a deterministic code expression like `len(output) > 0`, or is an empty generic approval phrase with zero specific rule ('works well', 'is good', 'high quality'). Do not mention defects that do not apply."
+      "2) Behavioral rule vs defect: state the concrete semantic/behavioral rule tested (such as natural-language meaning, greeting/language choice, phrasing, tone, conciseness, pedagogical/role behavior, avoiding spoilers, grounding, or claims). Natural-language precondition clauses on a semantic rule (such as 'when X is non-empty/present, its summary accurately reflects Y') are normal scoping, NOT deterministic None/len() checks—describe the semantic rule directly without framing the precondition as an emptiness or type check. State explicitly ONLY IF the check tests ONLY exact deterministic Python operations (`a + b`, `is None`, `isinstance`, `len()`, dict key/status lookup, JSON syntax, literal regex), embeds a deterministic code expression like `len(output) > 0`, or is an empty generic approval phrase with zero specific rule ('works well', 'is good', 'high quality'). Do not mention defects that do not apply."
     ]
   },
   "check_gate3_fixtures": {
