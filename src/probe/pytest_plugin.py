@@ -9,7 +9,7 @@ from collections.abc import Iterator
 import pytest
 
 import probe
-from probe import handle_thread_excepthook
+from probe import ProbeHaltError, handle_thread_excepthook
 
 
 def pytest_addoption(parser: pytest.Parser) -> None:
@@ -39,7 +39,8 @@ def pytest_addoption(parser: pytest.Parser) -> None:
 def pytest_configure(config: pytest.Config) -> None:
     config.addinivalue_line(
         "markers",
-        "probes: enable @probe and probe.here checks for this test even when --no-probes is set",
+        "probes: allow @probe and probe.here checks on this test when --no-probes is set "
+        "(pass force=True or --probes to enable even when PROBES is unset)",
     )
     config.addinivalue_line(
         "markers",
@@ -50,21 +51,57 @@ def pytest_configure(config: pytest.Config) -> None:
     threading.excepthook = lambda args: handle_thread_excepthook(args, prev_hook, suppress_forward=True)
 
 
-@pytest.hookimpl(hookwrapper=True)
-def pytest_runtest_call(item: pytest.Item) -> Iterator[None]:
+def _resolve_item_probe_ctx(item: pytest.Item) -> contextlib.AbstractContextManager[None]:
     cli_mode = item.config.getoption("probe_cli_mode", default=None)
     if item.get_closest_marker("no_probes") is not None:
-        ctx: contextlib.AbstractContextManager[None] = probe.disabled()
-    elif item.get_closest_marker("probes") is not None:
-        ctx = probe.enabled()
-    elif cli_mode is True:
-        ctx = probe.enabled()
-    elif cli_mode is False:
-        ctx = probe.disabled()
-    else:
-        ctx = contextlib.nullcontext()
+        return probe.disabled()
+    probes_mark = item.get_closest_marker("probes")
+    if probes_mark is not None:
+        force = bool(probes_mark.kwargs.get("force", False))
+        if force or cli_mode is True:
+            return probe.enabled()
+        return contextlib.nullcontext()
+    if cli_mode is True:
+        return probe.enabled()
+    if cli_mode is False:
+        return probe.disabled()
+    return contextlib.nullcontext()
 
-    with ctx:
-        outcome = yield
-        has_exc = outcome.excinfo is not None
-        probe.flush(check=not has_exc)
+
+def _run_phase_with_probes(item: pytest.Item) -> Iterator[object]:
+    with _resolve_item_probe_ctx(item):
+        try:
+            res = yield
+        except BaseException:
+            probe.flush(check=False)
+            raise
+        probe.flush(check=True)
+        return res
+
+
+@pytest.hookimpl(wrapper=True)
+def pytest_runtest_setup(item: pytest.Item) -> Iterator[object]:
+    return (yield from _run_phase_with_probes(item))
+
+
+@pytest.hookimpl(wrapper=True)
+def pytest_runtest_call(item: pytest.Item) -> Iterator[object]:
+    return (yield from _run_phase_with_probes(item))
+
+
+@pytest.hookimpl(wrapper=True)
+def pytest_runtest_teardown(item: pytest.Item) -> Iterator[object]:
+    return (yield from _run_phase_with_probes(item))
+
+
+@pytest.hookimpl(wrapper=True)
+def pytest_fixture_setup(
+    fixturedef: pytest.FixtureDef[object],
+    request: pytest.SubRequest,
+) -> Iterator[object]:
+    try:
+        return (yield)
+    except ProbeHaltError as exc:
+        if fixturedef.cached_result is None:
+            fixturedef.cached_result = (None, fixturedef.cache_key(request), (exc, exc.__traceback__))
+        raise

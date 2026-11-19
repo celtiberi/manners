@@ -1443,6 +1443,12 @@ def test_v05_here_rich_excerpt_and_probe_fixture_cli(tmp_path: Path, monkeypatch
                     reply=reply,
                 )
                 return reply
+
+            from typing import Any
+
+            @probe("Recorded items stay coherent", id="tutor.typed_dec")
+            def record_state(items: list[str], meta: dict[str, Any], count: int) -> None:
+                return None
             """
         ).strip()
         + "\n",
@@ -1450,8 +1456,8 @@ def test_v05_here_rich_excerpt_and_probe_fixture_cli(tmp_path: Path, monkeypatch
     )
 
     items = discover_probes([app_py], root=tmp_path)
-    assert len(items) == 1
-    item = items[0]
+    assert len(items) == 2
+    item = next(p for p in items if p.probe_id == "tutor.teach_turn")
     assert "Assemble a beginner lesson with coupled warmup flags." in item.source_excerpt
     assert 'also_introduce = "gracias"' in item.source_excerpt
     assert "warmup_recall_only = True" in item.source_excerpt
@@ -1466,12 +1472,12 @@ def test_v05_here_rich_excerpt_and_probe_fixture_cli(tmp_path: Path, monkeypatch
         encoding="utf-8",
     )
     items_after = discover_probes([app_py], root=tmp_path)
-    assert items_after[0].source_hash == orig_source_hash
+    assert next(p for p in items_after if p.probe_id == "tutor.teach_turn").source_hash == orig_source_hash
 
     monkeypatch.chdir(tmp_path)
     runner = CliRunner()
 
-    # --init scaffolds a valid starter fixture matching all 7 watched keys.
+    # --init scaffolds type-aware starter fixtures matching all 7 watched keys and typed @probe params/None return.
     init_res = runner.invoke(app, ["fixture", "tutor.teach_turn", "--init", "--json"])
     assert init_res.exit_code == 0, init_res.stderr
     init_data = json.loads(init_res.stdout)
@@ -1481,6 +1487,32 @@ def test_v05_here_rich_excerpt_and_probe_fixture_cli(tmp_path: Path, monkeypatch
     assert fixture_fp.is_file()
     fixture_json = json.loads(fixture_fp.read_text(encoding="utf-8"))
     assert set(fixture_json["pass"][0]["watched"].keys()) == set(item.watched_keys)
+    assert fixture_json["pass"][0]["watched"]["warmup_recall_only"] is True
+    assert fixture_json["fail"][0]["watched"]["warmup_recall_only"] is False
+
+    dec_init = runner.invoke(app, ["fixture", "tutor.typed_dec", "--init", "--json"])
+    assert dec_init.exit_code == 0, dec_init.stderr
+    dec_fp = tmp_path / ".probes" / "fixtures" / "tutor.typed_dec.json"
+    dec_json = json.loads(dec_fp.read_text(encoding="utf-8"))
+    assert dec_json["pass"][0]["inputs"] == {
+        "items": ["<PASS:items>"],
+        "meta": {"<PASS:meta>": "..."},
+        "count": 1,
+    }
+    assert dec_json["fail"][0]["inputs"] == {
+        "items": ["<FAIL:items>"],
+        "meta": {"<FAIL:meta>": "..."},
+        "count": 0,
+    }
+    assert dec_json["pass"][0]["output"] is None
+    assert dec_json["fail"][0]["output"] is None
+    dec_fp.unlink()
+
+    # Drop the extra typed decorator probe before running fixture promotion + Gate 3 check on tutor.teach_turn.
+    app_py.write_text(
+        app_py.read_text(encoding="utf-8").split("\nfrom typing import Any")[0].rstrip() + "\n",
+        encoding="utf-8",
+    )
 
     # Clear fixture and verify `probe fixture` promotes recorded pass + fail snapshots across runs.
     fixture_fp.unlink()
@@ -1586,3 +1618,85 @@ def test_v05_here_rich_excerpt_and_probe_fixture_cli(tmp_path: Path, monkeypatch
     assert ok_check is True
     assert res_check[0].status == "passed"
     assert synth_called["n"] == 0
+
+
+def test_v051_gate2_retry_recovers_transient_disagreement(tmp_path: Path) -> None:
+    target_py = tmp_path / "grade.py"
+    target_py.write_text(
+        textwrap.dedent(
+            """
+            from probe import probe
+
+            def cycle_grade(progress_note: str) -> str:
+                probe.here(
+                    "When progress_note is non-empty, its summary accurately reflects learner turns",
+                    id="tutor.cycle_grade",
+                    kind=probe.type.text,
+                    progress_note=progress_note,
+                )
+                return progress_note
+            """
+        ).strip()
+        + "\n",
+        encoding="utf-8",
+    )
+
+    gate2_temps: list[float] = []
+
+    def retry_handler(request: httpx.Request) -> httpx.Response:
+        url = str(request.url)
+        body = json.loads(request.content.decode("utf-8"))
+        if url.endswith("/chat/completions"):
+            sys_msg = body["messages"][0]["content"]
+            if "Gate 2" in body["messages"][0]["content"] or "audit @probe" in sys_msg:
+                gate2_temps.append(body["temperature"])
+                return httpx.Response(
+                    200,
+                    json={"choices": [{"message": {"content": "Check [0] tests semantic summary faithfulness."}}]},
+                )
+            if "passing_snapshot" in sys_msg:
+                payload = {
+                    "notes": "ok",
+                    "passing_snapshot": {"watched": {"progress_note": "GOOD accurate note"}},
+                    "failing_snapshot": {"watched": {"progress_note": "BAD hallucinated note"}},
+                }
+                return httpx.Response(200, json={"choices": [{"message": {"content": json.dumps(payload)}}]})
+            return httpx.Response(200, json={"choices": [{"message": {"content": "Evidence summary."}}]})
+        if body["probe_id"].endswith("#gate2"):
+            # Attempt 1 fails transiently (0.62 >= 0.50); attempt 2 passes (0.05 < 0.50).
+            if len(gate2_temps) == 1:
+                return httpx.Response(200, json={"probabilities": [0.62, 0.05, 0.05]})
+            return httpx.Response(200, json={"probabilities": [0.05, 0.05, 0.05]})
+        ok = "GOOD" in body["snapshot"]
+        return httpx.Response(200, json={"probabilities": [0.95 if ok else 0.10]})
+
+    cfg = ProbeConfig(
+        models_decision=ModelEndpointConfig(provider="http_decision", url="http://mock.local/decision", model="jev"),
+        models_text=ModelEndpointConfig(provider="openai_compat", url="http://mock.local/v1", model="qwen3.5:9b"),
+        decision=DecisionConfig(pass_threshold=0.50),
+        check=CheckConfig(require_check=True),
+        runtime=RuntimeConfig(
+            runs_dir=str(tmp_path / ".probes" / "runs"),
+            lock_path=str(tmp_path / ".probes" / "lock.json"),
+        ),
+        project_root=tmp_path,
+    )
+    ok, results = run_probe_check([target_py], config=cfg, transport=httpx.MockTransport(retry_handler))
+    assert ok is True
+    assert results[0].status == "passed"
+    assert gate2_temps == [0.0, 0.2]
+
+    # Persistent failure across both attempts still rejects at Gate 2.
+    def always_reject(request: httpx.Request) -> httpx.Response:
+        if str(request.url).endswith("/chat/completions"):
+            return httpx.Response(200, json={"choices": [{"message": {"content": "Mechanical length check."}}]})
+        return httpx.Response(200, json={"probabilities": [0.95, 0.05, 0.05]})
+
+    ok_fail, res_fail = run_probe_check(
+        [target_py],
+        force=True,
+        config=cfg,
+        transport=httpx.MockTransport(always_reject),
+    )
+    assert ok_fail is False
+    assert res_fail[0].gate == "gate2"

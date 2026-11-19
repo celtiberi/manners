@@ -63,6 +63,8 @@ class DiscoveredProbe:
     watched_keys: tuple[str, ...] = ()
     param_names: tuple[str, ...] = ()
     required_params: tuple[str, ...] = ()
+    type_tags: tuple[tuple[str, str], ...] = ()
+    return_type_tag: str = "str"
 
 
 @dataclass(slots=True)
@@ -362,6 +364,143 @@ def _is_generator_function(node: ast.FunctionDef | ast.AsyncFunctionDef) -> bool
     return False
 
 
+_SIMPLE_TYPE_NAMES: dict[str, str] = {
+    "bool": "bool",
+    "int": "int",
+    "float": "float",
+    "str": "str",
+    "none": "none",
+    "nonetype": "none",
+    "list": "list",
+    "tuple": "list",
+    "set": "list",
+    "frozenset": "list",
+    "sequence": "list",
+    "mutablesequence": "list",
+    "iterable": "list",
+    "dict": "dict",
+    "mapping": "dict",
+    "mutablemapping": "dict",
+}
+
+
+def _annotation_head_name(node: ast.expr) -> str | None:
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        return node.attr
+    return None
+
+
+def _classify_annotation_ast(node: ast.expr | None) -> str | None:
+    if node is None:
+        return None
+    if isinstance(node, ast.Constant):
+        if node.value is None:
+            return "none"
+        if isinstance(node.value, str):
+            try:
+                parsed = ast.parse(node.value, mode="eval").body
+            except SyntaxError:
+                return None
+            return _classify_annotation_ast(parsed)
+        return None
+    head = _annotation_head_name(node)
+    if head is not None:
+        return _SIMPLE_TYPE_NAMES.get(head.lower())
+    if isinstance(node, ast.Subscript):
+        base = _annotation_head_name(node.value)
+        if base is None:
+            return None
+        base_low = base.lower()
+        if base_low == "optional":
+            return _classify_annotation_ast(node.slice)
+        if base_low == "annotated":
+            sl = node.slice
+            first = sl.elts[0] if isinstance(sl, ast.Tuple) and sl.elts else sl
+            return _classify_annotation_ast(first)
+        if base_low == "literal":
+            sl = node.slice
+            first = sl.elts[0] if isinstance(sl, ast.Tuple) and sl.elts else sl
+            return _classify_value_ast(first)
+        if base_low == "union":
+            sl = node.slice
+            elts = list(sl.elts) if isinstance(sl, ast.Tuple) else [sl]
+            tags = [t for t in (_classify_annotation_ast(e) for e in elts) if t is not None]
+            non_none = [t for t in tags if t != "none"]
+            return non_none[0] if non_none else (tags[0] if tags else None)
+        return _SIMPLE_TYPE_NAMES.get(base_low)
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.BitOr):
+        left = _classify_annotation_ast(node.left)
+        right = _classify_annotation_ast(node.right)
+        for cand in (left, right):
+            if cand is not None and cand != "none":
+                return cand
+        return left or right
+    return None
+
+
+def _classify_value_ast(node: ast.expr | None) -> str | None:
+    if node is None:
+        return None
+    if isinstance(node, ast.Constant):
+        val = node.value
+        if val is None:
+            return "none"
+        if isinstance(val, bool):
+            return "bool"
+        if isinstance(val, int):
+            return "int"
+        if isinstance(val, float):
+            return "float"
+        if isinstance(val, str):
+            return "str"
+        return None
+    if isinstance(node, (ast.List, ast.Tuple, ast.Set, ast.ListComp, ast.SetComp)):
+        return "list"
+    if isinstance(node, (ast.Dict, ast.DictComp)):
+        return "dict"
+    if isinstance(node, ast.JoinedStr):
+        return "str"
+    if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+        return _SIMPLE_TYPE_NAMES.get(node.func.id.lower())
+    return None
+
+
+def _extract_fn_type_tags(fn_node: ast.FunctionDef | ast.AsyncFunctionDef) -> dict[str, str]:
+    """Infer lightweight JSON-shape tags ('str'|'int'|'float'|'bool'|'list'|'dict'|'none') for locals/params."""
+    tags: dict[str, str] = {}
+    args = fn_node.args
+    pos_all = [*args.posonlyargs, *args.args]
+    pos_defaults: list[ast.expr | None] = [None] * (len(pos_all) - len(args.defaults)) + list(args.defaults)
+    for arg, dflt in zip(pos_all, pos_defaults, strict=True):
+        t = _classify_annotation_ast(arg.annotation) or _classify_value_ast(dflt)
+        if t is not None:
+            tags[arg.arg] = t
+    for arg, dflt in zip(args.kwonlyargs, args.kw_defaults, strict=True):
+        t = _classify_annotation_ast(arg.annotation) or _classify_value_ast(dflt)
+        if t is not None:
+            tags[arg.arg] = t
+
+    stack: list[ast.AST] = list(fn_node.body)
+    while stack:
+        cur = stack.pop()
+        if isinstance(cur, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            continue
+        if isinstance(cur, ast.AnnAssign) and isinstance(cur.target, ast.Name):
+            t = _classify_annotation_ast(cur.annotation) or _classify_value_ast(cur.value)
+            if t is not None:
+                tags[cur.target.id] = t
+        elif isinstance(cur, ast.Assign):
+            t = _classify_value_ast(cur.value)
+            if t is not None:
+                for tgt in cur.targets:
+                    if isinstance(tgt, ast.Name):
+                        tags[tgt.id] = t
+        stack.extend(ast.iter_child_nodes(cur))
+    return tags
+
+
 def _extract_param_names(
     fn_node: ast.FunctionDef | ast.AsyncFunctionDef,
     *,
@@ -589,6 +728,9 @@ class _ModuleProbeVisitor(ast.NodeVisitor):
         s_hash = _sha256_text(f"{sig}\n{doc}")
         is_class_body = bool(self.scope and not self.scope[-1][1])
         param_names, required_params = _extract_param_names(node, is_class_body=is_class_body)
+        fn_type_tags = _extract_fn_type_tags(node)
+        param_type_tags = tuple((p, fn_type_tags.get(p, "str")) for p in param_names)
+        ret_type_tag = _classify_annotation_ast(node.returns) or "str"
 
         for dec in node.decorator_list:
             call, call_err, matched = _classify_probe_decorator(dec, self._lookup_role)
@@ -613,6 +755,8 @@ class _ModuleProbeVisitor(ast.NodeVisitor):
                         combined_hash=_sha256_text(f"{c_hash}:{s_hash}"),
                         param_names=param_names,
                         required_params=required_params,
+                        type_tags=param_type_tags,
+                        return_type_tag=ret_type_tag,
                     )
                 )
                 continue
@@ -644,6 +788,8 @@ class _ModuleProbeVisitor(ast.NodeVisitor):
                     combined_hash=combined,
                     param_names=param_names,
                     required_params=required_params,
+                    type_tags=param_type_tags,
+                    return_type_tag=ret_type_tag,
                 )
             )
 
@@ -788,6 +934,15 @@ class _ModuleProbeVisitor(ast.NodeVisitor):
             literal_error = struct_err or check_err or kind_err or watched_err
             enclosing = self.fn_stack[-1] if self.fn_stack else None
             sig = _format_signature(enclosing) if enclosing else "<module>"
+            enclosing_tags = _extract_fn_type_tags(enclosing) if enclosing is not None else {}
+            watched_type_pairs: list[tuple[str, str]] = []
+            for kw in call.keywords:
+                if not kw.arg or kw.arg in {"checks", "id", "kind"}:
+                    continue
+                t = _classify_value_ast(kw.value)
+                if t is None and isinstance(kw.value, ast.Name):
+                    t = enclosing_tags.get(kw.value.id)
+                watched_type_pairs.append((kw.arg, t or "str"))
             end_idx = min(len(self.lines), (call.end_lineno or call.lineno) + 3)
             if enclosing is not None:
                 start_idx = max(enclosing.lineno - 1, call.lineno - 41)
@@ -818,6 +973,7 @@ class _ModuleProbeVisitor(ast.NodeVisitor):
                     source_hash=s_hash,
                     combined_hash=combined,
                     watched_keys=watched_keys,
+                    type_tags=tuple(watched_type_pairs),
                 )
             )
         self.generic_visit(node)
@@ -958,13 +1114,38 @@ def resolve_fixture_path(fixtures_dir: Path, probe_id: str) -> Path:
     return target
 
 
+def _placeholder_for_tag(type_tag: str, tag: str, name: str) -> Any:
+    if type_tag == "none":
+        return None
+    if type_tag == "bool":
+        return tag == "PASS"
+    if type_tag == "int":
+        return 1 if tag == "PASS" else 0
+    if type_tag == "float":
+        return 1.0 if tag == "PASS" else 0.0
+    if type_tag == "list":
+        return [f"<{tag}:{name}>"]
+    if type_tag == "dict":
+        return {f"<{tag}:{name}>": "..."}
+    return f"<{tag}:{name}>"
+
+
 def build_skeleton_snapshot(item: DiscoveredProbe, tag: str) -> dict[str, Any]:
-    """Build a starter fixture snapshot matching item's AST signature or watched keys."""
+    """Build a starter fixture snapshot matching item's AST signature, type hints, or watched keys."""
+    tag_map = dict(item.type_tags)
     if item.site == "here":
-        return {"watched": {k: f"<{tag}:{k}>" for k in item.watched_keys}}
+        return {
+            "watched": {
+                k: _placeholder_for_tag(tag_map.get(k, "str"), tag, k)
+                for k in item.watched_keys
+            }
+        }
     return {
-        "inputs": {p: f"<{tag}:{p}>" for p in item.param_names},
-        "output": f"<{tag}:output>",
+        "inputs": {
+            p: _placeholder_for_tag(tag_map.get(p, "str"), tag, p)
+            for p in item.param_names
+        },
+        "output": _placeholder_for_tag(item.return_type_tag, tag, "output"),
     }
 
 
@@ -1274,52 +1455,60 @@ def _evaluate_uncached_probe(
     redactor: SecretRedactor,
 ) -> tuple[ProbeCheckResult, dict[str, Any] | None]:
     """Run Gates 2-3 for one uncached probe and return (result, lock_entry_or_none)."""
-    # Gate 2: Factual analysis via [models.text] + noul approval via [models.decision].
-    try:
-        gate2_analysis = text_backend.analyze_checks_gate2(
-            probe_id=item.probe_id,
-            site=item.site,
-            checks=item.checks,
-            signature=item.signature,
-            source_excerpt=item.source_excerpt,
-            watched_keys=item.watched_keys,
-        )
-        gate2_state = json.dumps(
-            {
-                "site": item.site,
-                "signature": item.signature,
-                "watched_keys": list(item.watched_keys),
-                "checks": list(item.checks),
-            },
-            ensure_ascii=False,
-        )
-        gate2_scores = decision_backend.evaluate_checks(
-            probe_id=f"{item.probe_id}#gate2",
-            checks=get_nouls("check_gate2_nouls"),
-            snapshot_json=gate2_state,
-            analysis=gate2_analysis,
-        )
-    except BackendError as exc:
-        return (
-            ProbeCheckResult(
-                probe_id=item.probe_id,
-                file_line=item.file_line,
-                site=item.site,
-                probe_type=item.probe_type.value,
-                status="failed",
-                gate="gate2",
-                reason=redactor.scrub_text(str(exc)),
-                checks=item.checks,
-            ),
-            None,
-        )
-
+    # Gate 2: Factual analysis via [models.text] + noul approval via [models.decision] (1x retry on disagreement).
     gate2_expected = get_noul_expected("check_gate2_nouls")
 
     def _gate2_noul_ok(score: CheckScore) -> bool:
         return score.probability > 0.50 if gate2_expected else score.probability < 0.50
 
-    approved = bool(gate2_scores) and all(_gate2_noul_ok(s) for s in gate2_scores)
+    gate2_analysis = ""
+    gate2_scores: list[CheckScore] = []
+    approved = False
+    for g2_attempt in (1, 2):
+        try:
+            gate2_analysis = text_backend.analyze_checks_gate2(
+                probe_id=item.probe_id,
+                site=item.site,
+                checks=item.checks,
+                signature=item.signature,
+                source_excerpt=item.source_excerpt,
+                watched_keys=item.watched_keys,
+                temperature=0.0 if g2_attempt == 1 else 0.2,
+            )
+            gate2_state = json.dumps(
+                {
+                    "site": item.site,
+                    "signature": item.signature,
+                    "watched_keys": list(item.watched_keys),
+                    "checks": list(item.checks),
+                },
+                ensure_ascii=False,
+            )
+            gate2_scores = decision_backend.evaluate_checks(
+                probe_id=f"{item.probe_id}#gate2",
+                checks=get_nouls("check_gate2_nouls"),
+                snapshot_json=gate2_state,
+                analysis=gate2_analysis,
+            )
+        except BackendError as exc:
+            return (
+                ProbeCheckResult(
+                    probe_id=item.probe_id,
+                    file_line=item.file_line,
+                    site=item.site,
+                    probe_type=item.probe_type.value,
+                    status="failed",
+                    gate="gate2",
+                    reason=redactor.scrub_text(str(exc)),
+                    checks=item.checks,
+                ),
+                None,
+            )
+
+        approved = bool(gate2_scores) and all(_gate2_noul_ok(s) for s in gate2_scores)
+        if approved:
+            break
+
     if not approved:
         failed_nouls = [s.check for s in gate2_scores if not _gate2_noul_ok(s)]
         audit_reason = (

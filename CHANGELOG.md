@@ -5,6 +5,15 @@ All notable changes to `probe` will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.1] - 2026-11-18
+
+### Fixed
+- Wrapped all three pytest item phases (`pytest_runtest_setup`, `pytest_runtest_call`, and `pytest_runtest_teardown`) in `probe.pytest_plugin` so `--no-probes`, `--probes`, and `@pytest.mark.{probes,no_probes}` protect fixture setup and teardown as well as test bodies.
+- Migrated `pytest_plugin.py` hooks from legacy `@pytest.hookimpl(hookwrapper=True)` to modern `@pytest.hookimpl(wrapper=True)` and added `pytest_fixture_setup` handling for `ProbeHaltError`, eliminating `PluggyTeardownRaisedWarning` and subsequent-test `_finalizers` assertion crashes on shared failing fixtures.
+- Changed `@pytest.mark.probes` to exempt marked tests from `--no-probes` (inheriting `PROBES` from `os.environ` / `.env` so keyless offline CI stays green), reserving force-enable for `--probes` or `@pytest.mark.probes(force=True)`, and honored explicit empty `os.environ` API-key overrides (`KEY=""`) without falling through to `.env`.
+- Clarified natural-language precondition scoping in `check_gate2_analysis` / `check_gate2_nouls` and added a 1x Gate 2 retry (`temperature=0.2`) in `run_probe_check` to absorb transient text/decision disagreements.
+- Added AST type-hint / local-value inference to `probe fixture --init` (`bool`, `int`, `float`, `list`, `dict`, and `-> None`) and documented daemon-thread pre-`probe.here` timing expectations.
+
 ## [0.5.0] - 2026-11-18
 
 ### Added

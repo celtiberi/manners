@@ -78,6 +78,11 @@ def test_typesafe_jev_systemone_dialect_and_dotenv_key_resolution(tmp_path: Path
     cfg = load_config(cwd=tmp_path)
     assert cfg.models_decision.resolve_api_key() == "ts_from_dotenv"
     assert cfg.models_text.resolve_api_key() == "ds_from_dotenv"
+    # Explicit empty env var overrides .env instead of leaking the dotenv value.
+    monkeypatch.setenv("TYPESAFE_API_KEY", "")
+    assert cfg.models_decision.resolve_api_key() is None
+    monkeypatch.delenv("TYPESAFE_API_KEY", raising=False)
+    assert cfg.models_decision.resolve_api_key() == "ts_from_dotenv"
 
     captured: list[tuple[str, str | None, dict]] = []
 

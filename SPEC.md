@@ -76,7 +76,7 @@ probe.flush()                # Drain background soak/thread evaluations and chec
 ```
 *(Overrides `PROBES=1` / unset `PROBES` across worker threads via `scope="process"` by default; pass `scope="context"` to scope to the active `ContextVar` without mutating environment variables.)*
 
-A built-in `pytest11` plugin (`probe.pytest_plugin`) adds `--no-probes`, `--probes`, `@pytest.mark.probes`, and `@pytest.mark.no_probes` (`marker > CLI flag > PROBES env`) and automatically calls `probe.flush(check=not has_exc)` after each test call.
+A built-in `pytest11` plugin (`probe.pytest_plugin`) adds `--no-probes`, `--probes`, `@pytest.mark.probes` (exempts tests from `--no-probes` so env/`.env` `PROBES` controls execution, or pass `force=True` / `--probes` to force-enable), and `@pytest.mark.no_probes`. It wraps `pytest_runtest_setup`, `pytest_runtest_call`, and `pytest_runtest_teardown`, handles `ProbeHaltError` inside `pytest_fixture_setup` cleanly so shared fixture finalizers still run, and calls `probe.flush()` at the end of each phase.
 
 ### 2.3 `probe.here` Watchpoint
 
@@ -177,7 +177,7 @@ By default, when a probe produces `fail`, `PROBE_MISUSE`, `PROBE_TRUNCATED`, or 
 
 When `PROBE_NO_HALT=1` or `[runtime].halt_on_fail = false` is set (soak / multi-turn eval mode), `call_seq`, timestamps, and redacted snapshots are captured synchronously while model grading dispatches onto a bounded background worker pool (`[runtime].max_workers`, default `4`, drained on `probe.flush()` and process `atexit`), `fail` and error events print `[PROBE FAIL]` / `[PROBE ERROR]` to `stderr`, `PROBE_MISUSE` trips the per-probe circuit breaker without halting the rest of the run, the run finishes with status `"failed"`, and `probe report --check` exits `1`.
 
-When a probe running inside a fire-and-forget background `threading.Thread` fails in halting mode, `probe` captures uncaught thread `ProbeHaltError` exits via `threading.excepthook` and re-raises on the caller thread during `probe.flush()` (and automatically at the end of `pytest` item calls).
+When a probe running inside a fire-and-forget background `threading.Thread` fails in halting mode, `probe` captures uncaught thread `ProbeHaltError` exits via `threading.excepthook` and re-raises on the caller thread during `probe.flush()` (and automatically across `pytest` `setup`/`call`/`teardown` phases). Note that `probe.flush()` waits on evaluations that have already entered `@probe` or `probe.here`; if a test spawns a daemon thread doing slow work before calling `probe`, `join()` the thread before returning.
 
 ---
 

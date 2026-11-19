@@ -283,9 +283,9 @@ class ModelEndpointConfig:
             return self.api_key
         if not self.api_key_env:
             return None
-        env_val = os.environ.get(self.api_key_env, "").strip()
-        if env_val:
-            return env_val
+        if self.api_key_env in os.environ:
+            env_val = os.environ[self.api_key_env].strip()
+            return env_val or None
 
         seen: set[Path] = set()
         for base_dir in self.env_search_dirs:

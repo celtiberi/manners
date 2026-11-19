@@ -33,17 +33,17 @@ Both roles are configured once in `config.toml` and can point at cloud APIs or l
 From a GitHub Release wheel (recommended in containers/CI — no `git` binary required):
 
 ```sh
-uv tool install https://github.com/celtiberi/probe/releases/download/v0.5.0/probe-0.5.0-py3-none-any.whl
+uv tool install https://github.com/celtiberi/probe/releases/download/v0.5.1/probe-0.5.1-py3-none-any.whl
 ```
 
 In a project virtual environment (wheel or git):
 
 ```sh
-uv add https://github.com/celtiberi/probe/releases/download/v0.5.0/probe-0.5.0-py3-none-any.whl
+uv add https://github.com/celtiberi/probe/releases/download/v0.5.1/probe-0.5.1-py3-none-any.whl
 # Optional local ONNX NLI decision runtime (no cloud decision API key required):
-# uv add "probe[onnx] @ https://github.com/celtiberi/probe/releases/download/v0.5.0/probe-0.5.0-py3-none-any.whl"
+# uv add "probe[onnx] @ https://github.com/celtiberi/probe/releases/download/v0.5.1/probe-0.5.1-py3-none-any.whl"
 # or via pip:
-# pip install https://github.com/celtiberi/probe/releases/download/v0.5.0/probe-0.5.0-py3-none-any.whl
+# pip install https://github.com/celtiberi/probe/releases/download/v0.5.1/probe-0.5.1-py3-none-any.whl
 # or from git main:
 # uv add git+https://github.com/celtiberi/probe.git
 ```
@@ -115,9 +115,9 @@ To skip `.probes/lock.json` enforcement during quick local iteration, set `PROBE
 To run multi-turn simulations or soak tests without stopping on the first failure, set `PROBE_NO_HALT=1` (or `[runtime].halt_on_fail = false`) and run `probe report --check` at the end to inspect failures and exit `1` if any probe failed. In non-halting soak mode, model grading dispatches onto a bounded background pool (`[runtime].max_workers = 4`) after capturing `call_seq` and snapshots synchronously; call `probe.flush()` (or let process exit / pytest teardown drain automatically) to flush pending evaluations.
 
 To control probes inside `pytest` when `PROBES=1` is set in `.env`:
-- Add `--no-probes` to `[tool.pytest.ini_options] addopts` so mocked unit tests skip probes automatically without extra `conftest.py` boilerplate.
-- Mark probe-backed integration tests with `@pytest.mark.probes` (or pass `--probes` on the CLI) to opt them back in; mark exclusions with `@pytest.mark.no_probes`.
-- The built-in `pytest` plugin also drains background/daemon-thread evaluations after each test item so uncaught `ProbeHaltError`s from background threads fail the test cleanly.
+- Add `--no-probes` to `[tool.pytest.ini_options] addopts` so mocked unit tests skip probes across fixture `setup`, test `call`, and `teardown` without extra `conftest.py` boilerplate.
+- Mark probe-backed integration tests with `@pytest.mark.probes` to exempt them from `--no-probes` (so `PROBES=1` in `.env` runs them locally while keyless CI with `PROBES` unset keeps them a no-op; pass `--probes` on the CLI or `@pytest.mark.probes(force=True)` to enable unconditionally). Mark exclusions with `@pytest.mark.no_probes`.
+- The built-in `pytest` plugin drains background/daemon-thread probe evaluations across `setup`/`call`/`teardown` so uncaught `ProbeHaltError`s fail the test cleanly (`probe.flush()` drains threads that have already entered `@probe`/`probe.here`; if a test spawns a daemon thread doing slow upstream work before reaching `probe.here`, `join()` it before returning).
 - In plain Python code or fixtures, use stackable `with probe.disabled():` and `with probe.enabled():` (`from probe import disabled, enabled, flush`).
 
 5. Inspect results in call-entry order (works while a server is running too, via per-run JSONL logs):
