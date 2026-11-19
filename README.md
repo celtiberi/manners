@@ -2,29 +2,68 @@
 
 [![CI](https://github.com/celtiberi/probe/actions/workflows/ci.yml/badge.svg)](https://github.com/celtiberi/probe/actions/workflows/ci.yml)
 
-Plain-English runtime behavioral checks (`@probe` and `probe.here`) and call-ordered debug logs for Python. See [`SPEC.md`](./SPEC.md) for the full design and [`docs/case-study-spanish-tutor.md`](./docs/case-study-spanish-tutor.md) for a real-world multi-stage tutor integration report.
+Plain-English runtime behavioral checks (`@probe` and `probe.here`) and call-ordered debug logs for Python. Inactive when `PROBES` is unset; when `PROBES=1` is active during dev or testing, `probe` evaluates inputs and outputs against plain-English rules and halts on the exact call that fails. See [`SPEC.md`](./SPEC.md) and [`docs/case-study-spanish-tutor.md`](./docs/case-study-spanish-tutor.md).
 
-## Why This Exists
+Python `assert`s catch structural bugs (`x is not None`, valid JSON), not behavioral bugs where a valid response has the wrong meaning—such as a tutor giving away the answer it just asked for, an assistant claiming a refund ran when no tool executed, or a RAG reply contradicting its retrieved chunks:
 
-Python `assert`s, type checks, and regexes catch structural bugs (`x is not None`, `len(items) > 0`, valid JSON), and you should keep using them for that. They don't catch behavioral bugs where a function returns a valid string or dict whose content is wrong—especially in code that calls LLMs, formats prompts, or combines retrieved context.
+```python
+from probe import probe
 
-Two examples where normal assertions come up short:
+@probe(
+    [
+        "Tutor opens with a short Spanish greeting or phrase",
+        "Tutor gives brief teaching or instructions to help the student",
+        "Tutor asks the student to say something in Spanish",
+        "Tutor does NOT give away the exact Spanish sentence the student is expected to say",
+    ],
+    id="tutor.opening_turn",
+)
+def generate_opening_turn(lesson, history) -> str:
+    ...
+```
 
-- An assistant endpoint returns `200 OK` and a valid reply, so tests pass—even though the reply tells the user an action was completed (like issuing a refund or updating an account) when no tool call actually ran.
-- A RAG endpoint summarizes a policy doc using the exact words and numbers from the retrieved chunks, yet flips the meaning—telling a user they qualify when the chunk says their tier is excluded.
+Validate checks once, then run with probes enabled (`probe check` rejects checks that belong as plain Python `assert`s):
 
-Normally you only spot those by manually clicking through your app or reading through raw prompt/response logs later. `probe` lets you put checks right on the function (`@probe`) or mid-function line (`probe.here`) so execution stops on the exact call that broke them.
+```sh
+probe check
+PROBES=1 pytest evals/test_tutor_turns.py
+```
+
+When a rule fails at runtime, `probe` stops execution on that call and prints which rule broke and why:
+
+```text
+[PROBE HALT] call #003 tutor.opening_turn (tutor/turn.py:61)
+  ✓ [0.97] Tutor opens with a short Spanish greeting or phrase
+  ✓ [0.91] Tutor gives brief teaching or instructions to help the student
+  ✓ [0.89] Tutor asks the student to say something in Spanish
+  ✗ [0.06] Tutor does NOT give away the exact Spanish sentence the student is expected to say
+  analysis: Tutor tells the student: 'Try saying: Quiero un café por favor', giving away the target sentence verbatim.
+```
+
+For mid-function checks comparing intermediate values (like a draft against retrieved context), use `probe.here(...)` with `kind=probe.type.text`:
+
+```python
+probe.here(
+    [
+        "Draft answer stays strictly grounded in retrieved chunks",
+        "Draft answer directly addresses the user question",
+        "Draft does NOT answer confidently when retrieved_chunks do not cover user_question",
+    ],
+    id="rag.draft_answer",
+    kind=probe.type.text,
+    user_question=question,
+    retrieved_chunks=chunks,
+    draft=draft_text,
+)
+```
 
 ## How It Works
 
-When probes are enabled during local development or testing, `probe` captures the inputs and outputs at each `@probe` or `probe.here` call (redacting secrets first) and checks whether the runtime behavior matches your plain-English rules—halting execution right there if a check fails, and staying completely inactive when turned off in production.
-
-Instead of asking a chat LLM to output `"pass"` or `"fail"` directly—which tends to hedge and drift—`probe` splits the work across two configurable model roles:
-
-- **Decision model (`probe.type.decision`, default):** Evaluates discrete yes/no checks directly and returns a calibrated probability per check (`pass` or `fail`). Fast and deterministic enough for most checks.
-- **Text LLM + Decision model (`probe.type.text`):** When a check requires open-ended reasoning first (such as comparing a generated answer against source documents), a text LLM analyzes the snapshot and hands its findings to the decision model for the final `pass` or `fail` verdict.
-
-Both roles are configured once in `config.toml` and can point at cloud APIs or local models without changing your code. Before probes run, `probe check` validates your check prompts against synthetic pass/fail cases and rejects checks that belong as normal Python `assert`s.
+- **Zero overhead in production, inline halts in dev/tests:** When `PROBES` is unset (or `0`), `@probe` and `probe.here` are no-ops. When `PROBES=1`, `probe` captures function arguments or watched variables (redacting secrets first), writes chronological events to `.probes/runs/<run_id>.jsonl`, and raises `ProbeHaltError` on the exact failing call.
+- **Split across decision and text models:** Asking a chat LLM to reply `"pass"` or `"fail"` tends to hedge and drift, so `probe` splits grading across two configurable roles:
+  - **Decision model (`probe.type.decision`, default):** Evaluates discrete yes/no checks directly and returns a calibrated probability per check.
+  - **Text LLM + Decision model (`probe.type.text`):** A text LLM first analyzes the snapshot against source context, then passes its findings to the decision model for the final `pass` or `fail` verdict.
+- **Pre-run `probe check` gate:** Before probes run, `probe check` audits checks, calibrates them against pass/fail cases, and locks approved hashes in `.probes/lock.json`.
 
 ## Install
 
@@ -50,86 +89,45 @@ uv add https://github.com/celtiberi/probe/releases/download/v0.6.2/probe-0.6.2-p
 
 ## Quick Start
 
-1. Configure your models and API keys (`probe` splits grading into two roles, configured once in `~/.config/probe/config.toml` or `[tool.probe]` in `pyproject.toml`, reading keys from shell env or `.env`):
-   - **`[models.decision]` (scores yes/no checks):** Defaults to **TypeSafe Jev** (`TYPESAFE_API_KEY` from [typesafe.ai](https://typesafe.ai)). Without a TypeSafe key, install `"probe[onnx] @ ..."` and point `provider = "onnx_nli"` at local NLI weights (such as `DeBERTa-v3-base-mnli-fever-anli` — see [Configuration](#configuration-configprobeconfigtoml)).
-   - **`[models.text]` (runs `probe check` calibration, `probe.type.text` analysis, and failure explanations):** Defaults to **DeepSeek** (`DEEPSEEK_API_KEY`), or point `url` / `model` / `api_key_env` at **OpenAI** (`OPENAI_API_KEY`), **Gemini** (`GEMINI_API_KEY`), or local **Ollama** (`qwen3.5:9b`, no API key).
+1. **Configure models and API keys** in shell env or `.env` (see [Configuration](#configuration-configprobeconfigtoml) to override endpoints in `~/.config/probe/config.toml` or `[tool.probe]` in `pyproject.toml`):
+   - **`[models.decision]` (scores yes/no checks):** Defaults to **TypeSafe Jev** (`TYPESAFE_API_KEY` from [typesafe.ai](https://typesafe.ai)), or install `"probe[onnx] @ ..."` with `provider = "onnx_nli"` for local NLI weights (such as `DeBERTa-v3-base-mnli-fever-anli`).
+   - **`[models.text]` (runs `probe check`, `probe.type.text` analysis, and failure explanations):** Defaults to **DeepSeek** (`DEEPSEEK_API_KEY`), or point `url` / `model` / `api_key_env` at **OpenAI** (`OPENAI_API_KEY`), **Gemini** (`GEMINI_API_KEY`), or local **Ollama** (`qwen3.5:9b`, no API key).
 
-Minimal `.env` when using defaults (no `config.toml` needed; see [Configuration](#configuration-configprobeconfigtoml) to swap in OpenAI, Gemini, Ollama, or local ONNX):
+   ```sh
+   TYPESAFE_API_KEY=...
+   DEEPSEEK_API_KEY=...
+   ```
 
-```sh
-TYPESAFE_API_KEY=...
-DEEPSEEK_API_KEY=...
-```
+2. **Validate your probes** (populates `.probes/lock.json`):
 
-2. Attach checks to a function or intermediate step:
+   ```sh
+   probe check
+   ```
 
-```python
-from probe import probe
+3. **Run your server or tests with `PROBES=1`** (in the shell or `.env`):
 
-@probe(
-    [
-        "Tutor opens with a short Spanish greeting or phrase",
-        "Tutor gives brief teaching or instructions to help the student",
-        "Tutor asks the student to say something in Spanish",
-        "Tutor does NOT give away the exact Spanish sentence the student is expected to say",
-    ],
-    id="tutor.opening_turn",
-)
-def generate_opening_turn(lesson, history) -> str:
-    ...
-```
+   ```sh
+   PROBES=1 uvicorn app:app --reload
+   # or in CI / non-interactive test runs:
+   PROBES=1 PROBE_NO_PDB=1 pytest
+   ```
 
-Mid-function watchpoint:
+   - **Skip lockfile during iteration:** Set `PROBE_SKIP_LOCK=1`. Setting `PROBES=""` or `PROBES=0` in the shell overrides `PROBES=1` in `.env`.
+   - **Non-halting soak tests:** Set `PROBE_NO_HALT=1` (or `[runtime].halt_on_fail = false`) to log all failures across multi-turn runs via a bounded background pool (`[runtime].max_workers = 4`) and exit `1` via `probe report --check` at the end (`probe.flush()` or process/pytest teardown drains pending evaluations).
+   - **Controlling `pytest` runs when `PROBES=1` is in `.env`:**
+     - Add `--no-probes` to `[tool.pytest.ini_options] addopts` so mocked unit tests skip probes across fixture `setup`, test `call`, and `teardown` without `conftest.py` boilerplate.
+     - Mark probe-backed integration tests with `@pytest.mark.probes` to exempt them from `--no-probes` (inheriting `PROBES` from `.env`/env so keyless CI stays a no-op; pass `--probes` on the CLI or `@pytest.mark.probes(force=True)` to enable unconditionally). Mark exclusions with `@pytest.mark.no_probes`.
+     - The `pytest` plugin drains background/daemon-thread evaluations across `setup`/`call`/`teardown` so uncaught `ProbeHaltError`s fail the test cleanly (`probe.flush()` drains threads that have already entered `@probe`/`probe.here`; `join()` any slow daemon thread that has not reached `probe.here` before the test returns).
+     - In plain Python code or fixtures, use stackable `with probe.disabled():` and `with probe.enabled():` (`from probe import disabled, enabled, flush`).
 
-```python
-probe.here(
-    [
-        "Draft answer stays strictly grounded in retrieved chunks",
-        "Draft answer directly addresses the user question",
-        "Draft does NOT answer confidently when retrieved_chunks do not cover user_question",
-    ],
-    id="rag.draft_answer",
-    kind=probe.type.text,
-    user_question=question,
-    retrieved_chunks=chunks,
-    draft=draft_text,
-)
-```
+4. **Inspect results in call-entry order** (works live against per-run JSONL logs while a server is running):
 
-3. Run the pre-run check (populates `.probes/lock.json`):
-
-```sh
-probe check
-```
-
-4. Run your server or tests with probes enabled (either in the shell or by setting `PROBES=1` in `.env`):
-
-```sh
-PROBES=1 uvicorn app:app --reload
-# or in CI / non-interactive test runs:
-PROBES=1 PROBE_NO_PDB=1 pytest
-```
-
-To skip `.probes/lock.json` enforcement during quick local iteration, set `PROBE_SKIP_LOCK=1`. Setting `PROBES=""` or `PROBES=0` in the shell overrides `PROBES=1` in `.env`.
-
-To run multi-turn simulations or soak tests without stopping on the first failure, set `PROBE_NO_HALT=1` (or `[runtime].halt_on_fail = false`) and run `probe report --check` at the end to inspect failures and exit `1` if any probe failed. In non-halting soak mode, model grading dispatches onto a bounded background pool (`[runtime].max_workers = 4`) after capturing `call_seq` and snapshots synchronously; call `probe.flush()` (or let process exit / pytest teardown drain automatically) to flush pending evaluations.
-
-To control probes inside `pytest` when `PROBES=1` is set in `.env`:
-- Add `--no-probes` to `[tool.pytest.ini_options] addopts` so mocked unit tests skip probes across fixture `setup`, test `call`, and `teardown` without extra `conftest.py` boilerplate.
-- Mark probe-backed integration tests with `@pytest.mark.probes` to exempt them from `--no-probes` (so `PROBES=1` in `.env` runs them locally while keyless CI with `PROBES` unset keeps them a no-op; pass `--probes` on the CLI or `@pytest.mark.probes(force=True)` to enable unconditionally). Mark exclusions with `@pytest.mark.no_probes`.
-- The built-in `pytest` plugin drains background/daemon-thread probe evaluations across `setup`/`call`/`teardown` so uncaught `ProbeHaltError`s fail the test cleanly (`probe.flush()` drains threads that have already entered `@probe`/`probe.here`; if a test spawns a daemon thread doing slow upstream work before reaching `probe.here`, `join()` it before returning).
-- In plain Python code or fixtures, use stackable `with probe.disabled():` and `with probe.enabled():` (`from probe import disabled, enabled, flush`).
-
-5. Inspect results in call-entry order (works while a server is running too, via per-run JSONL logs):
-
-```sh
-probe report --all
-probe report --check
-probe log tutor.opening_turn rag.*
-probe runs
-```
-
-### Example Output
+   ```sh
+   probe report --all
+   probe report --check
+   probe log tutor.opening_turn rag.*
+   probe runs
+   ```
 
 ```text
 Run 2026-11-18T15:10:04Z (cmd: pytest evals/test_tutor_turns.py) — HALTED on FAIL at call #003
