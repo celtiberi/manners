@@ -292,6 +292,22 @@ def test_load_config_isolates_credentials_and_validates_types_and_bounds(
     assert cfg.models_text.url == "http://127.0.0.1:11434/v1"
     assert cfg.models_text.resolve_api_key() is None
     assert cfg.runtime.strict_api is False
+    assert cfg.text.max_tokens is None
+
+    # Explicit [text].max_tokens parses as int, while <= 0 or bool fails validation.
+    (tmp_path / "pyproject.toml").write_text(
+        "[project]\nname = 'cfg-test'\n[tool.probe.text]\nmax_tokens = 2048\n",
+        encoding="utf-8",
+    )
+    cfg_tok = load_config(cwd=tmp_path)
+    assert type(cfg_tok.text.max_tokens) is int and cfg_tok.text.max_tokens == 2048
+    for bad_tok in ("0", "true"):
+        (tmp_path / "pyproject.toml").write_text(
+            f"[project]\nname = 'cfg-test'\n[tool.probe.text]\nmax_tokens = {bad_tok}\n",
+            encoding="utf-8",
+        )
+        with pytest.raises(ValueError, match="max_tokens"):
+            load_config(cwd=tmp_path)
 
     # pass_threshold=1.0 makes p > pass_threshold impossible and must fail validation.
     (tmp_path / "pyproject.toml").write_text(
@@ -405,15 +421,15 @@ def test_stage5_prompt_escaping_validation_and_reasoning_effort(tmp_path: Path, 
     with pytest.raises(BackendError, match="missing entry"):
         _parse_probabilities_payload({"probabilities": {"q0": 0.9}}, ["A", "B"])
 
-    # Gate 2 & Gate 3 skip user system_prompt; Gate 3 uses max_tokens >= 2400 (or override).
+    # Gate 2 & Gate 3 skip user system_prompt and omit max_tokens when unset; explicit max_tokens is forwarded.
     seen_calls: list[dict] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
         body = json.loads(request.content.decode("utf-8"))
         seen_calls.append(body)
-        if len(seen_calls) == 1:
+        if len(seen_calls) in {1, 4}:
             return httpx.Response(200, json={"choices": [{"message": {"content": "Gate2 factual summary"}}]})
-        if len(seen_calls) in {2, 3}:
+        if len(seen_calls) in {2, 5}:
             return httpx.Response(
                 200,
                 json={
@@ -435,7 +451,12 @@ def test_stage5_prompt_escaping_validation_and_reasoning_effort(tmp_path: Path, 
 
     tb = TextBackend(
         ModelEndpointConfig(provider="openai_compat", url="http://127.0.0.1:11434/v1", model="qwen3.5:9b"),
-        TextConfig(max_tokens=300, system_prompt="USER_CUSTOM_SYSTEM_PROMPT"),
+        TextConfig(system_prompt="USER_CUSTOM_SYSTEM_PROMPT"),
+        transport=httpx.MockTransport(handler),
+    )
+    tb_capped = TextBackend(
+        ModelEndpointConfig(provider="openai_compat", url="http://127.0.0.1:11434/v1", model="qwen3.5:9b"),
+        TextConfig(max_tokens=300),
         transport=httpx.MockTransport(handler),
     )
     try:
@@ -445,26 +466,28 @@ def test_stage5_prompt_escaping_validation_and_reasoning_effort(tmp_path: Path, 
         tb.generate_calibration_fixtures_gate3(
             probe_id="p", site="decorator", checks=["C"], signature="def f():", source_excerpt="pass"
         )
-        tb.generate_calibration_fixtures_gate3(
-            probe_id="p",
-            site="decorator",
-            checks=["C"],
-            signature="def f():",
-            source_excerpt="pass",
-            max_tokens=4096,
-        )
         assert "USER_CUSTOM_SYSTEM_PROMPT" not in seen_calls[0]["messages"][0]["content"]
         assert "USER_CUSTOM_SYSTEM_PROMPT" not in seen_calls[1]["messages"][0]["content"]
-        assert seen_calls[1]["max_tokens"] >= 2400
-        assert seen_calls[2]["max_tokens"] == 4096
+        assert "max_tokens" not in seen_calls[0]
+        assert "max_tokens" not in seen_calls[1]
         assert seen_calls[1]["response_format"]["type"] == "json_schema"
         assert seen_calls[1]["response_format"]["json_schema"]["name"] == "gate3_calibration_fixtures"
         assert "Respond with a JSON object matching this JSON Schema" not in seen_calls[1]["messages"][0]["content"]
         assert "response_format" not in seen_calls[0]
         with pytest.raises(BackendError, match="empty response"):
             tb.analyze_snapshot(probe_id="p", checks=["C"], snapshot_json="{}")
+
+        tb_capped.analyze_checks_gate2(
+            probe_id="p", site="decorator", checks=["C"], signature="def f():", source_excerpt="pass"
+        )
+        tb_capped.generate_calibration_fixtures_gate3(
+            probe_id="p", site="decorator", checks=["C"], signature="def f():", source_excerpt="pass"
+        )
+        assert seen_calls[3]["max_tokens"] == 300
+        assert seen_calls[4]["max_tokens"] == 300
     finally:
         tb.close()
+        tb_capped.close()
 
     # Provider-aware output_schema translation.
     gate3_schema = get_output_schema("check_gate3_fixtures")

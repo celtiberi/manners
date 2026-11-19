@@ -34,7 +34,7 @@ _TRUSTED_DEFAULT_HOSTS = frozenset(
     }
 )
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
-_OPTIONAL_INT_FIELDS = frozenset({"entailment_index", "contradiction_index"})
+_OPTIONAL_INT_FIELDS = frozenset({"entailment_index", "contradiction_index", "max_tokens"})
 _ALLOWED_TEXT_DETAILS = frozenset({"concise", "standard", "detailed"})
 _ALLOWED_ONNX_OUTPUTS = frozenset({"logits", "probabilities"})
 
@@ -330,7 +330,7 @@ class TextConfig:
     """Settings controlling text-model analysis, failure explanations, and pre-run audits."""
 
     detail: str = "standard"  # "concise" | "standard" | "detailed"
-    max_tokens: int = 1024
+    max_tokens: int | None = None
     explain_decision_failures: bool = True
     system_prompt: str = ""
 
@@ -535,7 +535,7 @@ def _apply_dataclass_dict(obj: Any, data: dict[str, Any]) -> None:
         if not hasattr(obj, key):
             raise ValueError(f"Unknown config key {key!r} in {type(obj).__name__}")
         current = getattr(obj, key)
-        if key in _OPTIONAL_INT_FIELDS and isinstance(obj, ModelEndpointConfig):
+        if key in _OPTIONAL_INT_FIELDS and isinstance(obj, (ModelEndpointConfig, TextConfig)):
             if val is None:
                 setattr(obj, key, None)
             elif isinstance(val, (bool, float)):
@@ -740,7 +740,7 @@ def load_config(
 
     if cfg.text.detail.strip().lower() not in _ALLOWED_TEXT_DETAILS:
         raise ValueError(f"[text].detail must be concise, standard, or detailed; got {cfg.text.detail!r}")
-    if cfg.text.max_tokens < 1:
+    if cfg.text.max_tokens is not None and cfg.text.max_tokens < 1:
         raise ValueError(f"[text].max_tokens must be >= 1, got {cfg.text.max_tokens!r}")
     if not math.isfinite(cfg.decision.pass_threshold) or not (0.0 <= cfg.decision.pass_threshold < 1.0):
         raise ValueError(f"[decision].pass_threshold must be in [0.0, 1.0), got {cfg.decision.pass_threshold!r}")

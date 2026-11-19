@@ -1987,7 +1987,7 @@ def test_v06_cli_root_and_monorepo_check_list_fixture_report(tmp_path: Path, mon
 def test_v061_gate3_truncation_retry_max_items_50_and_import_hint(tmp_path: Path) -> None:
     from probe.redact import SecretRedactor, serialize_call_snapshot
 
-    # 1. Gate 3 synthetic truncation (finish_reason="length") auto-retries once with max_tokens >= 4096.
+    # 1. Gate 3 omits max_tokens by default and retries once with concise-output feedback on finish_reason='length'.
     app_py = tmp_path / "summary.py"
     app_py.write_text(
         textwrap.dedent(
@@ -2043,7 +2043,7 @@ def test_v061_gate3_truncation_retry_max_items_50_and_import_hint(tmp_path: Path
         models_decision=ModelEndpointConfig(provider="http_decision", url="http://mock.local/decision", model="jev"),
         models_text=ModelEndpointConfig(provider="openai_compat", url="http://mock.local/v1", model="qwen3.5:9b"),
         decision=DecisionConfig(pass_threshold=0.50),
-        text=TextConfig(max_tokens=1024),
+        text=TextConfig(),
         check=CheckConfig(require_check=True),
         runtime=RuntimeConfig(
             runs_dir=str(tmp_path / ".probes" / "runs"),
@@ -2055,9 +2055,9 @@ def test_v061_gate3_truncation_retry_max_items_50_and_import_hint(tmp_path: Path
     assert ok_check is True
     assert results[0].status == "passed"
     assert len(gate3_calls) == 2
-    assert gate3_calls[0]["max_tokens"] >= 2400
-    assert gate3_calls[1]["max_tokens"] >= 4096
-    assert "truncated at max_tokens" in gate3_calls[1]["messages"][1]["content"]
+    assert "max_tokens" not in gate3_calls[0]
+    assert "max_tokens" not in gate3_calls[1]
+    assert "finish_reason='length'" in gate3_calls[1]["messages"][1]["content"]
 
     # 2. Default max_items is 50 (a 30-field return dict stays intact; 55-field dict truncates 5).
     assert RuntimeConfig().max_items == 50

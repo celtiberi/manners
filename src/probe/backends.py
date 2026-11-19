@@ -738,8 +738,10 @@ class TextBackend:
         payload: dict[str, Any] = {
             "model": self.endpoint.model,
             "temperature": temperature,
-            "max_tokens": max_tokens if max_tokens is not None else self.text_cfg.max_tokens,
         }
+        effective_max_tokens = max_tokens if max_tokens is not None else self.text_cfg.max_tokens
+        if effective_max_tokens is not None:
+            payload["max_tokens"] = effective_max_tokens
         full_system = _apply_output_schema(
             payload,
             full_system,
@@ -849,7 +851,6 @@ class TextBackend:
             system,
             user,
             temperature=temperature,
-            max_tokens=max(260, self.text_cfg.max_tokens),
             include_user_system=False,
         )
 
@@ -866,7 +867,6 @@ class TextBackend:
         captured_params: Sequence[str] | None = None,
         temperature: float = 0.0,
         retry_feedback: str = "",
-        max_tokens: int | None = None,
     ) -> tuple[str, str]:
         """Gate 3 synthesis: create one valid passing snapshot and one realistic near-miss failing snapshot."""
         system, user = format_gate3_fixtures_prompts(
@@ -881,13 +881,9 @@ class TextBackend:
             domain_context=self.domain_context,
             retry_feedback=retry_feedback,
         )
-        effective_max_tokens = (
-            max_tokens if max_tokens is not None else max(2400, self.text_cfg.max_tokens)
-        )
         content = self._chat(
             system,
             user,
-            max_tokens=effective_max_tokens,
             include_user_system=False,
             output_schema=get_output_schema("check_gate3_fixtures"),
             temperature=temperature,
@@ -917,7 +913,10 @@ def _extract_chat_content(data: dict[str, Any]) -> str:
             else (choice0["text"] if isinstance(choice0.get("text"), str) else "")
         )
         raise ModelTruncatedError(
-            "Text model response truncated (finish_reason='length'); increase [text].max_tokens",
+            (
+                "Text model response truncated (finish_reason='length'); "
+                "increase [text].max_tokens or unset it to use the model default"
+            ),
             partial_text=strip_thinking(raw_partial),
         )
     if isinstance(msg, dict) and isinstance(msg.get("content"), str):

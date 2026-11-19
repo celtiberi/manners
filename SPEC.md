@@ -285,7 +285,7 @@ pass_threshold = 0.50            # Check passes iff p > pass_threshold
 
 [text]
 detail = "standard"              # "concise" | "standard" | "detailed"
-max_tokens = 1024
+# max_tokens = 2048              # Optional cap; omitted by default (uses model default)
 explain_decision_failures = true
 system_prompt = ""               # Optional custom instructions for [models.text]
 
