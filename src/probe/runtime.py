@@ -73,6 +73,24 @@ def normalize_probe_type(kind: ProbeType | str) -> ProbeType:
         raise ValueError(f"Unsupported probe kind: {kind!r} (expected probe.type.decision or probe.type.text)") from exc
 
 
+def normalize_ignore(ignore: str | Sequence[str] | None) -> tuple[str, ...]:
+    """Normalize ignored parameter name(s) for @probe into a deduplicated tuple."""
+    if ignore is None:
+        return ()
+    if isinstance(ignore, str):
+        if not ignore.strip():
+            raise ValueError("@probe `ignore` parameter name must not be empty")
+        return (ignore,)
+    if isinstance(ignore, (bytes, bytearray)) or not isinstance(ignore, Sequence):
+        raise TypeError("@probe `ignore` must be a parameter name string or sequence of parameter names")
+    out: list[str] = []
+    for elem in ignore:
+        if not isinstance(elem, str) or not elem.strip():
+            raise ValueError("@probe `ignore` entries must be non-empty parameter name strings")
+        out.append(elem)
+    return tuple(dict.fromkeys(out))
+
+
 def compute_checks_hash(kind: ProbeType | str, checks: Sequence[str]) -> str:
     """Compute canonical SHA-256 hex digest for (kind, checks) shared between check and runtime."""
     payload = json.dumps(
@@ -277,7 +295,7 @@ class ProbeRuntime:
             self.redactor = SecretRedactor.from_environment(
                 self.config.redact,
                 cwd=self.config.project_root,
-                extra_dirs=(Path.cwd(),),
+                extra_dirs=(*self.config.models_decision.env_search_dirs, Path.cwd()),
             )
             self.decision_backend = DecisionBackend(
                 self.config.models_decision,

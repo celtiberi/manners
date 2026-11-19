@@ -23,12 +23,34 @@ from probe.check import (
 from probe.config import load_config
 from probe.store import EventRecord, ProbeStore, RunRecord
 
+_ROOT_OPTION = typer.Option(
+    None,
+    "--root",
+    help="Project root directory (overrides auto-discovery and PROBE_PROJECT_ROOT).",
+)
+
 app = typer.Typer(
     name="probe",
     help="AI runtime checks, pre-run check, and call-ordered behavior logs.",
     no_args_is_help=True,
     add_completion=False,
 )
+
+
+@app.callback()
+def main_callback(
+    ctx: typer.Context,
+    root: Path | None = _ROOT_OPTION,
+) -> None:
+    """Store optional global --root option for subcommands."""
+    ctx.obj = {"root": root}
+
+
+def _load_cli_config(ctx: typer.Context, root: Path | None):
+    cb_root = ctx.obj.get("root") if isinstance(ctx.obj, dict) else None
+    if root is not None and cb_root is not None and root != cb_root:
+        raise ValueError("Pass --root either before or after the subcommand, not two different paths")
+    return load_config(project_root=root or cb_root)
 
 
 def _open_existing_store(runs_dir: Path, *, read_only: bool = True) -> ProbeStore:
@@ -209,34 +231,47 @@ def _resolve_cli_scan_paths(
     locked: dict[str, Any] | None = None
     resolved_paths: list[Path] = []
     for p in paths:
-        resolved = p.resolve() if p.is_absolute() else (cwd / p).resolve()
+        if p.is_absolute():
+            candidates = [p.resolve()]
+            resolved = candidates[0]
+        else:
+            cwd_cand = (cwd / p).resolve()
+            root_cand = (base_root / p).resolve()
+            candidates = [root_cand] if root_cand == cwd_cand else [cwd_cand, root_cand]
+            resolved = next((cand for cand in candidates if cand.exists()), candidates[0])
         if not resolved.exists():
-            allow_deleted = False
+            matched_deleted: Path | None = None
             if lock_path is not None and lock_path.exists():
                 if locked is None:
                     locked = _load_lockfile(lock_path).get("probes", {})
-                rel = _rel_display_path(resolved, base_root)
-                allow_deleted = any(
-                    isinstance(meta, dict)
-                    and _matches_file_or_dir_prefixes(str(meta.get("file_line", "")), {rel})
-                    for meta in locked.values()
-                )
-            if not allow_deleted:
+                for cand in candidates:
+                    rel = _rel_display_path(cand, base_root)
+                    if any(
+                        isinstance(meta, dict)
+                        and _matches_file_or_dir_prefixes(str(meta.get("file_line", "")), {rel})
+                        for meta in locked.values()
+                    ):
+                        matched_deleted = cand
+                        break
+            if matched_deleted is None:
                 typer.echo(f"Path does not exist: {p}", err=True)
                 raise typer.Exit(code=1)
+            resolved = matched_deleted
         resolved_paths.append(resolved)
     return resolved_paths
 
 
 @app.command("check")
 def check_cmd(
+    ctx: typer.Context,
     paths: list[Path] = typer.Argument(None, help="Files or directories to scan (defaults to project root)."),
     force: bool = typer.Option(False, "--force", help="Re-run Gates 2-3 even when unchanged in lockfile."),
     json_out: bool = typer.Option(False, "--json", help="Emit machine-readable JSON output."),
+    root: Path | None = _ROOT_OPTION,
 ) -> None:
     """Run Gates 1-3 on new or changed probes and update .probes/lock.json."""
     try:
-        cfg = load_config()
+        cfg = _load_cli_config(ctx, root)
         resolved_paths = _resolve_cli_scan_paths(
             paths,
             lock_path=cfg.resolve_lock_path(),
@@ -273,12 +308,14 @@ def check_cmd(
 
 @app.command("list")
 def list_cmd(
+    ctx: typer.Context,
     paths: list[Path] = typer.Argument(None, help="Files or directories to scan (defaults to project root)."),
     json_out: bool = typer.Option(False, "--json", help="Emit JSON output."),
+    root: Path | None = _ROOT_OPTION,
 ) -> None:
     """List statically discovered @probe and probe.here call sites and lock status."""
     try:
-        cfg = load_config()
+        cfg = _load_cli_config(ctx, root)
         resolved_paths = _resolve_cli_scan_paths(paths, project_root=cfg.project_root)
         _, discovered, parse_errors = _scan_files(resolved_paths, root=cfg.project_root)
         lock_path = cfg.resolve_lock_path()
@@ -359,6 +396,7 @@ def list_cmd(
 
 @app.command("report")
 def report_cmd(
+    ctx: typer.Context,
     run_id: str | None = typer.Option(None, "--run", help="Specific run ULID (defaults to latest run)."),
     show_all: bool = typer.Option(False, "--all", help="Include passed probe calls in timeline."),
     fmt: str = typer.Option("text", "--format", help="Output format: text | md | json."),
@@ -367,10 +405,11 @@ def report_cmd(
         "--check",
         help="Exit with code 1 if the run recorded any fail/error events (for non-halting soak runs).",
     ),
+    root: Path | None = _ROOT_OPTION,
 ) -> None:
     """Print call-ordered summary of the latest or specified probe run."""
     try:
-        cfg = load_config()
+        cfg = _load_cli_config(ctx, root)
         runs_dir = cfg.resolve_runs_dir()
         store = _open_existing_store(runs_dir)
         try:
@@ -407,17 +446,19 @@ def report_cmd(
 
 @app.command("log")
 def log_cmd(
+    ctx: typer.Context,
     probe_ids: list[str] = typer.Argument(..., help="One or more probe IDs or glob patterns."),
     run_id: str | None = typer.Option(None, "--run", help="Specific run ULID (defaults to latest run)."),
     payload: bool = typer.Option(False, "--payload", help="Include redacted input/output snapshots."),
     fmt: str = typer.Option("text", "--format", help="Output format: text | md | json."),
+    root: Path | None = _ROOT_OPTION,
 ) -> None:
     """Interleave detailed chronological entries (call_seq ASC) for one or more probe IDs/globs."""
     if not probe_ids or any(not pat.strip() for pat in probe_ids):
         typer.echo("Probe ID or glob pattern must not be empty.", err=True)
         raise typer.Exit(code=1)
     try:
-        cfg = load_config()
+        cfg = _load_cli_config(ctx, root)
         runs_dir = cfg.resolve_runs_dir()
         store = _open_existing_store(runs_dir)
         try:
@@ -500,12 +541,14 @@ def log_cmd(
 
 @app.command("runs")
 def runs_cmd(
+    ctx: typer.Context,
     limit: int = typer.Option(20, "--limit", min=1, help="Maximum number of recent runs to show."),
     json_out: bool = typer.Option(False, "--json", help="Emit JSON output."),
+    root: Path | None = _ROOT_OPTION,
 ) -> None:
     """List recent probe runs with timestamps, verdict counts, and status."""
     try:
-        cfg = load_config()
+        cfg = _load_cli_config(ctx, root)
         store = _open_existing_store(cfg.resolve_runs_dir())
         try:
             runs = store.list_runs(limit=limit)
@@ -533,11 +576,13 @@ def runs_cmd(
 
 @app.command("clean")
 def clean_cmd(
+    ctx: typer.Context,
     keep: int = typer.Option(20, "--keep", min=0, help="Number of newest runs to retain."),
+    root: Path | None = _ROOT_OPTION,
 ) -> None:
     """Prune old run logs from .probes/runs."""
     try:
-        cfg = load_config()
+        cfg = _load_cli_config(ctx, root)
         store = _open_existing_store(cfg.resolve_runs_dir(), read_only=False)
         try:
             deleted = store.clean_runs(keep=keep)
@@ -551,16 +596,18 @@ def clean_cmd(
 
 @app.command("fixture")
 def fixture_cmd(
+    ctx: typer.Context,
     probe_id: str = typer.Argument(..., help="Probe ID to promote recorded snapshots or scaffold."),
     run_id: str | None = typer.Option(None, "--run", help="Specific run ULID to extract snapshots from."),
     init_skeleton: bool = typer.Option(
         False, "--init", help="Scaffold missing pass/fail entries from the probe's AST signature/watched keys."
     ),
     json_out: bool = typer.Option(False, "--json", help="Emit JSON output."),
+    root: Path | None = _ROOT_OPTION,
 ) -> None:
     """Promote recorded pass/fail snapshots into .probes/fixtures/<id>.json or scaffold a starter fixture."""
     try:
-        cfg = load_config()
+        cfg = _load_cli_config(ctx, root)
         fp, pass_count, fail_count = upsert_probe_fixture(
             probe_id=probe_id,
             cfg=cfg,

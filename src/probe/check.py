@@ -63,6 +63,7 @@ class DiscoveredProbe:
     watched_keys: tuple[str, ...] = ()
     param_names: tuple[str, ...] = ()
     required_params: tuple[str, ...] = ()
+    ignored_params: tuple[str, ...] = ()
     type_tags: tuple[tuple[str, str], ...] = ()
     return_type_tag: str = "str"
 
@@ -255,6 +256,25 @@ def _extract_checks_literal(expr: ast.expr | None) -> tuple[tuple[str, ...], str
     return (), "`checks` must be a string literal or list/tuple of string literals"
 
 
+def _extract_ignore_literal(expr: ast.expr | None) -> tuple[tuple[str, ...], str | None]:
+    if expr is None or (isinstance(expr, ast.Constant) and expr.value is None):
+        return (), None
+    if isinstance(expr, ast.Constant) and isinstance(expr.value, str):
+        if not expr.value.strip():
+            return (), "`ignore` parameter name must not be empty"
+        return (expr.value,), None
+    if isinstance(expr, (ast.List, ast.Tuple)):
+        items: list[str] = []
+        for elt in expr.elts:
+            if not (isinstance(elt, ast.Constant) and isinstance(elt.value, str)):
+                return (), "All elements in `ignore` must be literal strings for static inspection"
+            if not elt.value.strip():
+                return (), "`ignore` parameter names must not be empty"
+            items.append(elt.value)
+        return tuple(dict.fromkeys(items)), None
+    return (), "`ignore` must be a string literal or list/tuple of string literals"
+
+
 def _extract_probe_type(
     expr: ast.expr | None,
     *,
@@ -315,7 +335,7 @@ def _validate_call_structure_and_id(
         if kw.arg in seen_kws:
             return None, f"Duplicate keyword argument '{kw.arg}' in {site}"
         seen_kws.add(kw.arg)
-        if site == "@probe" and kw.arg not in {"checks", "id", "kind"}:
+        if site == "@probe" and kw.arg not in {"checks", "id", "kind", "ignore"}:
             return None, f"Unknown @probe keyword argument: {kw.arg!r}"
 
     if call.args and "checks" in seen_kws:
@@ -768,9 +788,28 @@ class _ModuleProbeVisitor(ast.NodeVisitor):
                 _extract_kwarg(call, "kind"),
                 lookup_role=self._lookup_role,
             )
-            literal_error = call_err or struct_err or check_err or kind_err or gen_err
+            ignored_params, ignore_err = _extract_ignore_literal(_extract_kwarg(call, "ignore"))
+            if ignore_err is None and ignored_params:
+                unknown_ign = [p for p in ignored_params if p not in param_names]
+                if unknown_ign:
+                    ignore_err = (
+                        f"@probe ignore references unknown parameter(s): "
+                        f"{', '.join(repr(p) for p in unknown_ign)}"
+                    )
+            ign_set = frozenset(ignored_params)
+            eff_param_names = tuple(p for p in param_names if p not in ign_set) if ign_set else param_names
+            eff_req_params = tuple(p for p in required_params if p not in ign_set) if ign_set else required_params
+            eff_type_tags = (
+                tuple((p, fn_type_tags.get(p, "str")) for p in eff_param_names) if ign_set else param_type_tags
+            )
+            eff_s_hash = (
+                _sha256_text(f"{sig}\n{doc}\nignore={','.join(ignored_params)}")
+                if ignored_params
+                else s_hash
+            )
+            literal_error = call_err or struct_err or check_err or kind_err or ignore_err or gen_err
             c_hash = compute_checks_hash(kind, checks)
-            combined = _sha256_text(f"{c_hash}:{s_hash}")
+            combined = _sha256_text(f"{c_hash}:{eff_s_hash}")
             self.discovered.append(
                 DiscoveredProbe(
                     probe_id=probe_id,
@@ -784,11 +823,12 @@ class _ModuleProbeVisitor(ast.NodeVisitor):
                     signature=sig,
                     source_excerpt=body_excerpt,
                     checks_hash=c_hash,
-                    source_hash=s_hash,
+                    source_hash=eff_s_hash,
                     combined_hash=combined,
-                    param_names=param_names,
-                    required_params=required_params,
-                    type_tags=param_type_tags,
+                    param_names=eff_param_names,
+                    required_params=eff_req_params,
+                    ignored_params=ignored_params,
+                    type_tags=eff_type_tags,
                     return_type_tag=ret_type_tag,
                 )
             )
@@ -1402,6 +1442,13 @@ def _validate_gate3_snapshot(snapshot_json: str, *, item: DiscoveredProbe, label
                 f"Gate 3 {label} for decorator probe {item.probe_id} missing required input(s): "
                 f"{', '.join(missing_params)}"
             )
+        if item.ignored_params:
+            unexpected_ignored = [p for p in item.ignored_params if p in inputs]
+            if unexpected_ignored:
+                raise BackendError(
+                    f"Gate 3 {label} for decorator probe {item.probe_id} must omit ignored input(s): "
+                    f"{', '.join(unexpected_ignored)}"
+                )
         if "output" not in obj:
             raise BackendError(
                 f"Gate 3 {label} for decorator probe {item.probe_id} must include 'output'"
@@ -1444,6 +1491,28 @@ def _format_case_scores(case_scores: list[list[CheckScore]]) -> list[dict[str, A
     return out
 
 
+def _format_gate3_pass_reason(
+    fixture_source: str,
+    pass_case_scores: list[list[CheckScore]],
+    fail_case_scores: list[list[CheckScore]],
+) -> tuple[str, float, float]:
+    """Summarize Gate 2 + Gate 3 calibration margins and return (reason, pass_min_p, fail_max_p)."""
+    pass_min_p = min(s.probability for scores in pass_case_scores for s in scores)
+    fail_max_p = max(min(s.probability for s in scores) for scores in fail_case_scores)
+    if len(pass_case_scores) == 1 and len(fail_case_scores) == 1:
+        reason = (
+            f"Passed Gate 2 audit & Gate 3 {fixture_source} calibration "
+            f"(pass min p={pass_min_p:.2f}, fail max p={fail_max_p:.2f})"
+        )
+    else:
+        reason = (
+            f"Passed Gate 2 audit & Gate 3 {fixture_source} calibration "
+            f"({len(pass_case_scores)} pass, {len(fail_case_scores)} fail; "
+            f"pass min p={pass_min_p:.2f}, fail max p={fail_max_p:.2f})"
+        )
+    return reason, round(pass_min_p, 4), round(fail_max_p, 4)
+
+
 def _evaluate_uncached_probe(
     item: DiscoveredProbe,
     *,
@@ -1473,17 +1542,21 @@ def _evaluate_uncached_probe(
                 signature=item.signature,
                 source_excerpt=item.source_excerpt,
                 watched_keys=item.watched_keys,
+                ignored_params=item.ignored_params,
+                captured_params=item.param_names,
                 temperature=0.0 if g2_attempt == 1 else 0.2,
             )
-            gate2_state = json.dumps(
-                {
-                    "site": item.site,
-                    "signature": item.signature,
-                    "watched_keys": list(item.watched_keys),
-                    "checks": list(item.checks),
-                },
-                ensure_ascii=False,
-            )
+            gate2_state_obj: dict[str, Any] = {
+                "site": item.site,
+                "signature": item.signature,
+                "watched_keys": list(item.watched_keys),
+                "checks": list(item.checks),
+            }
+            if item.site == "decorator":
+                gate2_state_obj["captured_inputs"] = list(item.param_names)
+                if item.ignored_params:
+                    gate2_state_obj["ignored_params"] = list(item.ignored_params)
+            gate2_state = json.dumps(gate2_state_obj, ensure_ascii=False)
             gate2_scores = decision_backend.evaluate_checks(
                 probe_id=f"{item.probe_id}#gate2",
                 checks=get_nouls("check_gate2_nouls"),
@@ -1529,7 +1602,6 @@ def _evaluate_uncached_probe(
             ),
             None,
         )
-    audit_reason = "Passed Gate 2 check audit"
 
     # Gate 3: Dry-run calibration against manual fixture(s) or synthesized samples (1x synthetic retry).
     fixture_source = "fixture" if fixture is not None else "synthetic"
@@ -1555,6 +1627,8 @@ def _evaluate_uncached_probe(
                     signature=item.signature,
                     source_excerpt=item.source_excerpt,
                     watched_keys=item.watched_keys,
+                    ignored_params=item.ignored_params,
+                    captured_params=item.param_names,
                     temperature=0.0 if attempt == 1 else 0.3,
                     retry_feedback=retry_feedback,
                 )
@@ -1694,7 +1768,10 @@ def _evaluate_uncached_probe(
             None,
         )
 
-    lock_entry = {
+    passed_reason, pass_min_p, fail_max_p = _format_gate3_pass_reason(
+        fixture_source, pass_case_scores, fail_case_scores
+    )
+    lock_entry: dict[str, Any] = {
         "probe_id": item.probe_id,
         "site": item.site,
         "kind": item.probe_type.value,
@@ -1706,8 +1783,12 @@ def _evaluate_uncached_probe(
         "source_hash": item.source_hash,
         "combined_hash": effective_combined_hash,
         "source": fixture_source,
+        "pass_min_p": pass_min_p,
+        "fail_max_p": fail_max_p,
         "approved_at": utc_now_iso(),
     }
+    if item.ignored_params:
+        lock_entry["ignored_params"] = list(item.ignored_params)
     return (
         ProbeCheckResult(
             probe_id=item.probe_id,
@@ -1716,7 +1797,7 @@ def _evaluate_uncached_probe(
             probe_type=item.probe_type.value,
             status="passed",
             gate="done",
-            reason=audit_reason or "Passed Gates 1-3",
+            reason=passed_reason,
             checks=item.checks,
             pass_scores=pass_dicts,
             fail_scores=fail_dicts,
@@ -1745,7 +1826,11 @@ def run_probe_check(
     lock_data = _load_lockfile(lock_path)
     locked_probes: dict[str, Any] = dict(lock_data.get("probes", {}))
     fixtures_dir = lock_path.parent / "fixtures"
-    redactor = SecretRedactor.from_environment(cfg.redact, cwd=base_root, extra_dirs=(Path.cwd(),))
+    redactor = SecretRedactor.from_environment(
+        cfg.redact,
+        cwd=base_root,
+        extra_dirs=(*cfg.models_decision.env_search_dirs, Path.cwd()),
+    )
 
     error_file_prefixes = {_rel_display_path(pf, base_root) for pf in parse_errors}
     checked_prefixes = {_rel_display_path(pf, base_root) for pf in py_files} - error_file_prefixes
@@ -1890,6 +1975,16 @@ def run_probe_check(
                 and params_ok
             ):
                 existing["file_line"] = item.file_line
+                pass_p = existing.get("pass_min_p")
+                fail_p = existing.get("fail_max_p")
+                if isinstance(pass_p, (int, float)) and isinstance(fail_p, (int, float)):
+                    src_label = str(existing.get("source", "locked"))
+                    cached_reason = (
+                        f"Unchanged since last approved lock entry "
+                        f"({src_label}: pass min p={float(pass_p):.2f}, fail max p={float(fail_p):.2f})"
+                    )
+                else:
+                    cached_reason = "Unchanged since last approved lock entry"
                 discovered_results[idx] = ProbeCheckResult(
                     probe_id=item.probe_id,
                     file_line=item.file_line,
@@ -1897,7 +1992,7 @@ def run_probe_check(
                     probe_type=item.probe_type.value,
                     status="cached",
                     gate="cache",
-                    reason="Unchanged since last approved lock entry",
+                    reason=cached_reason,
                     checks=item.checks,
                 )
                 continue

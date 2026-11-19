@@ -59,12 +59,14 @@ def probe(
     *,
     id: str | None = None,
     kind: ProbeType = probe.type.decision,
+    ignore: str | Sequence[str] = (),
 ) -> Callable[[F], F]: ...
 ```
 
-- `checks`: One expectation string or a list of discrete expectations checked against arguments and return value.
+- `checks`: One expectation string or a list of discrete expectations checked against captured arguments and return value.
 - `id`: Probe identifier (e.g., `"tutor.opening_turn"`). Defaults to `<module>.<qualname>`.
 - `kind`: `probe.type.decision` *(default)* or `probe.type.text`.
+- `ignore`: Optional parameter name or sequence of parameter names omitted before runtime input serialization, `lock.json` `param_names`, and Gate 3 fixtures.
 
 Waitpoints and decorators can also be suppressed or explicitly opted back in using stackable context managers (`from probe import disabled, enabled, flush`):
 
@@ -188,23 +190,23 @@ Probes must pass `probe check` before running (and whenever checks, `kind`, or t
 1. **Static AST scan:** Extracts `@probe(...)` and `probe.here(...)` calls, signatures, and enclosing context (`probe.here` includes the enclosing function's docstring and up to 40 pre-call lines in `source_excerpt`) without importing project modules.
 2. **Gate 1 — Budgets & structure:** Checks for duplicate `probe_id`s, `len(checks) <= max_checks` (default `12`), and `len(check) <= max_check_chars` (default `200`).
 3. **Gate 2 — Assert vs. prose audit (`[models.text]` + `[models.decision]`):** `[models.text]` describes factually what each check inspects at runtime, and `[models.decision]` scores short positive Gate 2 defect questions (`expected: false`; every defect question must score `< 0.50` to pass)—rejecting checks that belong as regular Python `assert`s or regexes (math, null checks, regex matches, type/length checks), vague unfalsifiable filler, or checks requiring uncaptured external state.
-4. **Gate 3 — Dry-run calibration:** Skipped when `(probe_id, site, kind, watched_keys, param_names)` and combined `(checks, source, threshold, domain_context, manual fixture)` hashes are unchanged in `.probes/lock.json` (unless `--force`). For `@probe`, `source_hash` hashes `(signature, docstring)` so editing internal statements/logging does not invalidate `lock.json`; for `probe.here`, `source_hash` hashes `(enclosing_signature, watched_keys)`. Uncached probes run Gates 2–3 in bounded parallel (`[check].max_workers`, default `4`) while returning deterministic order. Decision snapshots separate `Observed Output (under test)` / `Watched Variables (under test)` ahead of `Call Inputs (context only)`. Uses fixtures from `.probes/fixtures/<probe_id>.json` if present (either a single `"pass"`/`"fail"` snapshot or lists of historical snapshots `"pass": [...]`, `"fail": [...]`, optionally promoted via `probe fixture <probe_id>`), or asks `[models.text]` for one passing and one failing sample matching the signature (retrying synthetic synthesis up to 1x on transient shape/calibration failures), then verifies every pass sample scores `pass` on all checks and every fail sample fails at least one check.
+4. **Gate 3 — Dry-run calibration:** Skipped when `(probe_id, site, kind, watched_keys, param_names)` and combined `(checks, source, threshold, domain_context, manual fixture)` hashes are unchanged in `.probes/lock.json` (unless `--force`). For `@probe`, `source_hash` hashes `(signature, docstring[, ignore=...])` so editing internal statements/logging does not invalidate `lock.json`; for `probe.here`, `source_hash` hashes `(enclosing_signature, watched_keys)`. Uncached probes run Gates 2–3 in bounded parallel (`[check].max_workers`, default `4`) while returning deterministic order. Decision snapshots separate `Observed Output (under test)` / `Watched Variables (under test)` ahead of `Call Inputs (context only)`. Uses fixtures from `.probes/fixtures/<probe_id>.json` if present (either a single `"pass"`/`"fail"` snapshot or lists of historical snapshots `"pass": [...]`, `"fail": [...]`, optionally promoted via `probe fixture <probe_id>`), or asks `[models.text]` for one passing and one failing sample matching the signature (retrying synthetic synthesis up to 1x on transient shape/calibration failures), then verifies every pass sample scores `pass` on all checks, every fail sample fails at least one check, and reports the resulting `(pass min p, fail max p)` margins in `probe check` output and `.probes/lock.json`.
 
 ---
 
 ## 5. CLI
 
-Per-run JSONL files (`.probes/runs/<run_id>.jsonl`) are append-only plain text; CLI commands sort and summarize events by `call_seq ASC`.
+Per-run JSONL files (`.probes/runs/<run_id>.jsonl`) are append-only plain text; CLI commands sort and summarize events by `call_seq ASC`, and accept `--root <dir>` (either globally or per subcommand) to override project root discovery.
 
 | Command | Purpose |
 |---|---|
-| `probe check [paths...]` | Run Gates 1–3 on new or changed probes and update `.probes/lock.json` (`--force`, `--json`). |
-| `probe list [paths...]` | List probes (`id`, `file:line`, `kind`, lock status, `checks`). |
-| `probe fixture <id>` | Promote recorded pass/fail snapshots from `.probes/runs/*.jsonl` into `.probes/fixtures/<id>.json` (`--run ID`, `--init`, `--json`). |
-| `probe report` | Print call-ordered summary of the latest run (`--run <id>`, `--all`, `--format text\|md\|json`, `--check`). |
-| `probe log <probe_id>...` | Interleave detailed chronological entries (`call_seq ASC`) for one or more probe IDs / glob patterns (e.g., `probe log tutor.opening_turn rag.*`). |
-| `probe runs` | List recent runs with timestamps, command, verdict counts, and status. |
-| `probe clean [--keep N]` | Prune older run logs from `.probes/runs` (default keeps last `20`). |
+| `probe check [paths...]` | Run Gates 1–3 on new or changed probes, surface calibration margins, and update `.probes/lock.json` (`--force`, `--json`, `--root`). |
+| `probe list [paths...]` | List probes (`id`, `file:line`, `kind`, lock status, `checks`, `--root`). |
+| `probe fixture <id>` | Promote recorded pass/fail snapshots from `.probes/runs/*.jsonl` into `.probes/fixtures/<id>.json` (`--run ID`, `--init`, `--json`, `--root`). |
+| `probe report` | Print call-ordered summary of the latest run (`--run <id>`, `--all`, `--format text\|md\|json`, `--check`, `--root`). |
+| `probe log <probe_id>...` | Interleave detailed chronological entries (`call_seq ASC`) for one or more probe IDs / glob patterns (`--root`). |
+| `probe runs` | List recent runs with timestamps, command, verdict counts, and status (`--root`). |
+| `probe clean [--keep N]` | Prune older run logs from `.probes/runs` (default keeps last `20`, `--root`). |
 
 ### Example `probe report --all` Output
 
@@ -310,8 +312,9 @@ halt_on_fail = true              # Set false (or PROBE_NO_HALT=1) for non-haltin
 max_workers = 4                  # Bounded background grading pool size in non-halting soak mode
 ```
 
-**Environment flags (shell env or `.env`):**
+**Environment flags (shell env or `.env`, searching nearest-first from `project_root` up to the enclosing `.git` root):**
 - `PROBES`: `0` *(default, disabled)* | `1` *(enabled; shell env overrides `.env`)*
+- `PROBE_PROJECT_ROOT`: Optional project root directory override (useful in monorepos when running from the repository root so `pyproject.toml`, `.probes/lock.json`, and `.probes/runs` stay inside a subpackage)
 - `PROBE_CONFIG`: Optional path override for `config.toml`
 - `PROBE_SKIP_LOCK`: `1` to bypass `.probes/lock.json` during rapid local edits
 - `PROBE_NO_PDB`: `1` to always raise `ProbeHaltError` instead of opening `pdb` in interactive terminals

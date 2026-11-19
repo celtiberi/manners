@@ -557,11 +557,12 @@ def serialize_call_inputs(
     kwargs: dict[str, Any],
     redactor: SecretRedactor,
     *,
+    ignore: Sequence[str] = (),
     max_depth: int = 4,
     max_items: int = 25,
     max_str_bytes: int = 4096,
 ) -> dict[str, Any]:
-    """Bind function arguments by parameter name, mask request secrets, and bound sizes."""
+    """Bind function arguments by parameter name, drop ignored handles, mask secrets, and bound sizes."""
     try:
         sig = inspect.signature(fn)
         bound = sig.bind_partial(*args, **kwargs)
@@ -572,6 +573,10 @@ def serialize_call_inputs(
             raw_inputs["args"] = list(args)
         if kwargs:
             raw_inputs["kwargs"] = dict(kwargs)
+
+    if ignore:
+        for param_name in ignore:
+            raw_inputs.pop(param_name, None)
 
     return _serialize_bounded(
         raw_inputs,

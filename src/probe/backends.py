@@ -829,6 +829,8 @@ class TextBackend:
         signature: str,
         source_excerpt: str,
         watched_keys: Sequence[str] = (),
+        ignored_params: Sequence[str] = (),
+        captured_params: Sequence[str] | None = None,
         temperature: float = 0.0,
     ) -> str:
         """Gate 2 step 1: produce factual analysis of checks before decision noul scoring."""
@@ -839,6 +841,8 @@ class TextBackend:
             signature=signature,
             source_excerpt=source_excerpt,
             watched_keys=watched_keys,
+            ignored_params=ignored_params,
+            captured_params=captured_params,
             domain_context=self.domain_context,
         )
         return self._chat(
@@ -858,6 +862,8 @@ class TextBackend:
         signature: str,
         source_excerpt: str,
         watched_keys: Sequence[str] = (),
+        ignored_params: Sequence[str] = (),
+        captured_params: Sequence[str] | None = None,
         temperature: float = 0.0,
         retry_feedback: str = "",
     ) -> tuple[str, str]:
@@ -869,6 +875,8 @@ class TextBackend:
             signature=signature,
             source_excerpt=source_excerpt,
             watched_keys=watched_keys,
+            ignored_params=ignored_params,
+            captured_params=captured_params,
             domain_context=self.domain_context,
             retry_feedback=retry_feedback,
         )
