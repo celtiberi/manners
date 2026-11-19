@@ -38,6 +38,7 @@ from probe.runtime import (
     _here_file_line,
     _short_stack_excerpt,
     normalize_checks,
+    normalize_ignore,
     normalize_probe_type,
 )
 
@@ -94,11 +95,15 @@ if hasattr(os, "register_at_fork"):
     os.register_at_fork(after_in_child=_reset_child_runtime)
 
 
-def _callable_param_names(fn: Callable[..., Any]) -> tuple[str, ...] | None:
+def _callable_param_names(fn: Callable[..., Any], ignore: Sequence[str] = ()) -> tuple[str, ...] | None:
     try:
-        return tuple(inspect.signature(inspect.unwrap(fn)).parameters.keys())
+        names = tuple(inspect.signature(inspect.unwrap(fn)).parameters.keys())
     except (TypeError, ValueError):
         return None
+    if ignore:
+        ign = set(ignore)
+        return tuple(n for n in names if n not in ign)
+    return names
 
 
 def _prepare_decorator_call(
@@ -109,6 +114,7 @@ def _prepare_decorator_call(
     checks: tuple[str, ...],
     probe_id: str | None,
     probe_type: ProbeType,
+    ignore: tuple[str, ...],
     caller_frame: FrameType | None,
 ) -> tuple[ProbeRuntime, str, str, int, float, str, dict[str, Any], bool]:
     """Validate lock & rate limits and snapshot inputs BEFORE calling wrapped `fn`."""
@@ -123,6 +129,7 @@ def _prepare_decorator_call(
         args,
         kwargs,
         rt.redactor,
+        ignore=ignore,
         max_depth=caps.max_depth,
         max_items=caps.max_items,
         max_str_bytes=caps.max_str_bytes,
@@ -140,7 +147,7 @@ def _prepare_decorator_call(
         file_line=file_line,
         payload_json=entry_payload_json,
         caller_frame=caller_frame,
-        param_names=_callable_param_names(fn),
+        param_names=_callable_param_names(fn, ignore=ignore),
     )
     if entered_pdb_lock or rt.is_tripped:
         raise ProbeHaltError(rt._halt_reason or "Probe halted before target call")
@@ -167,6 +174,7 @@ def _wrap_sync_fn(
     checks: tuple[str, ...],
     probe_id: str | None,
     probe_type: ProbeType,
+    ignore: tuple[str, ...] = (),
 ) -> Callable[P, R]:
     @functools.wraps(fn)
     def wrapper(*args: P.args, **kwargs: P.kwargs) -> R:
@@ -186,6 +194,7 @@ def _wrap_sync_fn(
                     checks=checks,
                     probe_id=probe_id,
                     probe_type=probe_type,
+                    ignore=ignore,
                     caller_frame=caller_frame,
                 )
             )
@@ -247,6 +256,7 @@ def _wrap_async_fn(
     checks: tuple[str, ...],
     probe_id: str | None,
     probe_type: ProbeType,
+    ignore: tuple[str, ...] = (),
 ) -> Callable[P, Any]:
     @functools.wraps(fn)
     async def wrapper(*args: P.args, **kwargs: P.kwargs) -> Any:
@@ -266,6 +276,7 @@ def _wrap_async_fn(
                     checks=checks,
                     probe_id=probe_id,
                     probe_type=probe_type,
+                    ignore=ignore,
                     caller_frame=caller_frame,
                 )
             )
@@ -420,9 +431,11 @@ class _ProbeAPI:
         *,
         id: str | None = None,
         kind: ProbeType | str = ProbeType.decision,
+        ignore: str | Sequence[str] = (),
     ) -> Callable[[F], F]:
         norm_checks = normalize_checks(checks)
         norm_kind = normalize_probe_type(kind)
+        norm_ignore = normalize_ignore(ignore)
 
         def decorator(fn: F) -> F:
             desc_type: builtins.type[classmethod[Any, Any, Any]] | builtins.type[staticmethod[Any, Any]] | None = None
@@ -443,6 +456,16 @@ class _ProbeAPI:
                     "@probe cannot wrap generator functions; use probe.here(...) inside the generator instead"
                 )
 
+            if norm_ignore:
+                raw_params = _callable_param_names(target)
+                if raw_params is not None:
+                    unknown = [p for p in norm_ignore if p not in raw_params]
+                    if unknown:
+                        raise ValueError(
+                            f"@probe ignore references unknown parameter(s) {unknown} "
+                            f"on {getattr(target, '__qualname__', target)}"
+                        )
+
             is_async = inspect.iscoroutinefunction(unwrapped) or (
                 not inspect.isfunction(target)
                 and not inspect.ismethod(target)
@@ -455,6 +478,7 @@ class _ProbeAPI:
                     checks=norm_checks,
                     probe_id=id,
                     probe_type=norm_kind,
+                    ignore=norm_ignore,
                 )
             else:
                 wrapped = _wrap_sync_fn(
@@ -462,6 +486,7 @@ class _ProbeAPI:
                     checks=norm_checks,
                     probe_id=id,
                     probe_type=norm_kind,
+                    ignore=norm_ignore,
                 )
 
             if desc_type is not None:

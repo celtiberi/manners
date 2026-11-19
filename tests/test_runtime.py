@@ -952,3 +952,102 @@ def test_v05_daemon_thread_halt_capture_and_threadpool_future(tmp_path: Path, mo
     finally:
         probe.flush_for_testing()
         reset_for_testing()
+
+
+def test_v06_decorator_ignore_params_sync_async_and_method(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("PROBES", "1")
+    monkeypatch.setenv("PROBE_NO_PDB", "1")
+    monkeypatch.delenv("PROBE_NO_HALT", raising=False)
+
+    class ExplodingHandle:
+        def model_dump(self) -> dict[str, str]:
+            raise AssertionError("ignored handle must not call model_dump()")
+
+        def __repr__(self) -> str:
+            raise AssertionError("ignored handle must not call __repr__()")
+
+    def pass_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"probabilities": [0.96]})
+
+    # 1. Invalid ignore names/shapes fail at decoration time.
+    with pytest.raises(ValueError, match="unknown parameter"):
+        @probe("Check summary", ignore="missing_arg")
+        def _bad(ticker: str) -> str:
+            return ticker
+
+    with pytest.raises(ValueError, match="must not be empty"):
+        @probe("Check summary", ignore="")
+        def _bad_empty(ticker: str) -> str:
+            return ticker
+
+    # 2. Valid sync, async, and method decorators skip ignored params completely.
+    @probe("Output summarizes portfolio metrics", id="svc.sync_sum", ignore=("data_dir", "llm_client"))
+    def summarize(ticker: str, data_dir: Path, llm_client: ExplodingHandle) -> str:
+        return f"{ticker}: steady growth"
+
+    @probe("Output summarizes portfolio metrics", id="svc.async_sum", ignore="llm_client")
+    async def asummarize(ticker: str, llm_client: ExplodingHandle) -> str:
+        return f"{ticker}: steady growth"
+
+    class Service:
+        @probe("Greeting stays polite", id="svc.method_greet", ignore=("self", "llm_client"))
+        def greet(self, name: str, llm_client: ExplodingHandle) -> str:
+            return f"Hello {name}"
+
+    cfg = _make_config(tmp_path, require_check=False)
+    reset_for_testing(config=cfg, transport=httpx.MockTransport(pass_handler))
+    try:
+        handle = ExplodingHandle()
+        assert summarize("AAPL", tmp_path, handle) == "AAPL: steady growth"
+        assert asyncio.run(asummarize("MSFT", handle)) == "MSFT: steady growth"
+        assert Service().greet("Ada", handle) == "Hello Ada"
+        rt = probe.flush_for_testing()
+    finally:
+        reset_for_testing()
+
+    assert rt is not None
+    store = ProbeStore(cfg.resolve_runs_dir(), create=False)
+    try:
+        _, events = store.get_run_with_events(rt.run_id)
+    finally:
+        store.close()
+    assert len(events) == 3
+    payloads = [json.loads(ev.payload_json) for ev in events]
+    assert payloads[0]["inputs"] == {"ticker": "AAPL"}
+    assert payloads[1]["inputs"] == {"ticker": "MSFT"}
+    assert payloads[2]["inputs"] == {"name": "Ada"}
+
+    # 3. Lockfile param_names verification matches filtered params (and catches removed ignore).
+    checks = ("Output summarizes portfolio metrics",)
+    lock_path = cfg.resolve_lock_path()
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "probes": {
+                    "svc.sync_sum": {
+                        "site": "decorator",
+                        "kind": "decision",
+                        "param_names": ["ticker"],
+                        "checks_hash": compute_checks_hash(ProbeType.decision, checks),
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    cfg_locked = _make_config(tmp_path, require_check=True)
+    reset_for_testing(config=cfg_locked, transport=httpx.MockTransport(pass_handler))
+    try:
+        assert summarize("NVDA", tmp_path, ExplodingHandle()) == "NVDA: steady growth"
+
+        @probe(checks[0], id="svc.sync_sum")
+        def summarize_unignored(ticker: str, data_dir: Path, llm_client: ExplodingHandle) -> str:
+            return f"{ticker}: ok"
+
+        with pytest.raises(ProbeHaltError, match="lock check"):
+            summarize_unignored("NVDA", tmp_path, "safe-handle")
+    finally:
+        probe.flush_for_testing()
+        reset_for_testing()

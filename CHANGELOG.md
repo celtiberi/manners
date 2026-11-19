@@ -5,6 +5,13 @@ All notable changes to `probe` will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.0] - 2026-11-18
+
+### Added
+- Monorepo `.env` and project-root discovery: `.env` flag, API-key, and secret-redaction lookups now walk nearest-first from `project_root` up to the enclosing `.git` root without escaping above the repository boundary. Added `PROBE_PROJECT_ROOT` (env/`.env`) and `--root <dir>` across CLI commands (`check`, `list`, `fixture`, `report`, `log`, `runs`, `clean`) plus `[tool.probe]` loading from the resolved project root.
+- `@probe(..., ignore=...)` support to exclude specified parameter names (such as `data_dir`, `llm_client`, or `self`) before input serialization, lockfile `param_names` checks, Gate 1–3 audits/fixtures, and `probe fixture --init` skeletons.
+- Gate 3 calibration probability margins (`pass min p`, `fail max p`) surfaced in `probe check` pass/cache output and stored in `.probes/lock.json`.
+
 ## [0.5.1] - 2026-11-18
 
 ### Fixed

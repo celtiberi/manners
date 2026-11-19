@@ -129,13 +129,18 @@ def parse_dotenv_file(path: Path) -> list[tuple[str, str]]:
     return entries
 
 
-def _parse_dotenv_key(env_path: Path, key_name: str) -> str:
-    """Return value for key_name from a dotenv file, or empty string if absent."""
-    matched = ""
+def _lookup_dotenv_key(env_path: Path, key_name: str) -> str | None:
+    """Return stripped value for key_name from a dotenv file, or None if absent."""
+    matched: str | None = None
     for k, val in parse_dotenv_file(env_path):
         if k == key_name:
             matched = val.strip()
     return matched
+
+
+def _parse_dotenv_key(env_path: Path, key_name: str) -> str:
+    """Return value for key_name from a dotenv file, or empty string if absent."""
+    return _lookup_dotenv_key(env_path, key_name) or ""
 
 
 def _encode_base32(value: int, length: int) -> str:
@@ -168,7 +173,7 @@ def utc_now_iso() -> str:
     return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
 
 
-_ENV_FLAG_CACHE: dict[tuple[str, str], tuple[tuple[int, int, int] | None, str]] = {}
+_ENV_FLAG_CACHE: dict[tuple[str, str], tuple[tuple[int, int, int] | None, str | None]] = {}
 _ENV_FLAG_CACHE_LOCK = threading.Lock()
 _TRUE_VALUES = frozenset({"1", "true", "yes", "on"})
 _FALSE_VALUES = frozenset({"0", "false", "no", "off"})
@@ -206,13 +211,7 @@ def clear_env_cache() -> None:
         _ENV_FLAG_CACHE.clear()
 
 
-def _read_env_flag(var_name: str, cwd: Path | None = None) -> str:
-    if var_name in os.environ:
-        return os.environ[var_name].strip()
-
-    base_str = str(cwd) if cwd is not None else os.getcwd()
-    root = find_project_root(Path(base_str))
-    env_path = root / ".env"
+def _read_dotenv_cached(env_path: Path, var_name: str) -> str | None:
     try:
         st = env_path.stat()
         sig: tuple[int, int, int] | None = (st.st_mtime_ns, st.st_size, st.st_ino)
@@ -225,10 +224,23 @@ def _read_env_flag(var_name: str, cwd: Path | None = None) -> str:
         if cached is not None and cached[0] == sig:
             return cached[1]
 
-    parsed = _parse_dotenv_key(env_path, var_name) if sig is not None else ""
+    parsed = _lookup_dotenv_key(env_path, var_name) if sig is not None else None
     with _ENV_FLAG_CACHE_LOCK:
         _ENV_FLAG_CACHE[cache_key] = (sig, parsed)
     return parsed
+
+
+def _read_env_flag(var_name: str, cwd: Path | None = None) -> str:
+    if var_name in os.environ:
+        return os.environ[var_name].strip()
+
+    base_dir = Path(str(cwd)) if cwd is not None else None
+    root = find_project_root(base_dir)
+    for search_dir in find_env_search_dirs(root):
+        parsed = _read_dotenv_cached(search_dir / ".env", var_name)
+        if parsed is not None:
+            return parsed
+    return ""
 
 
 def is_probes_enabled(cwd: Path | None = None) -> bool:
@@ -402,7 +414,7 @@ class ProbeConfig:
         return path if path.is_absolute() else (self.project_root / path)
 
 
-def find_project_root(start: Path | None = None) -> Path:
+def _find_auto_project_root(start: Path | None = None) -> Path:
     """Locate nearest directory with pyproject.toml, .probes, or .git; fallback to start."""
     cur = (start or Path.cwd()).resolve()
     for candidate in (cur, *cur.parents):
@@ -411,6 +423,74 @@ def find_project_root(start: Path | None = None) -> Path:
         if (candidate / ".git").exists():
             return candidate
     return cur
+
+
+def find_env_search_dirs(start: Path) -> tuple[Path, ...]:
+    """Return ordered directories (nearest-first) from start up to the enclosing .git root."""
+    cur = start.resolve()
+    home = Path.home().resolve()
+    chain: list[Path] = []
+    for candidate in (cur, *cur.parents):
+        chain.append(candidate)
+        if (candidate / ".git").exists():
+            if candidate == home and cur != home:
+                return (_find_auto_project_root(cur),)
+            return tuple(chain)
+        if candidate == home:
+            break
+
+    auto_root = _find_auto_project_root(cur)
+    if auto_root != cur and cur.is_relative_to(auto_root):
+        fallback: list[Path] = []
+        for candidate in (cur, *cur.parents):
+            fallback.append(candidate)
+            if candidate == auto_root:
+                break
+        return tuple(fallback)
+    return (cur,)
+
+
+def find_project_root(
+    start: Path | None = None,
+    *,
+    explicit_root: Path | None = None,
+) -> Path:
+    """Resolve project root from explicit path, PROBE_PROJECT_ROOT, or nearest marker."""
+    if explicit_root is not None:
+        p = Path(explicit_root).expanduser()
+        resolved = p.resolve() if p.is_absolute() else (Path.cwd() / p).resolve()
+        if not resolved.is_dir():
+            raise ValueError(f"Project root directory does not exist: {explicit_root}")
+        return resolved
+
+    if "PROBE_PROJECT_ROOT" in os.environ:
+        raw_env = os.environ["PROBE_PROJECT_ROOT"].strip()
+        if raw_env:
+            p = Path(raw_env).expanduser()
+            if p.is_absolute():
+                resolved = p.resolve()
+            else:
+                cwd_cand = (Path.cwd() / p).resolve()
+                start_cand = (start.resolve() / p).resolve() if start is not None else cwd_cand
+                resolved = cwd_cand if cwd_cand.is_dir() or start is None else start_cand
+            if not resolved.is_dir():
+                raise ValueError(f"PROBE_PROJECT_ROOT directory does not exist: {raw_env}")
+            return resolved
+        return _find_auto_project_root(start)
+
+    cur = (start or Path.cwd()).resolve()
+    auto_root = _find_auto_project_root(cur)
+    for env_dir in find_env_search_dirs(auto_root):
+        raw_val = _read_dotenv_cached(env_dir / ".env", "PROBE_PROJECT_ROOT")
+        if raw_val is not None:
+            if not raw_val:
+                break
+            p = Path(raw_val).expanduser()
+            resolved = p.resolve() if p.is_absolute() else (env_dir / p).resolve()
+            if not resolved.is_dir():
+                raise ValueError(f"PROBE_PROJECT_ROOT directory does not exist: {raw_val}")
+            return resolved
+    return auto_root
 
 
 def _find_pyproject(start: Path) -> Path | None:
@@ -585,21 +665,25 @@ def _validate_top_level_keys(data: dict[str, Any], source_label: str) -> None:
                 raise ValueError(f"Unknown [models.{mk}] section in {source_label}")
 
 
-def load_config(cwd: Path | None = None, config_path: Path | None = None) -> ProbeConfig:
+def load_config(
+    cwd: Path | None = None,
+    config_path: Path | None = None,
+    project_root: Path | None = None,
+) -> ProbeConfig:
     """Load default config merged with ~/.config/probe/config.toml (or PROBE_CONFIG) and pyproject.toml."""
     work_dir = (cwd or Path.cwd()).resolve()
-    project_root = find_project_root(work_dir)
-    cfg = ProbeConfig(project_root=project_root)
+    resolved_root = find_project_root(work_dir, explicit_root=project_root)
+    cfg = ProbeConfig(project_root=resolved_root)
 
     raw_user: dict[str, Any] = {}
-    env_cfg = _read_env_flag("PROBE_CONFIG", work_dir)
+    env_cfg = _read_env_flag("PROBE_CONFIG", resolved_root)
     user_path = config_path or (Path(env_cfg).expanduser() if env_cfg else _DEFAULT_USER_CONFIG_PATH)
     if user_path.is_file():
         raw_user = _load_toml_file(user_path)
         _validate_top_level_keys(raw_user, str(user_path))
 
     raw_proj: dict[str, Any] = {}
-    pyproject = _find_pyproject(work_dir)
+    pyproject = _find_pyproject(resolved_root)
     if pyproject is not None:
         parsed = _load_toml_file(pyproject)
         tool_probe = parsed.get("tool", {}).get("probe")
@@ -637,9 +721,10 @@ def load_config(cwd: Path | None = None, config_path: Path | None = None) -> Pro
             raise ValueError(f"domain_context must be a string, got {type(merged['domain_context']).__name__}")
         cfg.domain_context = merged["domain_context"].strip()
 
-    cfg.models_decision.env_search_dirs = (project_root,)
+    env_search_dirs = find_env_search_dirs(resolved_root)
+    cfg.models_decision.env_search_dirs = env_search_dirs
     cfg.models_decision.env_files = cfg.redact.env_files
-    cfg.models_text.env_search_dirs = (project_root,)
+    cfg.models_text.env_search_dirs = env_search_dirs
     cfg.models_text.env_files = cfg.redact.env_files
 
     for role_name, ep in (("models.decision", cfg.models_decision), ("models.text", cfg.models_text)):

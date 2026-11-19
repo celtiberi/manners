@@ -29,6 +29,7 @@ from probe.config import (
     ModelEndpointConfig,
     TextConfig,
     _merge_endpoint_config,
+    clear_env_cache,
     is_probes_enabled,
     load_config,
 )
@@ -45,6 +46,7 @@ from probe.prompts import (
     get_prompt,
     load_prompt_catalog,
 )
+from probe.redact import SecretRedactor
 
 
 def test_strip_thinking_and_extract_json() -> None:
@@ -924,3 +926,74 @@ def test_v04_system1_alignment_prompts_and_config() -> None:
     assert "Observed output (under test):" in premise
     assert "Call inputs (context only):" in premise
     assert premise.index('"output"') < premise.index('"inputs"')
+
+
+def test_v06_monorepo_env_walk_and_probe_project_root(tmp_path: Path, monkeypatch) -> None:
+    mono = tmp_path / "monorepo"
+    (mono / ".git").mkdir(parents=True)
+    sub = mono / "services" / "portfolio"
+    sub.mkdir(parents=True)
+    (sub / "pyproject.toml").write_text(
+        "[project]\nname = 'portfolio'\n[tool.probe]\ndomain_context = 'Portfolio check context.'\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "outside_root.env").write_text("TYPESAFE_API_KEY=outside-leak\n", encoding="utf-8")
+    (mono / ".env").write_text(
+        "PROBES=1\nTYPESAFE_API_KEY=mono-jev-secret-12345\nDEEPSEEK_API_KEY=mono-ds-secret-12345\n",
+        encoding="utf-8",
+    )
+
+    for var in ("PROBES", "TYPESAFE_API_KEY", "DEEPSEEK_API_KEY", "PROBE_PROJECT_ROOT"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("PROBE_CONFIG", str(tmp_path / "missing_config.toml"))
+    clear_env_cache()
+
+    cfg = load_config(cwd=sub)
+    assert cfg.project_root == sub.resolve()
+    assert cfg.domain_context == "Portfolio check context."
+    assert cfg.models_decision.resolve_api_key() == "mono-jev-secret-12345"
+    assert cfg.models_text.resolve_api_key() == "mono-ds-secret-12345"
+    assert is_probes_enabled(sub) is True
+
+    redactor = SecretRedactor.from_environment(
+        cfg.redact,
+        cwd=cfg.project_root,
+        extra_dirs=cfg.models_decision.env_search_dirs,
+    )
+    assert redactor.scrub_text("token=mono-ds-secret-12345") == "token=[REDACTED]"
+
+    # Traversal escaping above .git remains blocked.
+    ep_out = ModelEndpointConfig(
+        provider="openai_compat",
+        api_key_env="TYPESAFE_API_KEY",
+        env_search_dirs=cfg.models_decision.env_search_dirs,
+        env_files=("../../../outside_root.env",),
+    )
+    assert ep_out.resolve_api_key() is None
+
+    # Subproject .env takes precedence over monorepo root .env, while missing keys still inherit.
+    (sub / ".env").write_text("PROBES=0\nDEEPSEEK_API_KEY=sub-ds-override\n", encoding="utf-8")
+    clear_env_cache()
+    cfg_override = load_config(cwd=sub)
+    assert is_probes_enabled(sub) is False
+    assert cfg_override.models_text.resolve_api_key() == "sub-ds-override"
+    assert cfg_override.models_decision.resolve_api_key() == "mono-jev-secret-12345"
+
+    # Running from monorepo root with PROBE_PROJECT_ROOT in root .env or shell keeps artifacts in subproject.
+    (sub / ".env").unlink()
+    (mono / ".env").write_text(
+        "PROBES=1\nPROBE_PROJECT_ROOT=services/portfolio\nTYPESAFE_API_KEY=mono-jev-secret-12345\n",
+        encoding="utf-8",
+    )
+    clear_env_cache()
+    monkeypatch.chdir(mono)
+    cfg_root_env = load_config()
+    assert cfg_root_env.project_root == sub.resolve()
+    assert cfg_root_env.resolve_lock_path() == (sub / ".probes" / "lock.json").resolve()
+    assert cfg_root_env.domain_context == "Portfolio check context."
+    assert is_probes_enabled() is True
+
+    monkeypatch.setenv("PROBE_PROJECT_ROOT", str(sub))
+    clear_env_cache()
+    assert load_config().project_root == sub.resolve()
+    assert load_config(project_root=mono).project_root == mono.resolve()

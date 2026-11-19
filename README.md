@@ -33,17 +33,17 @@ Both roles are configured once in `config.toml` and can point at cloud APIs or l
 From a GitHub Release wheel (recommended in containers/CI — no `git` binary required):
 
 ```sh
-uv tool install https://github.com/celtiberi/probe/releases/download/v0.5.1/probe-0.5.1-py3-none-any.whl
+uv tool install https://github.com/celtiberi/probe/releases/download/v0.6.0/probe-0.6.0-py3-none-any.whl
 ```
 
 In a project virtual environment (wheel or git):
 
 ```sh
-uv add https://github.com/celtiberi/probe/releases/download/v0.5.1/probe-0.5.1-py3-none-any.whl
+uv add https://github.com/celtiberi/probe/releases/download/v0.6.0/probe-0.6.0-py3-none-any.whl
 # Optional local ONNX NLI decision runtime (no cloud decision API key required):
-# uv add "probe[onnx] @ https://github.com/celtiberi/probe/releases/download/v0.5.1/probe-0.5.1-py3-none-any.whl"
+# uv add "probe[onnx] @ https://github.com/celtiberi/probe/releases/download/v0.6.0/probe-0.6.0-py3-none-any.whl"
 # or via pip:
-# pip install https://github.com/celtiberi/probe/releases/download/v0.5.1/probe-0.5.1-py3-none-any.whl
+# pip install https://github.com/celtiberi/probe/releases/download/v0.6.0/probe-0.6.0-py3-none-any.whl
 # or from git main:
 # uv add git+https://github.com/celtiberi/probe.git
 ```
@@ -157,20 +157,22 @@ Chronological Timeline (ordered by call_seq):
 ## Writing Effective Checks & Fixtures
 
 - **Keep `probe.type.decision` checks short and atomic:** A single-pass decision model evaluates each check in parallel without multi-step reasoning. Prefer several short single-fact statements (`max_checks = 12` default) naming `output` or specific watched variables directly over one long compound sentence joining multiple `and`/`without`/`unless` clauses.
+- **Exclude noisy service handles with `ignore=`:** On `@probe(..., ignore=("data_dir", "llm_client"))`, ignored parameters are skipped completely before snapshot serialization, excluded from Gate 3 fixtures, and checked via AST/runtime.
 - **Use `kind=probe.type.text` for comparison or reasoning:** When a check requires comparing `output` against multi-turn `inputs` or retrieved context first, use `kind=probe.type.text` so `[models.text]` extracts factual evidence before `[models.decision]` scores the rule.
-- **Add regression fixtures in `.probes/fixtures/<probe_id>.json`:** Place optional JSON files with either a single `"pass"` / `"fail"` snapshot object or lists of historical regression snapshots (`"pass": [{...}, ...]`, `"fail": [{...}, ...]`). `probe check` backtests every listed pass and fail case whenever checks or fixtures change. Run `probe fixture <probe_id>` to promote recorded pass/fail snapshots out of `.probes/runs/*.jsonl` (or `probe fixture <probe_id> --init` to scaffold missing entries from the probe's AST signature/watched keys).
+- **Add regression fixtures in `.probes/fixtures/<probe_id>.json`:** Place optional JSON files with either a single `"pass"` / `"fail"` snapshot object or lists of historical regression snapshots (`"pass": [{...}, ...]`, `"fail": [{...}, ...]`). `probe check` prints Gate 3 pass/fail calibration margins (`pass min p`, `fail max p`) and backtests every listed case whenever checks or fixtures change. Run `probe fixture <probe_id>` to promote recorded pass/fail snapshots out of `.probes/runs/*.jsonl` (or `probe fixture <probe_id> --init` to scaffold missing entries from the probe's AST signature/watched keys).
+- **Monorepo `.env` & subproject root (`PROBE_PROJECT_ROOT` / `--root`):** `.env` lookups walk from `project_root` up to the enclosing `.git` root (nearest `.env` takes precedence), keeping API keys at the repo root while storing `.probes/` and `pyproject.toml` config in each subproject. Set `PROBE_PROJECT_ROOT=services/portfolio` (in env or root `.env`) or pass `--root <dir>` on CLI commands when running from a monorepo root.
 
 ## CLI
 
 | Command | Purpose |
 |---|---|
-| `probe check [paths...]` | Audit checks (Gate 1–2), run pass/fail calibration (Gate 3), and update `.probes/lock.json`. |
-| `probe list [paths...]` | List discovered `@probe` and `probe.here` sites with lock status. |
-| `probe fixture <id> [--run ID] [--init]` | Promote recorded pass/fail run snapshots into `.probes/fixtures/<id>.json` or scaffold from AST. |
-| `probe report [--run ID] [--all] [--check]` | Show call-ordered summary of failures/errors (or all events with `--all`); exit `1` on failures with `--check`. |
-| `probe log <probe_id>... [--payload]` | Interleave chronological events across one or more probe IDs or globs. |
-| `probe runs` | List recorded runs and pass/fail/error counts. |
-| `probe clean [--keep N]` | Prune older run logs from `.probes/runs` (default keeps last 20). |
+| `probe check [paths...] [--root DIR]` | Audit checks (Gate 1–2), run pass/fail calibration (Gate 3), show calibration margins, and update `.probes/lock.json`. |
+| `probe list [paths...] [--root DIR]` | List discovered `@probe` and `probe.here` sites with lock status. |
+| `probe fixture <id> [--run ID] [--init] [--root DIR]` | Promote recorded pass/fail run snapshots into `.probes/fixtures/<id>.json` or scaffold from AST. |
+| `probe report [--run ID] [--all] [--check] [--root DIR]` | Show call-ordered summary of failures/errors (or all events with `--all`); exit `1` on failures with `--check`. |
+| `probe log <probe_id>... [--payload] [--root DIR]` | Interleave chronological events across one or more probe IDs or globs. |
+| `probe runs [--root DIR]` | List recorded runs and pass/fail/error counts. |
+| `probe clean [--keep N] [--root DIR]` | Prune older run logs from `.probes/runs` (default keeps last 20). |
 
 ## Configuration (`~/.config/probe/config.toml`)
 

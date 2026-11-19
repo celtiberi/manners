@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import http.server
 import importlib.util
 import json
 import sys
@@ -1700,3 +1701,284 @@ def test_v051_gate2_retry_recovers_transient_disagreement(tmp_path: Path) -> Non
     )
     assert ok_fail is False
     assert res_fail[0].gate == "gate2"
+
+
+def test_v06_decorator_ignore_gate1_gate2_gate3_and_margins(tmp_path: Path, monkeypatch) -> None:
+    # 1. Gate 1 rejects unknown/empty/dynamic `ignore` on @probe.
+    bad_py = tmp_path / "bad_ignore.py"
+    bad_py.write_text(
+        textwrap.dedent(
+            """
+            from probe import probe
+
+            @probe("Output summarizes metrics", id="bad.unknown", ignore=("missing_param",))
+            def fn_a(account: str) -> str:
+                return account
+
+            @probe("Output summarizes metrics", id="bad.empty", ignore="")
+            def fn_b(account: str) -> str:
+                return account
+
+            DYN = ("x",)
+            @probe("Output summarizes metrics", id="bad.dyn", ignore=DYN)
+            def fn_c(account: str) -> str:
+                return account
+            """
+        ).strip()
+        + "\n",
+        encoding="utf-8",
+    )
+    cfg = ProbeConfig(
+        models_decision=ModelEndpointConfig(provider="http_decision", url="http://mock.local/decision", model="jev"),
+        models_text=ModelEndpointConfig(provider="openai_compat", url="http://mock.local/v1", model="qwen3.5:9b"),
+        decision=DecisionConfig(pass_threshold=0.50),
+        check=CheckConfig(require_check=True),
+        runtime=RuntimeConfig(
+            runs_dir=str(tmp_path / ".probes" / "runs"),
+            lock_path=str(tmp_path / ".probes" / "lock.json"),
+        ),
+        project_root=tmp_path,
+    )
+    ok_bad, res_bad = run_probe_check([bad_py], config=cfg)
+    assert ok_bad is False
+    by_id = {r.probe_id: r for r in res_bad}
+    assert by_id["bad.unknown"].gate == "gate1" and "unknown parameter" in by_id["bad.unknown"].reason
+    assert by_id["bad.empty"].gate == "gate1" and "empty" in by_id["bad.empty"].reason
+    assert by_id["bad.dyn"].gate == "gate1" and "literal" in by_id["bad.dyn"].reason
+
+    # 2. Valid @probe(..., ignore=...) filters params, prompts, --init skeletons, and surfaces margins.
+    good_py = tmp_path / "svc.py"
+    good_py.write_text(
+        textwrap.dedent(
+            """
+            from pathlib import Path
+            from probe import probe
+
+            @probe("Output summarizes portfolio metrics cleanly", id="svc.summary", ignore=("data_dir", "llm_client"))
+            def run_report(account: str, data_dir: Path, llm_client: object) -> str:
+                return account
+            """
+        ).strip()
+        + "\n",
+        encoding="utf-8",
+    )
+    bad_py.unlink()
+
+    seen_text_users: list[str] = []
+
+    def ok_handler(request: httpx.Request) -> httpx.Response:
+        url = str(request.url)
+        body = json.loads(request.content.decode("utf-8"))
+        if url.endswith("/chat/completions"):
+            sys_msg = body["messages"][0]["content"]
+            user_msg = body["messages"][1]["content"]
+            seen_text_users.append(user_msg)
+            if "audit @probe" in sys_msg:
+                return httpx.Response(200, json={"choices": [{"message": {"content": "Check [0] checks output."}}]})
+            payload = {
+                "notes": "ok",
+                "passing_snapshot": {"inputs": {"account": "acct-1"}, "output": "GOOD portfolio summary."},
+                "failing_snapshot": {"inputs": {"account": "acct-1"}, "output": "BAD garbled text."},
+            }
+            return httpx.Response(200, json={"choices": [{"message": {"content": json.dumps(payload)}}]})
+        if body["probe_id"].endswith("#gate2"):
+            return httpx.Response(200, json={"probabilities": [0.04, 0.04, 0.04]})
+        ok = "GOOD" in body["snapshot"]
+        return httpx.Response(200, json={"probabilities": [0.93 if ok else 0.12]})
+
+    ok_good, res_good = run_probe_check(
+        [good_py], config=cfg, transport=httpx.MockTransport(ok_handler)
+    )
+    assert ok_good is True
+    assert len(res_good) == 1
+    assert "Passed Gate 2 audit & Gate 3 synthetic calibration" in res_good[0].reason
+    assert "(pass min p=0.93, fail max p=0.12)" in res_good[0].reason
+    assert len(seen_text_users) == 2
+    expected_hdr = "Captured inputs: account (ignored parameters omitted at runtime: data_dir, llm_client)"
+    assert expected_hdr in seen_text_users[0]
+    assert expected_hdr in seen_text_users[1]
+
+    lock_data = json.loads(cfg.resolve_lock_path().read_text(encoding="utf-8"))
+    entry = lock_data["probes"]["svc.summary"]
+    assert entry["param_names"] == ["account"]
+    assert entry["ignored_params"] == ["data_dir", "llm_client"]
+    assert entry["pass_min_p"] == pytest.approx(0.93)
+    assert entry["fail_max_p"] == pytest.approx(0.12)
+
+    # Cached run also surfaces stored calibration margins.
+    ok_cached, res_cached = run_probe_check(
+        [good_py], config=cfg, transport=httpx.MockTransport(ok_handler)
+    )
+    assert ok_cached is True
+    assert res_cached[0].status == "cached"
+    assert "pass min p=0.93, fail max p=0.12" in res_cached[0].reason
+
+    # Snapshot validation rejects accidental ignored keys.
+    disc_item = discover_probes([good_py], root=tmp_path)[0]
+    with pytest.raises(BackendError, match="must omit ignored input"):
+        _validate_gate3_snapshot(
+            json.dumps({"inputs": {"account": "acct-1", "data_dir": "/tmp"}, "output": "ok"}),
+            item=disc_item,
+            label="passing_snapshot",
+        )
+
+    # Fixture --init omits ignored parameters.
+    (tmp_path / "pyproject.toml").write_text("[project]\nname='ign'\n", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    fix_res = CliRunner().invoke(app, ["fixture", "svc.summary", "--init", "--json"])
+    assert fix_res.exit_code == 0, fix_res.stdout
+    fix_payload = json.loads((tmp_path / ".probes" / "fixtures" / "svc.summary.json").read_text(encoding="utf-8"))
+    assert fix_payload["pass"] == [{"inputs": {"account": "<PASS:account>"}, "output": "<PASS:output>"}]
+    assert fix_payload["fail"] == [{"inputs": {"account": "<FAIL:account>"}, "output": "<FAIL:output>"}]
+
+
+def test_v06_cli_root_and_monorepo_check_list_fixture_report(tmp_path: Path, monkeypatch) -> None:
+    mono = tmp_path / "monorepo"
+    (mono / ".git").mkdir(parents=True)
+    sub = mono / "services" / "portfolio"
+    pkg_dir = sub / "src" / "portfolio"
+    pkg_dir.mkdir(parents=True)
+
+    # Local loopback mock server for full CLI `probe check --root services/portfolio` verification.
+    class MockHandler(http.server.BaseHTTPRequestHandler):
+        def log_message(self, format: str, *args: object) -> None:
+            return
+
+        def do_POST(self) -> None:
+            length = int(self.headers.get("Content-Length", "0"))
+            body = json.loads(self.rfile.read(length).decode("utf-8"))
+            if self.path.endswith("/chat/completions"):
+                sys_msg = body["messages"][0]["content"]
+                if "audit @probe" in sys_msg:
+                    resp = {"choices": [{"message": {"content": "Check [0] evaluates reply quality."}}]}
+                else:
+                    snap = {
+                        "notes": "ok",
+                        "passing_snapshot": {"inputs": {"ticker": "AAPL"}, "output": "GOOD reply."},
+                        "failing_snapshot": {"inputs": {"ticker": "AAPL"}, "output": "BAD reply."},
+                    }
+                    resp = {"choices": [{"message": {"content": json.dumps(snap)}}]}
+            else:
+                if body.get("probe_id", "").endswith("#gate2"):
+                    resp = {"probabilities": [0.03, 0.03, 0.03]}
+                else:
+                    ok = "GOOD" in body.get("snapshot", "")
+                    resp = {"probabilities": [0.91 if ok else 0.08]}
+            raw = json.dumps(resp).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(raw)))
+            self.end_headers()
+            self.wfile.write(raw)
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), MockHandler)
+    srv_thread = threading.Thread(target=server.serve_forever, daemon=True)
+    srv_thread.start()
+    try:
+        base_url = f"http://127.0.0.1:{server.server_port}"
+        (mono / ".env").write_text("DEEPSEEK_API_KEY=mono-root-key-123\n", encoding="utf-8")
+        (sub / "pyproject.toml").write_text(
+            textwrap.dedent(
+                f"""
+                [project]
+                name = "portfolio"
+                [tool.probe.models.decision]
+                provider = "http_decision"
+                url = "{base_url}/decision"
+                model = "local-decision"
+                [tool.probe.models.text]
+                provider = "openai_compat"
+                url = "{base_url}/v1"
+                model = "qwen3.5:9b"
+                """
+            ).strip()
+            + "\n",
+            encoding="utf-8",
+        )
+        (pkg_dir / "__init__.py").write_text("", encoding="utf-8")
+        (pkg_dir / "app.py").write_text(
+            textwrap.dedent(
+                """
+                from probe import probe
+
+                @probe("Reply states clear metric summary", id="portfolio.app.summary")
+                def summarize(ticker: str) -> str:
+                    return f"{ticker}: ok"
+                """
+            ).strip()
+            + "\n",
+            encoding="utf-8",
+        )
+
+        # Populate two runs in services/portfolio/.probes/runs for report/log/runs/clean.
+        store = ProbeStore(sub / ".probes" / "runs", create=True)
+        try:
+            store.create_run(
+                "01RUNA00000000000000000001",
+                started_at="2026-11-18T10:00:00Z",
+                cmd="pytest old",
+                pid=1,
+                decision_model="d",
+                text_model="t",
+            )
+            store.finish_run("01RUNA00000000000000000001", status="completed", finished_at="2026-11-18T10:00:01Z")
+            store.create_run(
+                "01RUNB00000000000000000002",
+                started_at="2026-11-18T11:00:00Z",
+                cmd="pytest new",
+                pid=2,
+                decision_model="d",
+                text_model="t",
+            )
+            store.insert_event(
+                run_id="01RUNB00000000000000000002",
+                call_seq=1,
+                elapsed_ms=10.0,
+                started_at="2026-11-18T11:00:00.010Z",
+                probe_id="portfolio.app.summary",
+                site="decorator",
+                probe_type="decision",
+                file_line="src/portfolio/app.py:4",
+                checks=("Reply states clear metric summary",),
+                payload_json='{"inputs": {"ticker": "AAPL"}, "output": "AAPL: ok"}',
+                check_scores=(CheckScore("Reply states clear metric summary", 0.92, True),),
+                verdict="pass",
+            )
+            store.finish_run("01RUNB00000000000000000002", status="completed", finished_at="2026-11-18T11:00:01Z")
+        finally:
+            store.close()
+
+        monkeypatch.setenv("PROBE_CONFIG", str(tmp_path / "no_user.toml"))
+        monkeypatch.delenv("PROBE_PROJECT_ROOT", raising=False)
+        monkeypatch.chdir(mono)
+        runner = CliRunner()
+
+        list_global = runner.invoke(app, ["--root", "services/portfolio", "list", "--json"])
+        assert list_global.exit_code == 0, list_global.stdout
+        assert [p["probe_id"] for p in json.loads(list_global.stdout)["probes"]] == ["portfolio.app.summary"]
+
+        chk = runner.invoke(app, ["check", "--root", "services/portfolio"])
+        assert chk.exit_code == 0, chk.stdout + chk.stderr
+        assert "[PASSED] portfolio.app.summary (src/portfolio/app.py:4)" in chk.stdout
+        assert "Passed Gate 2 audit & Gate 3 synthetic calibration (pass min p=0.91, fail max p=0.08)" in chk.stdout
+        assert (sub / ".probes" / "lock.json").is_file()
+        assert not (mono / ".probes").exists()
+
+        fix = runner.invoke(app, ["fixture", "portfolio.app.summary", "--init", "--root", "services/portfolio"])
+        assert fix.exit_code == 0, fix.stdout
+        assert (sub / ".probes" / "fixtures" / "portfolio.app.summary.json").is_file()
+
+        rep = runner.invoke(app, ["report", "--all", "--root", "services/portfolio"])
+        assert rep.exit_code == 0 and "portfolio.app.summary" in rep.stdout
+
+        log_res = runner.invoke(app, ["log", "portfolio.*", "--root", "services/portfolio"])
+        assert log_res.exit_code == 0 and "portfolio.app.summary" in log_res.stdout
+
+        runs_res = runner.invoke(app, ["runs", "--json", "--root", "services/portfolio"])
+        assert runs_res.exit_code == 0 and len(json.loads(runs_res.stdout)["runs"]) == 2
+
+        clean_res = runner.invoke(app, ["clean", "--keep", "1", "--root", "services/portfolio"])
+        assert clean_res.exit_code == 0 and "Removed 1" in clean_res.stdout
+    finally:
+        server.shutdown()
+        server.server_close()

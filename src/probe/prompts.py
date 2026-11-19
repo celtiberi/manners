@@ -243,6 +243,8 @@ def _format_gate_user_message(
     signature: str,
     source_excerpt: str,
     watched_keys: Sequence[str] = (),
+    ignored_params: Sequence[str] = (),
+    captured_params: Sequence[str] | None = None,
     domain_context: str = "",
     retry_feedback: str = "",
 ) -> str:
@@ -253,6 +255,12 @@ def _format_gate_user_message(
     ]
     if site == "here" and watched_keys:
         lines.append(f"Watched keys: {', '.join(watched_keys)}")
+    if site == "decorator" and ignored_params:
+        captured_label = ", ".join(captured_params) if captured_params else "(none)"
+        lines.append(
+            f"Captured inputs: {captured_label} "
+            f"(ignored parameters omitted at runtime: {', '.join(ignored_params)})"
+        )
     lines.append(f"Checks:\n{numbered}")
     header = "\n".join(lines)
     safe_sig = _escape_closing_tags(signature)
@@ -276,6 +284,8 @@ def format_gate2_analysis_prompts(
     signature: str,
     source_excerpt: str,
     watched_keys: Sequence[str] = (),
+    ignored_params: Sequence[str] = (),
+    captured_params: Sequence[str] | None = None,
     domain_context: str = "",
 ) -> tuple[str, str]:
     """Return (system, user) prompts for Gate 2 factual analysis before decision noul scoring."""
@@ -288,6 +298,8 @@ def format_gate2_analysis_prompts(
             signature=signature,
             source_excerpt=source_excerpt,
             watched_keys=watched_keys,
+            ignored_params=ignored_params,
+            captured_params=captured_params,
             domain_context=domain_context,
         ),
     )
@@ -301,6 +313,8 @@ def format_gate3_fixtures_prompts(
     signature: str,
     source_excerpt: str,
     watched_keys: Sequence[str] = (),
+    ignored_params: Sequence[str] = (),
+    captured_params: Sequence[str] | None = None,
     domain_context: str = "",
     retry_feedback: str = "",
 ) -> tuple[str, str]:
@@ -314,6 +328,8 @@ def format_gate3_fixtures_prompts(
             signature=signature,
             source_excerpt=source_excerpt,
             watched_keys=watched_keys,
+            ignored_params=ignored_params,
+            captured_params=captured_params,
             domain_context=domain_context,
             retry_feedback=retry_feedback,
         ),
