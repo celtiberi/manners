@@ -1,4 +1,4 @@
-"""Public API for `probe`: @probe, probe.here, probe.type.{decision,text}, ProbeHaltError."""
+"""Public API for `manners`: @manners, manners.here, manners.type.{decision,text}, MannersHaltError."""
 
 from __future__ import annotations
 
@@ -17,21 +17,21 @@ from typing import Any, ParamSpec, TypeVar
 
 import httpx
 
-from probe.config import (
+from manners.config import (
     _OVERRIDE_CTX,
-    ProbeConfig,
+    MannersConfig,
     clear_env_cache,
-    is_probes_enabled,
+    is_manners_enabled,
     load_config,
     pop_process_override,
     push_process_override,
     reset_config_locks_after_fork,
 )
-from probe.redact import serialize_call_inputs, serialize_call_snapshot, serialize_here_snapshot
-from probe.runtime import (
-    ProbeHaltError,
-    ProbeRuntime,
-    ProbeType,
+from manners.redact import serialize_call_inputs, serialize_call_snapshot, serialize_here_snapshot
+from manners.runtime import (
+    MannersHaltError,
+    MannersRuntime,
+    MannersType,
     _decorator_file_line,
     _derive_decorator_id,
     _derive_here_id,
@@ -39,7 +39,7 @@ from probe.runtime import (
     _short_stack_excerpt,
     normalize_checks,
     normalize_ignore,
-    normalize_probe_type,
+    normalize_manners_type,
 )
 
 F = TypeVar("F")
@@ -47,17 +47,17 @@ P = ParamSpec("P")
 R = TypeVar("R")
 
 _RUNTIME_LOCK = threading.Lock()
-_RUNTIME: ProbeRuntime | None = None
-_TEST_CONFIG: ProbeConfig | None = None
+_RUNTIME: MannersRuntime | None = None
+_TEST_CONFIG: MannersConfig | None = None
 _TEST_TRANSPORT: httpx.BaseTransport | None = None
 
 
-def _get_runtime() -> ProbeRuntime:
+def _get_runtime() -> MannersRuntime:
     global _RUNTIME
     with _RUNTIME_LOCK:
         if _RUNTIME is None:
             cfg = _TEST_CONFIG or load_config()
-            rt = ProbeRuntime(
+            rt = MannersRuntime(
                 config=cfg,
                 transport=_TEST_TRANSPORT,
             )
@@ -68,10 +68,10 @@ def _get_runtime() -> ProbeRuntime:
 
 def reset_for_testing(
     *,
-    config: ProbeConfig | None = None,
+    config: MannersConfig | None = None,
     transport: httpx.BaseTransport | None = None,
-) -> ProbeRuntime | None:
-    """Close any active ProbeRuntime and optionally inject test config/transport."""
+) -> MannersRuntime | None:
+    """Close any active MannersRuntime and optionally inject test config/transport."""
     global _RUNTIME, _TEST_CONFIG, _TEST_TRANSPORT
     with _RUNTIME_LOCK:
         old = _RUNTIME
@@ -112,15 +112,15 @@ def _prepare_decorator_call(
     kwargs: dict[str, Any],
     *,
     checks: tuple[str, ...],
-    probe_id: str | None,
-    probe_type: ProbeType,
+    check_id: str | None,
+    check_type: MannersType,
     ignore: tuple[str, ...],
     caller_frame: FrameType | None,
-) -> tuple[ProbeRuntime, str, str, int, float, str, dict[str, Any], bool]:
+) -> tuple[MannersRuntime, str, str, int, float, str, dict[str, Any], bool]:
     """Validate lock & rate limits and snapshot inputs BEFORE calling wrapped `fn`."""
     rt = _get_runtime()
     rt.ensure_not_tripped()
-    resolved_id = probe_id or _derive_decorator_id(fn, project_root=rt.cwd)
+    resolved_id = check_id or _derive_decorator_id(fn, project_root=rt.cwd)
     file_line = _decorator_file_line(fn, project_root=rt.cwd)
     call_seq, elapsed_ms, started_at = rt.next_call_meta()
     caps = rt.config.runtime
@@ -137,8 +137,8 @@ def _prepare_decorator_call(
     entry_payload_json = json.dumps({"inputs": inputs_data}, ensure_ascii=False)
 
     entered_pdb_lock = rt.verify_lock(
-        probe_id=resolved_id,
-        probe_type=probe_type,
+        check_id=resolved_id,
+        check_type=check_type,
         checks=checks,
         call_seq=call_seq,
         elapsed_ms=elapsed_ms,
@@ -150,10 +150,10 @@ def _prepare_decorator_call(
         param_names=_callable_param_names(fn, ignore=ignore),
     )
     if entered_pdb_lock or rt.is_tripped:
-        raise ProbeHaltError(rt._halt_reason or "Probe halted before target call")
+        raise MannersHaltError(rt._halt_reason or "Manners halted before target call")
     entered_pdb_rate, skip_grading = rt.check_rate_limit(
-        probe_id=resolved_id,
-        probe_type=probe_type,
+        check_id=resolved_id,
+        check_type=check_type,
         checks=checks,
         call_seq=call_seq,
         elapsed_ms=elapsed_ms,
@@ -164,7 +164,7 @@ def _prepare_decorator_call(
         caller_frame=caller_frame,
     )
     if entered_pdb_rate or rt.is_tripped:
-        raise ProbeHaltError(rt._halt_reason or "Probe halted before target call")
+        raise MannersHaltError(rt._halt_reason or "Manners halted before target call")
     return rt, resolved_id, file_line, call_seq, elapsed_ms, started_at, inputs_data, skip_grading
 
 
@@ -172,13 +172,13 @@ def _wrap_sync_fn(
     fn: Callable[P, R],
     *,
     checks: tuple[str, ...],
-    probe_id: str | None,
-    probe_type: ProbeType,
+    check_id: str | None,
+    check_type: MannersType,
     ignore: tuple[str, ...] = (),
 ) -> Callable[P, R]:
     @functools.wraps(fn)
     def wrapper(*args: P.args, **kwargs: P.kwargs) -> R:
-        if not is_probes_enabled():
+        if not is_manners_enabled():
             return fn(*args, **kwargs)
 
         frame = inspect.currentframe()
@@ -192,8 +192,8 @@ def _wrap_sync_fn(
                     args,
                     kwargs,
                     checks=checks,
-                    probe_id=probe_id,
-                    probe_type=probe_type,
+                    check_id=check_id,
+                    check_type=check_type,
                     ignore=ignore,
                     caller_frame=caller_frame,
                 )
@@ -203,16 +203,16 @@ def _wrap_sync_fn(
 
             try:
                 result = fn(*args, **kwargs)
-            except ProbeHaltError:
+            except MannersHaltError:
                 raise
             except Exception as exc:
                 rt.record_target_exception(
                     call_seq=call_seq,
                     elapsed_ms=elapsed_ms,
                     started_at=started_at,
-                    probe_id=resolved_id,
+                    check_id=resolved_id,
                     site="decorator",
-                    probe_type=probe_type,
+                    check_type=check_type,
                     file_line=file_line,
                     checks=checks,
                     inputs_data=inputs_data,
@@ -235,9 +235,9 @@ def _wrap_sync_fn(
                 call_seq=call_seq,
                 elapsed_ms=elapsed_ms,
                 started_at=started_at,
-                probe_id=resolved_id,
+                check_id=resolved_id,
                 site="decorator",
-                probe_type=probe_type,
+                check_type=check_type,
                 file_line=file_line,
                 checks=checks,
                 payload_json=payload_json,
@@ -254,13 +254,13 @@ def _wrap_async_fn(
     fn: Callable[P, Any],
     *,
     checks: tuple[str, ...],
-    probe_id: str | None,
-    probe_type: ProbeType,
+    check_id: str | None,
+    check_type: MannersType,
     ignore: tuple[str, ...] = (),
 ) -> Callable[P, Any]:
     @functools.wraps(fn)
     async def wrapper(*args: P.args, **kwargs: P.kwargs) -> Any:
-        if not is_probes_enabled():
+        if not is_manners_enabled():
             return await fn(*args, **kwargs)
 
         frame = inspect.currentframe()
@@ -274,8 +274,8 @@ def _wrap_async_fn(
                     args,
                     kwargs,
                     checks=checks,
-                    probe_id=probe_id,
-                    probe_type=probe_type,
+                    check_id=check_id,
+                    check_type=check_type,
                     ignore=ignore,
                     caller_frame=caller_frame,
                 )
@@ -288,16 +288,16 @@ def _wrap_async_fn(
 
         try:
             result = await fn(*args, **kwargs)
-        except ProbeHaltError:
+        except MannersHaltError:
             raise
         except Exception as exc:
             rt.record_target_exception(
                 call_seq=call_seq,
                 elapsed_ms=elapsed_ms,
                 started_at=started_at,
-                probe_id=resolved_id,
+                check_id=resolved_id,
                 site="decorator",
-                probe_type=probe_type,
+                check_type=check_type,
                 file_line=file_line,
                 checks=checks,
                 inputs_data=inputs_data,
@@ -329,9 +329,9 @@ def _wrap_async_fn(
                 call_seq=call_seq,
                 elapsed_ms=elapsed_ms,
                 started_at=started_at,
-                probe_id=resolved_id,
+                check_id=resolved_id,
                 site="decorator",
-                probe_type=probe_type,
+                check_type=check_type,
                 file_line=file_line,
                 checks=checks,
                 payload_json=payload_json,
@@ -345,9 +345,9 @@ def _wrap_async_fn(
         try:
             graded = await asyncio.to_thread(
                 rt.grade_event,
-                probe_id=resolved_id,
+                check_id=resolved_id,
                 site="decorator",
-                probe_type=probe_type,
+                check_type=check_type,
                 file_line=file_line,
                 checks=checks,
                 payload_json=payload_json,
@@ -378,8 +378,8 @@ def handle_thread_excepthook(
     *,
     suppress_forward: bool = False,
 ) -> None:
-    """Capture uncaught ProbeHaltError from background threads so flush() surfaces it on main."""
-    if isinstance(args.exc_value, ProbeHaltError):
+    """Capture uncaught MannersHaltError from background threads so flush() surfaces it on main."""
+    if isinstance(args.exc_value, MannersHaltError):
         with _RUNTIME_LOCK:
             rt = _RUNTIME
         if rt is not None:
@@ -393,11 +393,11 @@ def handle_thread_excepthook(
 _PREV_THREAD_EXCEPTHOOK = threading.excepthook
 
 
-def _probe_thread_excepthook(args: threading.ExceptHookArgs) -> None:
+def _manners_thread_excepthook(args: threading.ExceptHookArgs) -> None:
     handle_thread_excepthook(args, _PREV_THREAD_EXCEPTHOOK, suppress_forward=False)
 
 
-threading.excepthook = _probe_thread_excepthook
+threading.excepthook = _manners_thread_excepthook
 
 
 @contextlib.contextmanager
@@ -419,22 +419,22 @@ def _override_scope(enabled_state: bool, scope: str, api_name: str) -> Iterator[
         raise ValueError(f"Invalid {api_name} scope {scope!r}: expected 'process' or 'context'")
 
 
-class _ProbeAPI:
-    """Callable `probe` facade providing `@probe(...)`, `probe.here(...)`, and `probe.type`."""
+class _MannersAPI:
+    """Callable `manners` facade providing `@manners(...)`, `manners.here(...)`, and `manners.type`."""
 
-    type = ProbeType
-    ProbeHaltError = ProbeHaltError
+    type = MannersType
+    MannersHaltError = MannersHaltError
 
     def __call__(
         self,
         checks: str | Sequence[str],
         *,
         id: str | None = None,
-        kind: ProbeType | str = ProbeType.decision,
+        kind: MannersType | str = MannersType.decision,
         ignore: str | Sequence[str] = (),
     ) -> Callable[[F], F]:
         norm_checks = normalize_checks(checks)
-        norm_kind = normalize_probe_type(kind)
+        norm_kind = normalize_manners_type(kind)
         norm_ignore = normalize_ignore(ignore)
 
         def decorator(fn: F) -> F:
@@ -448,12 +448,12 @@ class _ProbeAPI:
                 target = fn.__func__
 
             if isinstance(target, builtins.type):
-                raise TypeError("@probe can only decorate functions or methods, not classes")
+                raise TypeError("@manners can only decorate functions or methods, not classes")
 
             unwrapped = inspect.unwrap(target)
             if inspect.isgeneratorfunction(unwrapped) or inspect.isasyncgenfunction(unwrapped):
                 raise TypeError(
-                    "@probe cannot wrap generator functions; use probe.here(...) inside the generator instead"
+                    "@manners cannot wrap generator functions; use manners.here(...) inside the generator instead"
                 )
 
             if norm_ignore:
@@ -462,7 +462,7 @@ class _ProbeAPI:
                     unknown = [p for p in norm_ignore if p not in raw_params]
                     if unknown:
                         raise ValueError(
-                            f"@probe ignore references unknown parameter(s) {unknown} "
+                            f"@manners ignore references unknown parameter(s) {unknown} "
                             f"on {getattr(target, '__qualname__', target)}"
                         )
 
@@ -476,16 +476,16 @@ class _ProbeAPI:
                 wrapped: Any = _wrap_async_fn(
                     target,
                     checks=norm_checks,
-                    probe_id=id,
-                    probe_type=norm_kind,
+                    check_id=id,
+                    check_type=norm_kind,
                     ignore=norm_ignore,
                 )
             else:
                 wrapped = _wrap_sync_fn(
                     target,
                     checks=norm_checks,
-                    probe_id=id,
-                    probe_type=norm_kind,
+                    check_id=id,
+                    check_type=norm_kind,
                     ignore=norm_ignore,
                 )
 
@@ -500,18 +500,18 @@ class _ProbeAPI:
         checks: str | Sequence[str],
         *,
         id: str | None = None,
-        kind: ProbeType | str = ProbeType.decision,
+        kind: MannersType | str = MannersType.decision,
         **watched_vars: Any,
     ) -> None:
         """Mid-function watchpoint capturing watched_vars and evaluating checks inline."""
-        if not is_probes_enabled():
+        if not is_manners_enabled():
             return
 
         if not watched_vars:
-            raise ValueError("probe.here requires at least one watched keyword variable")
+            raise ValueError("manners.here requires at least one watched keyword variable")
 
         norm_checks = normalize_checks(checks)
-        norm_kind = normalize_probe_type(kind)
+        norm_kind = normalize_manners_type(kind)
 
         rt = _get_runtime()
         rt.ensure_not_tripped()
@@ -534,8 +534,8 @@ class _ProbeAPI:
         )
         try:
             entered_pdb_lock = rt.verify_lock(
-                probe_id=resolved_id,
-                probe_type=norm_kind,
+                check_id=resolved_id,
+                check_type=norm_kind,
                 checks=norm_checks,
                 call_seq=call_seq,
                 elapsed_ms=elapsed_ms,
@@ -550,8 +550,8 @@ class _ProbeAPI:
                 return
             rt.ensure_not_tripped()
             entered_pdb_rate, skip_grading = rt.check_rate_limit(
-                probe_id=resolved_id,
-                probe_type=norm_kind,
+                check_id=resolved_id,
+                check_type=norm_kind,
                 checks=norm_checks,
                 call_seq=call_seq,
                 elapsed_ms=elapsed_ms,
@@ -568,9 +568,9 @@ class _ProbeAPI:
                 call_seq=call_seq,
                 elapsed_ms=elapsed_ms,
                 started_at=started_at,
-                probe_id=resolved_id,
+                check_id=resolved_id,
                 site="here",
-                probe_type=norm_kind,
+                check_type=norm_kind,
                 file_line=file_line,
                 checks=norm_checks,
                 payload_json=payload_json,
@@ -581,18 +581,18 @@ class _ProbeAPI:
 
     @staticmethod
     def disabled(scope: str = "process") -> contextlib.AbstractContextManager[None]:
-        """Temporarily suppress @probe and probe.here ('process' covers threads; 'context' is ContextVar-local)."""
+        """Temporarily suppress @manners and manners.here ('process' covers threads; 'context' is ContextVar-local)."""
         return _override_scope(False, scope, "disabled")
 
     @staticmethod
     def enabled(scope: str = "process") -> contextlib.AbstractContextManager[None]:
-        """Temporarily enable @probe and probe.here ('process' covers threads; 'context' is ContextVar-local)."""
+        """Temporarily enable @manners and manners.here ('process' covers threads; 'context' is ContextVar-local)."""
         return _override_scope(True, scope, "enabled")
 
     @staticmethod
     def reset_for_testing(
         *,
-        config: ProbeConfig | None = None,
+        config: MannersConfig | None = None,
         transport: httpx.BaseTransport | None = None,
     ) -> None:
         reset_for_testing(config=config, transport=transport)
@@ -617,10 +617,10 @@ class _ProbeAPI:
         if check:
             unhandled = rt.consume_unhandled_thread_halt()
             if unhandled is not None:
-                raise ProbeHaltError(unhandled)
+                raise MannersHaltError(unhandled)
 
     @staticmethod
-    def flush_for_testing() -> ProbeRuntime | None:
+    def flush_for_testing() -> MannersRuntime | None:
         global _RUNTIME
         with _RUNTIME_LOCK:
             rt = _RUNTIME
@@ -630,20 +630,20 @@ class _ProbeAPI:
         return rt
 
 
-probe = _ProbeAPI()
-here = probe.here
-disabled = probe.disabled
-enabled = probe.enabled
-flush = probe.flush
-type = ProbeType
+manners = _MannersAPI()
+here = manners.here
+disabled = manners.disabled
+enabled = manners.enabled
+flush = manners.flush
+type = MannersType
 
 __all__ = [
-    "ProbeHaltError",
-    "ProbeType",
+    "MannersHaltError",
+    "MannersType",
     "disabled",
     "enabled",
     "flush",
     "here",
-    "probe",
+    "manners",
     "reset_for_testing",
 ]

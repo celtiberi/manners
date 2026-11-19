@@ -1,4 +1,4 @@
-"""Static AST discovery, Gates 1-3 pre-run checks, and .probes/lock.json management."""
+"""Static AST discovery, Gates 1-3 pre-run checks, and .manners/lock.json management."""
 
 from __future__ import annotations
 
@@ -16,14 +16,14 @@ from typing import Any
 
 import httpx
 
-from probe.backends import BackendError, CheckScore, DecisionBackend, ModelTruncatedError, TextBackend
-from probe.config import ProbeConfig, load_config, utc_now_iso
-from probe.prompts import get_noul_expected, get_nouls
-from probe.redact import SecretRedactor
-from probe.runtime import ProbeType, compute_checks_hash, resolve_module_name
-from probe.store import ProbeStore
+from manners.backends import BackendError, CheckScore, DecisionBackend, ModelTruncatedError, TextBackend
+from manners.config import MannersConfig, load_config, utc_now_iso
+from manners.prompts import get_noul_expected, get_nouls
+from manners.redact import SecretRedactor
+from manners.runtime import MannersType, compute_checks_hash, resolve_module_name
+from manners.store import MannersStore
 
-_VALID_PROBE_ID_RE = re.compile(r"[A-Za-z0-9._:-]{1,128}")
+_VALID_CHECK_ID_RE = re.compile(r"[A-Za-z0-9._:-]{1,128}")
 
 _SKIP_DIRS: frozenset[str] = frozenset(
     {
@@ -33,7 +33,7 @@ _SKIP_DIRS: frozenset[str] = frozenset(
         "env",
         "node_modules",
         "__pycache__",
-        ".probes",
+        ".manners",
         ".mypy_cache",
         ".pytest_cache",
         ".ruff_cache",
@@ -44,12 +44,12 @@ _SKIP_DIRS: frozenset[str] = frozenset(
 
 
 @dataclass(slots=True, frozen=True)
-class DiscoveredProbe:
-    """Static AST representation of a @probe decorator or probe.here(...) call."""
+class DiscoveredCheck:
+    """Static AST representation of a @manners decorator or manners.here(...) call."""
 
-    probe_id: str
+    check_id: str
     site: str  # "decorator" | "here"
-    probe_type: ProbeType
+    check_type: MannersType
     file_path: str
     lineno: int
     file_line: str
@@ -69,13 +69,13 @@ class DiscoveredProbe:
 
 
 @dataclass(slots=True)
-class ProbeCheckResult:
-    """Outcome of running Gates 1-3 for one discovered probe."""
+class MannersCheckResult:
+    """Outcome of running Gates 1-3 for one discovered behavioral check."""
 
-    probe_id: str
+    check_id: str
     file_line: str
     site: str
-    probe_type: str
+    check_type: str
     status: str  # "passed" | "cached" | "failed"
     gate: str  # "gate1" | "gate2" | "gate3" | "cache" | "done"
     reason: str = ""
@@ -150,23 +150,23 @@ def _module_name_for_file(file_path: Path, root: Path) -> str:
     return resolve_module_name(file_path, root)
 
 
-def _file_may_use_probe(tree: ast.Module) -> bool:
+def _file_may_use_manners(tree: ast.Module) -> bool:
     """Fast pre-check before running the scoped AST visitor on a parsed module."""
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             for alias in node.names:
-                if alias.name == "probe" or alias.name.startswith("probe."):
+                if alias.name == "manners" or alias.name.startswith("manners."):
                     return True
-        elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module in {"probe", "probe.runtime"}:
+        elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module in {"manners", "manners.runtime"}:
             return True
     return False
 
 
-def _classify_probe_decorator(
+def _classify_manners_decorator(
     node: ast.expr,
     lookup_role: Any,
 ) -> tuple[ast.Call | None, str | None, bool]:
-    """Identify @probe decorators using lexically scoped symbol roles."""
+    """Identify @manners decorators using lexically scoped symbol roles."""
     if isinstance(node, ast.Call):
         func = node.func
         if isinstance(func, ast.Name):
@@ -177,15 +177,15 @@ def _classify_probe_decorator(
                 return (
                     node,
                     (
-                        "Module `probe` is not callable; use `from probe import probe` "
-                        "(which also exposes `probe.type`, `probe.here`, and `probe.disabled`) "
-                        "or `@probe.probe(...)`"
+                        "Module `manners` is not callable; use `from manners import manners` "
+                        "(which also exposes `manners.type`, `manners.here`, and `manners.disabled`) "
+                        "or `@manners.manners(...)`"
                     ),
                     True,
                 )
         elif (
             isinstance(func, ast.Attribute)
-            and func.attr == "probe"
+            and func.attr == "manners"
             and isinstance(func.value, ast.Name)
         ):
             role = lookup_role(func.value.id)
@@ -194,20 +194,21 @@ def _classify_probe_decorator(
             if role == "api":
                 return (
                     node,
-                    "`probe` imported via `from probe import probe` has no `.probe` attribute; use `@probe(...)`",
+                    "`manners` imported via `from manners import manners` has no `.manners` attribute; "
+                    "use `@manners(...)`",
                     True,
                 )
         return None, None, False
 
     if isinstance(node, ast.Name) and lookup_role(node.id) in {"api", "module"}:
-        return None, "Bare `@probe` requires arguments; use `@probe(\"...\")` or `@probe.probe(\"...\")`", True
+        return None, "Bare `@manners` requires arguments; use `@manners(\"...\")` or `@manners.manners(\"...\")`", True
     if (
         isinstance(node, ast.Attribute)
-        and node.attr == "probe"
+        and node.attr == "manners"
         and isinstance(node.value, ast.Name)
         and lookup_role(node.value.id) in {"api", "module"}
     ):
-        return None, "Bare `@probe.probe` requires arguments; use `@probe.probe(\"...\")`", True
+        return None, "Bare `@manners.manners` requires arguments; use `@manners.manners(\"...\")`", True
     return None, None, False
 
 
@@ -222,7 +223,7 @@ def _is_here_call(node: ast.expr, lookup_role: Any) -> ast.Call | None:
             return node
         if (
             isinstance(func.value, ast.Attribute)
-            and func.value.attr == "probe"
+            and func.value.attr == "manners"
             and isinstance(func.value.value, ast.Name)
             and lookup_role(func.value.value.id) == "module"
         ):
@@ -279,18 +280,18 @@ def _extract_ignore_literal(expr: ast.expr | None) -> tuple[tuple[str, ...], str
     return (), "`ignore` must be a string literal or list/tuple of string literals"
 
 
-def _extract_probe_type(
+def _extract_manners_type(
     expr: ast.expr | None,
     *,
     lookup_role: Any,
-) -> tuple[ProbeType, str | None]:
+) -> tuple[MannersType, str | None]:
     if expr is None:
-        return ProbeType.decision, None
+        return MannersType.decision, None
     if isinstance(expr, ast.Constant) and isinstance(expr.value, str):
         try:
-            return ProbeType(expr.value.strip().lower()), None
+            return MannersType(expr.value.strip().lower()), None
         except ValueError:
-            return ProbeType.decision, f"Unknown probe kind: {expr.value!r}"
+            return MannersType.decision, f"Unknown manners kind: {expr.value!r}"
     if isinstance(expr, ast.Attribute) and expr.attr in {"decision", "text"}:
         val = expr.value
         valid = (
@@ -305,20 +306,20 @@ def _extract_probe_type(
                 isinstance(val, ast.Attribute)
                 and val.attr == "type"
                 and isinstance(val.value, ast.Attribute)
-                and val.value.attr == "probe"
+                and val.value.attr == "manners"
                 and isinstance(val.value.value, ast.Name)
                 and lookup_role(val.value.value.id) == "module"
             )
             or (
                 isinstance(val, ast.Attribute)
-                and val.attr == "ProbeType"
+                and val.attr == "MannersType"
                 and isinstance(val.value, ast.Name)
                 and lookup_role(val.value.id) == "module"
             )
         )
         if valid:
-            return ProbeType(expr.attr), None
-    return ProbeType.decision, f"Unsupported probe kind expression: {ast.unparse(expr)}"
+            return MannersType(expr.attr), None
+    return MannersType.decision, f"Unsupported manners kind expression: {ast.unparse(expr)}"
 
 
 def _validate_call_structure_and_id(
@@ -326,7 +327,7 @@ def _validate_call_structure_and_id(
     *,
     site: str,
 ) -> tuple[str | None, str | None]:
-    """Validate positional/keyword arguments and optional literal `id` on @probe or probe.here."""
+    """Validate positional/keyword arguments and optional literal `id` on @manners or manners.here."""
     if any(isinstance(a, ast.Starred) for a in call.args):
         return None, f"Dynamic *args is not allowed in {site}; use static literals"
     if len(call.args) > 1:
@@ -339,8 +340,8 @@ def _validate_call_structure_and_id(
         if kw.arg in seen_kws:
             return None, f"Duplicate keyword argument '{kw.arg}' in {site}"
         seen_kws.add(kw.arg)
-        if site == "@probe" and kw.arg not in {"checks", "id", "kind", "ignore"}:
-            return None, f"Unknown @probe keyword argument: {kw.arg!r}"
+        if site == "@manners" and kw.arg not in {"checks", "id", "kind", "ignore"}:
+            return None, f"Unknown @manners keyword argument: {kw.arg!r}"
 
     if call.args and "checks" in seen_kws:
         return None, f"Duplicate 'checks' passed positionally and by keyword in {site}"
@@ -353,7 +354,7 @@ def _validate_call_structure_and_id(
     raw_id = id_expr.value
     if not raw_id.strip():
         return None, "`id` must not be empty"
-    if not _VALID_PROBE_ID_RE.fullmatch(raw_id) or ".." in raw_id:
+    if not _VALID_CHECK_ID_RE.fullmatch(raw_id) or ".." in raw_id:
         return (
             None,
             "`id` must be 1-128 chars matching [A-Za-z0-9._:-] without '/' , '\\\\', whitespace, or '..'",
@@ -567,8 +568,8 @@ def _sha256_text(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
-class _ModuleProbeVisitor(ast.NodeVisitor):
-    """Lexically scoped AST visitor collecting @probe decorators and probe.here(...) calls."""
+class _ModuleMannersVisitor(ast.NodeVisitor):
+    """Lexically scoped AST visitor collecting @manners decorators and manners.here(...) calls."""
 
     def __init__(
         self,
@@ -584,7 +585,7 @@ class _ModuleProbeVisitor(ast.NodeVisitor):
         self.scope: list[tuple[str, bool]] = []
         self.fn_stack: list[ast.FunctionDef | ast.AsyncFunctionDef] = []
         self._env_stack: list[dict[str, str]] = [{}]
-        self.discovered: list[DiscoveredProbe] = []
+        self.discovered: list[DiscoveredCheck] = []
 
     def _bind(self, name: str, role: str) -> None:
         if name:
@@ -613,32 +614,32 @@ class _ModuleProbeVisitor(ast.NodeVisitor):
 
     def visit_Import(self, node: ast.Import) -> None:
         for alias in node.names:
-            if alias.name == "probe":
-                self._bind(alias.asname or "probe", "module")
-            elif alias.name.startswith("probe.") and alias.asname is None:
-                self._bind("probe", "module")
+            if alias.name == "manners":
+                self._bind(alias.asname or "manners", "module")
+            elif alias.name.startswith("manners.") and alias.asname is None:
+                self._bind("manners", "module")
             else:
                 self._bind(alias.asname or alias.name.split(".", 1)[0], "shadowed")
 
     def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
-        if node.level == 0 and node.module == "probe":
+        if node.level == 0 and node.module == "manners":
             for alias in node.names:
-                if alias.name == "probe":
-                    self._bind(alias.asname or "probe", "api")
+                if alias.name == "manners":
+                    self._bind(alias.asname or "manners", "api")
                 elif alias.name == "here":
                     self._bind(alias.asname or "here", "here")
-                elif alias.name in {"ProbeType", "type"}:
+                elif alias.name in {"MannersType", "type"}:
                     self._bind(alias.asname or alias.name, "type")
                 elif alias.name == "*":
-                    self._bind("probe", "api")
+                    self._bind("manners", "api")
                     self._bind("here", "here")
-                    self._bind("ProbeType", "type")
+                    self._bind("MannersType", "type")
                 else:
                     self._bind(alias.asname or alias.name, "shadowed")
-        elif node.level == 0 and node.module == "probe.runtime":
+        elif node.level == 0 and node.module == "manners.runtime":
             for alias in node.names:
-                if alias.name == "ProbeType":
-                    self._bind(alias.asname or "ProbeType", "type")
+                if alias.name == "MannersType":
+                    self._bind(alias.asname or "MannersType", "type")
                 elif alias.name != "*":
                     self._bind(alias.asname or alias.name, "shadowed")
         else:
@@ -744,7 +745,7 @@ class _ModuleProbeVisitor(ast.NodeVisitor):
     def _visit_function(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> None:
         qualname = self._qualname(node.name)
         is_gen = _is_generator_function(node)
-        gen_err = "Generator functions cannot be decorated with @probe" if is_gen else None
+        gen_err = "Generator functions cannot be decorated with @manners" if is_gen else None
         sig = _format_signature(node)
         full_source = ast.get_source_segment(self.source, node) or ast.unparse(node)
         body_excerpt = full_source[:1500]
@@ -757,16 +758,16 @@ class _ModuleProbeVisitor(ast.NodeVisitor):
         ret_type_tag = _classify_annotation_ast(node.returns) or "str"
 
         for dec in node.decorator_list:
-            call, call_err, matched = _classify_probe_decorator(dec, self._lookup_role)
+            call, call_err, matched = _classify_manners_decorator(dec, self._lookup_role)
             if not matched:
                 continue
             if call is None:
-                c_hash = compute_checks_hash(ProbeType.decision, ())
+                c_hash = compute_checks_hash(MannersType.decision, ())
                 self.discovered.append(
-                    DiscoveredProbe(
-                        probe_id=f"{self.module_name}.{qualname}",
+                    DiscoveredCheck(
+                        check_id=f"{self.module_name}.{qualname}",
                         site="decorator",
-                        probe_type=ProbeType.decision,
+                        check_type=MannersType.decision,
                         file_path=self.display_path,
                         lineno=node.lineno,
                         file_line=f"{self.display_path}:{node.lineno}",
@@ -786,9 +787,9 @@ class _ModuleProbeVisitor(ast.NodeVisitor):
                 continue
 
             checks, check_err = _extract_checks_literal(_extract_kwarg(call, "checks", 0))
-            explicit_id, struct_err = _validate_call_structure_and_id(call, site="@probe")
-            probe_id = explicit_id or f"{self.module_name}.{qualname}"
-            kind, kind_err = _extract_probe_type(
+            explicit_id, struct_err = _validate_call_structure_and_id(call, site="@manners")
+            check_id = explicit_id or f"{self.module_name}.{qualname}"
+            kind, kind_err = _extract_manners_type(
                 _extract_kwarg(call, "kind"),
                 lookup_role=self._lookup_role,
             )
@@ -797,7 +798,7 @@ class _ModuleProbeVisitor(ast.NodeVisitor):
                 unknown_ign = [p for p in ignored_params if p not in param_names]
                 if unknown_ign:
                     ignore_err = (
-                        f"@probe ignore references unknown parameter(s): "
+                        f"@manners ignore references unknown parameter(s): "
                         f"{', '.join(repr(p) for p in unknown_ign)}"
                     )
             ign_set = frozenset(ignored_params)
@@ -815,10 +816,10 @@ class _ModuleProbeVisitor(ast.NodeVisitor):
             c_hash = compute_checks_hash(kind, checks)
             combined = _sha256_text(f"{c_hash}:{eff_s_hash}")
             self.discovered.append(
-                DiscoveredProbe(
-                    probe_id=probe_id,
+                DiscoveredCheck(
+                    check_id=check_id,
                     site="decorator",
-                    probe_type=kind,
+                    check_type=kind,
                     file_path=self.display_path,
                     lineno=node.lineno,
                     file_line=f"{self.display_path}:{node.lineno}",
@@ -870,28 +871,28 @@ class _ModuleProbeVisitor(ast.NodeVisitor):
         sig = f"class {node.name}"
         full_source = ast.get_source_segment(self.source, node) or sig
         for dec in node.decorator_list:
-            call, _, matched = _classify_probe_decorator(dec, self._lookup_role)
+            call, _, matched = _classify_manners_decorator(dec, self._lookup_role)
             if not matched:
                 continue
             checks: tuple[str, ...] = ()
             explicit_id: str | None = None
-            kind = ProbeType.decision
+            kind = MannersType.decision
             if call is not None:
                 checks, _ = _extract_checks_literal(_extract_kwarg(call, "checks", 0))
-                explicit_id, _ = _validate_call_structure_and_id(call, site="@probe")
-                kind, _ = _extract_probe_type(_extract_kwarg(call, "kind"), lookup_role=self._lookup_role)
+                explicit_id, _ = _validate_call_structure_and_id(call, site="@manners")
+                kind, _ = _extract_manners_type(_extract_kwarg(call, "kind"), lookup_role=self._lookup_role)
             c_hash = compute_checks_hash(kind, checks)
             s_hash = _sha256_text(f"{sig}\n{full_source}")
             self.discovered.append(
-                DiscoveredProbe(
-                    probe_id=explicit_id or f"{self.module_name}.{qualname}",
+                DiscoveredCheck(
+                    check_id=explicit_id or f"{self.module_name}.{qualname}",
                     site="decorator",
-                    probe_type=kind,
+                    check_type=kind,
                     file_path=self.display_path,
                     lineno=node.lineno,
                     file_line=f"{self.display_path}:{node.lineno}",
                     checks=checks,
-                    literal_error="@probe can only decorate functions or methods, not classes",
+                    literal_error="@manners can only decorate functions or methods, not classes",
                     signature=sig,
                     source_excerpt=full_source[:1500],
                     checks_hash=c_hash,
@@ -961,20 +962,20 @@ class _ModuleProbeVisitor(ast.NodeVisitor):
         call = _is_here_call(node, self._lookup_role)
         if call is not None:
             checks, check_err = _extract_checks_literal(_extract_kwarg(call, "checks", 0))
-            explicit_id, struct_err = _validate_call_structure_and_id(call, site="probe.here")
+            explicit_id, struct_err = _validate_call_structure_and_id(call, site="manners.here")
             qual = self._qualname()
             default_id = (
                 f"{self.module_name}.{qual}:L{call.lineno}" if qual else f"{self.module_name}:L{call.lineno}"
             )
-            probe_id = explicit_id or default_id
-            kind, kind_err = _extract_probe_type(
+            check_id = explicit_id or default_id
+            kind, kind_err = _extract_manners_type(
                 _extract_kwarg(call, "kind"),
                 lookup_role=self._lookup_role,
             )
             watched_keys = tuple(
                 kw.arg for kw in call.keywords if kw.arg and kw.arg not in {"checks", "id", "kind"}
             )
-            watched_err = None if watched_keys else "probe.here requires at least one watched keyword variable"
+            watched_err = None if watched_keys else "manners.here requires at least one watched keyword variable"
             literal_error = struct_err or check_err or kind_err or watched_err
             enclosing = self.fn_stack[-1] if self.fn_stack else None
             sig = _format_signature(enclosing) if enclosing else "<module>"
@@ -1002,10 +1003,10 @@ class _ModuleProbeVisitor(ast.NodeVisitor):
             s_hash = _sha256_text(f"{sig}\n{','.join(watched_keys)}")
             combined = _sha256_text(f"{c_hash}:{s_hash}")
             self.discovered.append(
-                DiscoveredProbe(
-                    probe_id=probe_id,
+                DiscoveredCheck(
+                    check_id=check_id,
                     site="here",
-                    probe_type=kind,
+                    check_type=kind,
                     file_path=self.display_path,
                     lineno=call.lineno,
                     file_line=f"{self.display_path}:{call.lineno}",
@@ -1026,9 +1027,9 @@ class _ModuleProbeVisitor(ast.NodeVisitor):
 def _parse_and_discover(
     py_files: Sequence[Path],
     base_root: Path,
-) -> tuple[list[DiscoveredProbe], dict[Path, str]]:
-    """Parse Python files and discover @probe and probe.here sites."""
-    discovered: list[DiscoveredProbe] = []
+) -> tuple[list[DiscoveredCheck], dict[Path, str]]:
+    """Parse Python files and discover @manners and manners.here sites."""
+    discovered: list[DiscoveredCheck] = []
     parse_errors: dict[Path, str] = {}
 
     for py_file in py_files:
@@ -1039,13 +1040,13 @@ def _parse_and_discover(
             parse_errors[py_file] = f"{type(exc).__name__}: {exc}"
             continue
 
-        if not _file_may_use_probe(tree):
+        if not _file_may_use_manners(tree):
             continue
 
         module_name = _module_name_for_file(py_file, base_root)
         display_path = _rel_display_path(py_file, base_root)
 
-        visitor = _ModuleProbeVisitor(
+        visitor = _ModuleMannersVisitor(
             source=source,
             module_name=module_name,
             display_path=display_path,
@@ -1060,33 +1061,33 @@ def _scan_files(
     paths: Sequence[Path] = (),
     *,
     root: Path | None = None,
-) -> tuple[list[Path], list[DiscoveredProbe], dict[Path, str]]:
-    """Scan Python files via AST, returning (scanned_files, discovered_probes, parse_errors)."""
+) -> tuple[list[Path], list[DiscoveredCheck], dict[Path, str]]:
+    """Scan Python files via AST, returning (scanned_files, discovered_checks, parse_errors)."""
     base_root = (root or Path.cwd()).resolve()
     py_files, _, _, _ = _resolve_scan_targets(paths, base_root)
     discovered, parse_errors = _parse_and_discover(py_files, base_root)
     return py_files, discovered, parse_errors
 
 
-def discover_probes(
+def discover_manners(
     paths: Sequence[Path] = (),
     *,
     root: Path | None = None,
-) -> list[DiscoveredProbe]:
-    """Statically scan Python files via AST for @probe(...) and probe.here(...) sites."""
+) -> list[DiscoveredCheck]:
+    """Statically scan Python files via AST for @manners(...) and manners.here(...) sites."""
     _, discovered, _ = _scan_files(paths, root=root)
     return discovered
 
 
 def _load_lockfile(lock_path: Path) -> dict[str, Any]:
     if not lock_path.exists():
-        return {"version": 1, "probes": {}}
+        return {"version": 1, "manners": {}}
     try:
         raw = json.loads(lock_path.read_text(encoding="utf-8"))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise BackendError(f"Corrupt lockfile {lock_path}: {exc}") from exc
-    if not isinstance(raw, dict) or not isinstance(raw.get("probes"), dict):
-        raise BackendError(f"Invalid lockfile format in {lock_path}: expected object with 'probes' dict")
+    if not isinstance(raw, dict) or not isinstance(raw.get("manners"), dict):
+        raise BackendError(f"Invalid lockfile format in {lock_path}: expected object with 'manners' dict")
     return raw
 
 
@@ -1120,22 +1121,22 @@ def _normalize_fixture_cases(raw_val: Any, *, fp: Path, field_name: str) -> tupl
     )
 
 
-def _fixture_candidates(fixtures_dir: Path, probe_id: str) -> tuple[Path, list[Path], str, str]:
-    """Validate probe_id and return (resolved_root, candidate_paths, safe_id, hashed_id)."""
+def _fixture_candidates(fixtures_dir: Path, check_id: str) -> tuple[Path, list[Path], str, str]:
+    """Validate check_id and return (resolved_root, candidate_paths, safe_id, hashed_id)."""
     if (
-        not probe_id
-        or "/" in probe_id
-        or "\\" in probe_id
-        or ".." in probe_id
-        or any(ord(ch) < 32 or ord(ch) == 127 for ch in probe_id)
+        not check_id
+        or "/" in check_id
+        or "\\" in check_id
+        or ".." in check_id
+        or any(ord(ch) < 32 or ord(ch) == 127 for ch in check_id)
     ):
         raise BackendError(
-            f"Invalid fixture probe_id {probe_id!r}: path separators, control chars, and '..' are not allowed"
+            f"Invalid fixture check_id {check_id!r}: path separators, control chars, and '..' are not allowed"
         )
     fixtures_root = fixtures_dir.resolve()
-    safe_id = re.sub(r"[^A-Za-z0-9._-]", "_", probe_id)
-    hashed_id = f"{safe_id}-{_sha256_text(probe_id)[:6]}"
-    names = list(dict.fromkeys((f"{hashed_id}.json", f"{probe_id}.json", f"{safe_id}.json")))
+    safe_id = re.sub(r"[^A-Za-z0-9._-]", "_", check_id)
+    hashed_id = f"{safe_id}-{_sha256_text(check_id)[:6]}"
+    names = list(dict.fromkeys((f"{hashed_id}.json", f"{check_id}.json", f"{safe_id}.json")))
     paths: list[Path] = []
     for name in names:
         fp = fixtures_dir / name
@@ -1145,13 +1146,13 @@ def _fixture_candidates(fixtures_dir: Path, probe_id: str) -> tuple[Path, list[P
     return fixtures_root, paths, safe_id, hashed_id
 
 
-def resolve_fixture_path(fixtures_dir: Path, probe_id: str) -> Path:
-    """Return existing manual fixture path for probe_id or the canonical path for creating one."""
-    fixtures_root, candidates, safe_id, hashed_id = _fixture_candidates(fixtures_dir, probe_id)
+def resolve_fixture_path(fixtures_dir: Path, check_id: str) -> Path:
+    """Return existing manual fixture path for check_id or the canonical path for creating one."""
+    fixtures_root, candidates, safe_id, hashed_id = _fixture_candidates(fixtures_dir, check_id)
     for fp in candidates:
         if fp.exists() and fp.is_file():
             return fp
-    target_name = f"{probe_id}.json" if safe_id == probe_id else f"{hashed_id}.json"
+    target_name = f"{check_id}.json" if safe_id == check_id else f"{hashed_id}.json"
     target = fixtures_dir / target_name
     if not target.resolve().is_relative_to(fixtures_root):
         raise BackendError(f"Fixture path {target} escapes {fixtures_dir}")
@@ -1174,7 +1175,7 @@ def _placeholder_for_tag(type_tag: str, tag: str, name: str) -> Any:
     return f"<{tag}:{name}>"
 
 
-def build_skeleton_snapshot(item: DiscoveredProbe, tag: str) -> dict[str, Any]:
+def build_skeleton_snapshot(item: DiscoveredCheck, tag: str) -> dict[str, Any]:
     """Build a starter fixture snapshot matching item's AST signature, type hints, or watched keys."""
     tag_map = dict(item.type_tags)
     if item.site == "here":
@@ -1210,17 +1211,17 @@ def _parse_existing_fixture_section(raw_val: Any, *, fp: Path, field_name: str) 
     return out
 
 
-def upsert_probe_fixture(
+def upsert_manners_fixture(
     *,
-    probe_id: str,
-    cfg: ProbeConfig,
+    check_id: str,
+    cfg: MannersConfig,
     run_id: str | None = None,
     init_skeleton: bool = False,
     max_per_side: int = 5,
 ) -> tuple[Path, int, int]:
-    """Promote recorded pass/fail snapshots (and optionally AST skeletons) into .probes/fixtures/<id>.json."""
+    """Promote recorded pass/fail snapshots (and optionally AST skeletons) into .manners/fixtures/<id>.json."""
     fixtures_dir = cfg.resolve_lock_path().parent / "fixtures"
-    fp = resolve_fixture_path(fixtures_dir, probe_id)
+    fp = resolve_fixture_path(fixtures_dir, check_id)
 
     pass_list: list[dict[str, Any]] = []
     fail_list: list[dict[str, Any]] = []
@@ -1231,8 +1232,9 @@ def upsert_probe_fixture(
             raise BackendError(f"Failed to read existing fixture {fp}: {exc}") from exc
         if not isinstance(existing, dict):
             raise BackendError(f"Fixture {fp} must contain a JSON object")
-        if "probe_id" in existing and existing["probe_id"] != probe_id:
-            raise BackendError(f"Fixture {fp} probe_id {existing['probe_id']!r} does not match {probe_id!r}")
+        existing_id = existing.get("check_id")
+        if existing_id is not None and existing_id != check_id:
+            raise BackendError(f"Fixture {fp} check_id {existing_id!r} does not match {check_id!r}")
         pass_list = _parse_existing_fixture_section(
             existing.get("pass", existing.get("passing_snapshot")),
             fp=fp,
@@ -1252,7 +1254,7 @@ def upsert_probe_fixture(
 
     runs_dir = cfg.resolve_runs_dir()
     if runs_dir.is_dir():
-        store = ProbeStore(runs_dir, create=False)
+        store = MannersStore(runs_dir, create=False)
         try:
             if run_id is not None:
                 run = store.get_run(run_id)
@@ -1268,7 +1270,7 @@ def upsert_probe_fixture(
                 if added_pass >= max_per_side and added_fail >= max_per_side:
                     break
                 for ev in store.list_events(r.id):
-                    if ev.probe_id != probe_id or ev.verdict not in {"pass", "fail"}:
+                    if ev.check_id != check_id or ev.verdict not in {"pass", "fail"}:
                         continue
                     try:
                         snap = json.loads(ev.payload_json)
@@ -1291,10 +1293,10 @@ def upsert_probe_fixture(
         raise BackendError(f"Run {run_id!r} not found: {runs_dir} does not exist")
 
     if init_skeleton and (not pass_list or not fail_list):
-        discovered = discover_probes(root=cfg.project_root)
-        item = next((p for p in discovered if p.probe_id == probe_id), None)
+        discovered = discover_manners(root=cfg.project_root)
+        item = next((p for p in discovered if p.check_id == check_id), None)
         if item is None:
-            raise BackendError(f"Probe {probe_id!r} not found in Python files under {cfg.project_root}")
+            raise BackendError(f"Check {check_id!r} not found in Python files under {cfg.project_root}")
         if not pass_list:
             pass_list.append(build_skeleton_snapshot(item, "PASS"))
         if not fail_list:
@@ -1302,13 +1304,13 @@ def upsert_probe_fixture(
 
     if not pass_list or not fail_list:
         raise BackendError(
-            f"Fixture for {probe_id!r} requires at least 1 pass and 1 fail snapshot "
+            f"Fixture for {check_id!r} requires at least 1 pass and 1 fail snapshot "
             f"(found {len(pass_list)} pass, {len(fail_list)} fail); record both verdicts or pass --init"
         )
 
     fp.parent.mkdir(parents=True, exist_ok=True)
     payload = {
-        "probe_id": probe_id,
+        "check_id": check_id,
         "pass": pass_list,
         "fail": fail_list,
     }
@@ -1316,8 +1318,8 @@ def upsert_probe_fixture(
     return fp, len(pass_list), len(fail_list)
 
 
-def _load_manual_fixture(fixtures_dir: Path, probe_id: str) -> tuple[tuple[str, ...], tuple[str, ...]] | None:
-    _, candidates, _, _ = _fixture_candidates(fixtures_dir, probe_id)
+def _load_manual_fixture(fixtures_dir: Path, check_id: str) -> tuple[tuple[str, ...], tuple[str, ...]] | None:
+    _, candidates, _, _ = _fixture_candidates(fixtures_dir, check_id)
     for fp in candidates:
         if not fp.exists() or not fp.is_file():
             continue
@@ -1327,9 +1329,9 @@ def _load_manual_fixture(fixtures_dir: Path, probe_id: str) -> tuple[tuple[str, 
             raise BackendError(f"Failed to read fixture {fp}: {exc}") from exc
         if not isinstance(data, dict):
             raise BackendError(f"Fixture {fp} must contain a JSON object with 'pass' and 'fail' keys")
-        if "probe_id" in data and data["probe_id"] != probe_id:
+        if "check_id" in data and data["check_id"] != check_id:
             raise BackendError(
-                f"Fixture {fp} probe_id {data['probe_id']!r} does not match {probe_id!r}"
+                f"Fixture {fp} check_id {data['check_id']!r} does not match {check_id!r}"
             )
         passing = data.get("pass", data.get("passing_snapshot"))
         failing = data.get("fail", data.get("failing_snapshot"))
@@ -1343,7 +1345,7 @@ def _load_manual_fixture(fixtures_dir: Path, probe_id: str) -> tuple[tuple[str, 
 
 
 def compute_effective_combined_hash(
-    item: DiscoveredProbe,
+    item: DiscoveredCheck,
     *,
     fixtures_dir: Path,
     pass_threshold: float,
@@ -1351,7 +1353,7 @@ def compute_effective_combined_hash(
 ) -> tuple[str, tuple[tuple[str, ...], tuple[str, ...]] | None, str | None]:
     """Compute effective lock hash folding combined_hash, pass_threshold, domain_context, and any manual fixture."""
     try:
-        fixture = _load_manual_fixture(fixtures_dir, item.probe_id)
+        fixture = _load_manual_fixture(fixtures_dir, item.check_id)
     except BackendError as exc:
         return "", None, str(exc)
 
@@ -1374,20 +1376,20 @@ def compute_effective_combined_hash(
 
 def _evaluate_sample(
     *,
-    item: DiscoveredProbe,
+    item: DiscoveredCheck,
     snapshot_json: str,
     decision_backend: DecisionBackend,
     text_backend: TextBackend,
 ) -> list[CheckScore]:
     analysis = ""
-    if item.probe_type == ProbeType.text:
+    if item.check_type == MannersType.text:
         analysis = text_backend.analyze_snapshot(
-            probe_id=item.probe_id,
+            check_id=item.check_id,
             checks=item.checks,
             snapshot_json=snapshot_json,
         )
     return decision_backend.evaluate_checks(
-        probe_id=item.probe_id,
+        check_id=item.check_id,
         checks=item.checks,
         snapshot_json=snapshot_json,
         analysis=analysis,
@@ -1417,73 +1419,73 @@ def _file_from_file_line(file_line: str) -> str:
     return file_line
 
 
-def _validate_gate3_snapshot(snapshot_json: str, *, item: DiscoveredProbe, label: str) -> str:
+def _validate_gate3_snapshot(snapshot_json: str, *, item: DiscoveredCheck, label: str) -> str:
     """Validate Gate 3 pass/fail snapshot JSON matches the runtime site schema."""
     try:
         obj = json.loads(snapshot_json)
     except ValueError as exc:
-        raise BackendError(f"Gate 3 {label} for {item.probe_id} is not valid JSON: {exc}") from exc
+        raise BackendError(f"Gate 3 {label} for {item.check_id} is not valid JSON: {exc}") from exc
     if not isinstance(obj, dict):
-        raise BackendError(f"Gate 3 {label} for {item.probe_id} must be a JSON object")
+        raise BackendError(f"Gate 3 {label} for {item.check_id} must be a JSON object")
 
     if item.site == "decorator":
         if "exception" in obj:
             raise BackendError(
-                f"Gate 3 {label} for decorator probe {item.probe_id} must not use 'exception'; provide 'output'"
+                f"Gate 3 {label} for decorator check {item.check_id} must not use 'exception'; provide 'output'"
             )
         if "watched" in obj:
             raise BackendError(
-                f"Gate 3 {label} for decorator probe {item.probe_id} must not include 'watched'"
+                f"Gate 3 {label} for decorator check {item.check_id} must not include 'watched'"
             )
         inputs = obj.get("inputs")
         if not isinstance(inputs, dict):
             raise BackendError(
-                f"Gate 3 {label} for decorator probe {item.probe_id} must include dict 'inputs'"
+                f"Gate 3 {label} for decorator check {item.check_id} must include dict 'inputs'"
             )
         missing_params = [p for p in item.required_params if p not in inputs]
         if missing_params:
             raise BackendError(
-                f"Gate 3 {label} for decorator probe {item.probe_id} missing required input(s): "
+                f"Gate 3 {label} for decorator check {item.check_id} missing required input(s): "
                 f"{', '.join(missing_params)}"
             )
         if item.ignored_params:
             unexpected_ignored = [p for p in item.ignored_params if p in inputs]
             if unexpected_ignored:
                 raise BackendError(
-                    f"Gate 3 {label} for decorator probe {item.probe_id} must omit ignored input(s): "
+                    f"Gate 3 {label} for decorator check {item.check_id} must omit ignored input(s): "
                     f"{', '.join(unexpected_ignored)}"
                 )
         if "output" not in obj:
             raise BackendError(
-                f"Gate 3 {label} for decorator probe {item.probe_id} must include 'output'"
+                f"Gate 3 {label} for decorator check {item.check_id} must include 'output'"
             )
     elif item.site == "here":
         for forbidden in ("inputs", "output", "exception"):
             if forbidden in obj:
                 raise BackendError(
-                    f"Gate 3 {label} for here probe {item.probe_id} must not include {forbidden!r}"
+                    f"Gate 3 {label} for here check {item.check_id} must not include {forbidden!r}"
                 )
         watched = obj.get("watched")
         if not isinstance(watched, dict):
             raise BackendError(
-                f"Gate 3 {label} for here probe {item.probe_id} must include dict 'watched'"
+                f"Gate 3 {label} for here check {item.check_id} must include dict 'watched'"
             )
         if item.watched_keys:
             missing = [k for k in item.watched_keys if k not in watched]
             extra = sorted(k for k in watched if k not in item.watched_keys)
             if missing:
                 raise BackendError(
-                    f"Gate 3 {label} for {item.probe_id} missing watched key(s): {', '.join(missing)}"
+                    f"Gate 3 {label} for {item.check_id} missing watched key(s): {', '.join(missing)}"
                 )
             if extra:
                 raise BackendError(
-                    f"Gate 3 {label} for {item.probe_id} has unexpected watched key(s): {', '.join(extra)}"
+                    f"Gate 3 {label} for {item.check_id} has unexpected watched key(s): {', '.join(extra)}"
                 )
     return snapshot_json
 
 
 def _format_case_scores(case_scores: list[list[CheckScore]]) -> list[dict[str, Any]]:
-    """Serialize per-case CheckScore lists for ProbeCheckResult."""
+    """Serialize per-case CheckScore lists for MannersCheckResult."""
     multi = len(case_scores) > 1
     out: list[dict[str, Any]] = []
     for idx, scores in enumerate(case_scores):
@@ -1517,17 +1519,17 @@ def _format_gate3_pass_reason(
     return reason, round(pass_min_p, 4), round(fail_max_p, 4)
 
 
-def _evaluate_uncached_probe(
-    item: DiscoveredProbe,
+def _evaluate_uncached_check(
+    item: DiscoveredCheck,
     *,
     effective_combined_hash: str,
     fixture: tuple[tuple[str, ...], tuple[str, ...]] | None,
-    cfg: ProbeConfig,
+    cfg: MannersConfig,
     decision_backend: DecisionBackend,
     text_backend: TextBackend,
     redactor: SecretRedactor,
-) -> tuple[ProbeCheckResult, dict[str, Any] | None]:
-    """Run Gates 2-3 for one uncached probe and return (result, lock_entry_or_none)."""
+) -> tuple[MannersCheckResult, dict[str, Any] | None]:
+    """Run Gates 2-3 for one uncached check and return (result, lock_entry_or_none)."""
     # Gate 2: Factual analysis via [models.text] + noul approval via [models.decision] (1x retry on disagreement).
     gate2_expected = get_noul_expected("check_gate2_nouls")
 
@@ -1540,7 +1542,7 @@ def _evaluate_uncached_probe(
     for g2_attempt in (1, 2):
         try:
             gate2_analysis = text_backend.analyze_checks_gate2(
-                probe_id=item.probe_id,
+                check_id=item.check_id,
                 site=item.site,
                 checks=item.checks,
                 signature=item.signature,
@@ -1562,18 +1564,18 @@ def _evaluate_uncached_probe(
                     gate2_state_obj["ignored_params"] = list(item.ignored_params)
             gate2_state = json.dumps(gate2_state_obj, ensure_ascii=False)
             gate2_scores = decision_backend.evaluate_checks(
-                probe_id=f"{item.probe_id}#gate2",
+                check_id=f"{item.check_id}#gate2",
                 checks=get_nouls("check_gate2_nouls"),
                 snapshot_json=gate2_state,
                 analysis=gate2_analysis,
             )
         except BackendError as exc:
             return (
-                ProbeCheckResult(
-                    probe_id=item.probe_id,
+                MannersCheckResult(
+                    check_id=item.check_id,
                     file_line=item.file_line,
                     site=item.site,
-                    probe_type=item.probe_type.value,
+                    check_type=item.check_type.value,
                     status="failed",
                     gate="gate2",
                     reason=redactor.scrub_text(str(exc)),
@@ -1594,11 +1596,11 @@ def _evaluate_uncached_probe(
             else "; ".join(failed_nouls)
         )
         return (
-            ProbeCheckResult(
-                probe_id=item.probe_id,
+            MannersCheckResult(
+                check_id=item.check_id,
                 file_line=item.file_line,
                 site=item.site,
-                probe_type=item.probe_type.value,
+                check_type=item.check_type.value,
                 status="failed",
                 gate="gate2",
                 reason=redactor.scrub_text(audit_reason or "Rejected by Gate 2 check audit"),
@@ -1625,7 +1627,7 @@ def _evaluate_uncached_probe(
                 raw_pass_cases, raw_fail_cases = fixture
             else:
                 p_snap, f_snap = text_backend.generate_calibration_fixtures_gate3(
-                    probe_id=item.probe_id,
+                    check_id=item.check_id,
                     site=item.site,
                     checks=item.checks,
                     signature=item.signature,
@@ -1734,11 +1736,11 @@ def _evaluate_uncached_probe(
 
     if gate3_error is not None:
         return (
-            ProbeCheckResult(
-                probe_id=item.probe_id,
+            MannersCheckResult(
+                check_id=item.check_id,
                 file_line=item.file_line,
                 site=item.site,
-                probe_type=item.probe_type.value,
+                check_type=item.check_type.value,
                 status="failed",
                 gate="gate3",
                 reason=redactor.scrub_text(gate3_error),
@@ -1763,11 +1765,11 @@ def _evaluate_uncached_probe(
             else:
                 parts.append(f"failing fixture case(s) {bad_fail_indices} did not fail any check")
         return (
-            ProbeCheckResult(
-                probe_id=item.probe_id,
+            MannersCheckResult(
+                check_id=item.check_id,
                 file_line=item.file_line,
                 site=item.site,
-                probe_type=item.probe_type.value,
+                check_type=item.check_type.value,
                 status="failed",
                 gate="gate3",
                 reason=f"Calibration failed ({'; '.join(parts)})",
@@ -1782,9 +1784,9 @@ def _evaluate_uncached_probe(
         fixture_source, pass_case_scores, fail_case_scores
     )
     lock_entry: dict[str, Any] = {
-        "probe_id": item.probe_id,
+        "check_id": item.check_id,
         "site": item.site,
-        "kind": item.probe_type.value,
+        "kind": item.check_type.value,
         "file_line": item.file_line,
         "checks": list(item.checks),
         "watched_keys": list(item.watched_keys),
@@ -1800,11 +1802,11 @@ def _evaluate_uncached_probe(
     if item.ignored_params:
         lock_entry["ignored_params"] = list(item.ignored_params)
     return (
-        ProbeCheckResult(
-            probe_id=item.probe_id,
+        MannersCheckResult(
+            check_id=item.check_id,
             file_line=item.file_line,
             site=item.site,
-            probe_type=item.probe_type.value,
+            check_type=item.check_type.value,
             status="passed",
             gate="done",
             reason=passed_reason,
@@ -1816,14 +1818,14 @@ def _evaluate_uncached_probe(
     )
 
 
-def run_probe_check(
+def run_manners_check(
     paths: Sequence[Path] = (),
     *,
     force: bool = False,
-    config: ProbeConfig | None = None,
+    config: MannersConfig | None = None,
     transport: httpx.BaseTransport | None = None,
-) -> tuple[bool, list[ProbeCheckResult]]:
-    """Run Gates 1-3 across discovered probes and update .probes/lock.json."""
+) -> tuple[bool, list[MannersCheckResult]]:
+    """Run Gates 1-3 across discovered checks and update .manners/lock.json."""
     cfg = config or load_config()
     root = cfg.project_root
     base_root = root.resolve()
@@ -1834,7 +1836,7 @@ def run_probe_check(
 
     lock_path = cfg.resolve_lock_path()
     lock_data = _load_lockfile(lock_path)
-    locked_probes: dict[str, Any] = dict(lock_data.get("probes", {}))
+    locked_checks: dict[str, Any] = dict(lock_data.get("manners", {}))
     fixtures_dir = lock_path.parent / "fixtures"
     redactor = SecretRedactor.from_environment(
         cfg.redact,
@@ -1844,21 +1846,21 @@ def run_probe_check(
 
     error_file_prefixes = {_rel_display_path(pf, base_root) for pf in parse_errors}
     checked_prefixes = {_rel_display_path(pf, base_root) for pf in py_files} - error_file_prefixes
-    discovered_ids = {p.probe_id for p in discovered}
+    discovered_ids = {p.check_id for p in discovered}
 
     protected_locked_ids: set[str] = set()
-    for pid, meta in locked_probes.items():
+    for cid, meta in locked_checks.items():
         if not isinstance(meta, dict):
             continue
         meta_fl = str(meta.get("file_line", ""))
         if meta_fl and _matches_file_prefixes(meta_fl, error_file_prefixes):
-            protected_locked_ids.add(pid)
+            protected_locked_ids.add(cid)
 
     unscanned_locked_ids: set[str] = set()
     if not full_root_scan:
         lazy_cache: dict[Path, tuple[bool, set[str]]] = {}
-        for pid, meta in locked_probes.items():
-            if pid not in discovered_ids or pid in protected_locked_ids or not isinstance(meta, dict):
+        for cid, meta in locked_checks.items():
+            if cid not in discovered_ids or cid in protected_locked_ids or not isinstance(meta, dict):
                 continue
             meta_fl = str(meta.get("file_line", ""))
             if (
@@ -1874,20 +1876,20 @@ def run_probe_check(
                 continue
             if candidate not in lazy_cache:
                 cand_disc, cand_errs = _parse_and_discover([candidate], base_root)
-                lazy_cache[candidate] = (not cand_errs, {p.probe_id for p in cand_disc})
+                lazy_cache[candidate] = (not cand_errs, {p.check_id for p in cand_disc})
             parsed_ok, cand_ids = lazy_cache[candidate]
             if not parsed_ok:
-                protected_locked_ids.add(pid)
-            elif pid in cand_ids:
-                unscanned_locked_ids.add(pid)
+                protected_locked_ids.add(cid)
+            elif cid in cand_ids:
+                unscanned_locked_ids.add(cid)
 
-    id_counts = Counter(p.probe_id for p in discovered)
-    results: list[ProbeCheckResult] = [
-        ProbeCheckResult(
-            probe_id="<parse_error>",
+    id_counts = Counter(p.check_id for p in discovered)
+    results: list[MannersCheckResult] = [
+        MannersCheckResult(
+            check_id="<parse_error>",
             file_line=_rel_display_path(pf, base_root),
             site="file",
-            probe_type="decision",
+            check_type="decision",
             status="failed",
             gate="gate1",
             reason=redactor.scrub_text(err),
@@ -1911,18 +1913,18 @@ def run_probe_check(
             transport=transport,
         )
 
-        discovered_results: list[ProbeCheckResult | None] = [None] * len(discovered)
-        uncached_tasks: list[tuple[int, DiscoveredProbe, str, tuple[str, str] | None]] = []
+        discovered_results: list[MannersCheckResult | None] = [None] * len(discovered)
+        uncached_tasks: list[tuple[int, DiscoveredCheck, str, tuple[str, str] | None]] = []
 
         for idx, item in enumerate(discovered):
             # Gate 1: Static literals, budgets, duplicate IDs.
             gate1_err: str | None = None
             if item.literal_error:
                 gate1_err = item.literal_error
-            elif item.probe_id in protected_locked_ids or item.probe_id in unscanned_locked_ids:
-                gate1_err = f"Duplicate probe_id '{item.probe_id}' already locked in another file"
-            elif id_counts[item.probe_id] > 1:
-                gate1_err = f"Duplicate probe_id '{item.probe_id}' ({id_counts[item.probe_id]} sites)"
+            elif item.check_id in protected_locked_ids or item.check_id in unscanned_locked_ids:
+                gate1_err = f"Duplicate check_id '{item.check_id}' already locked in another file"
+            elif id_counts[item.check_id] > 1:
+                gate1_err = f"Duplicate check_id '{item.check_id}' ({id_counts[item.check_id]} sites)"
             elif len(item.checks) > cfg.check.max_checks:
                 gate1_err = f"Too many checks ({len(item.checks)} > max_checks={cfg.check.max_checks})"
             else:
@@ -1934,13 +1936,13 @@ def run_probe_check(
                     )
 
             if gate1_err:
-                if item.probe_id not in protected_locked_ids and item.probe_id not in unscanned_locked_ids:
-                    locked_probes.pop(item.probe_id, None)
-                discovered_results[idx] = ProbeCheckResult(
-                    probe_id=item.probe_id,
+                if item.check_id not in protected_locked_ids and item.check_id not in unscanned_locked_ids:
+                    locked_checks.pop(item.check_id, None)
+                discovered_results[idx] = MannersCheckResult(
+                    check_id=item.check_id,
                     file_line=item.file_line,
                     site=item.site,
-                    probe_type=item.probe_type.value,
+                    check_type=item.check_type.value,
                     status="failed",
                     gate="gate1",
                     reason=redactor.scrub_text(gate1_err),
@@ -1955,12 +1957,12 @@ def run_probe_check(
                 domain_context=cfg.domain_context,
             )
             if fixture_error is not None:
-                locked_probes.pop(item.probe_id, None)
-                discovered_results[idx] = ProbeCheckResult(
-                    probe_id=item.probe_id,
+                locked_checks.pop(item.check_id, None)
+                discovered_results[idx] = MannersCheckResult(
+                    check_id=item.check_id,
                     file_line=item.file_line,
                     site=item.site,
-                    probe_type=item.probe_type.value,
+                    check_type=item.check_type.value,
                     status="failed",
                     gate="gate3",
                     reason=redactor.scrub_text(fixture_error),
@@ -1968,7 +1970,7 @@ def run_probe_check(
                 )
                 continue
 
-            existing = locked_probes.get(item.probe_id)
+            existing = locked_checks.get(item.check_id)
             watched_ok = item.site != "here" or (
                 isinstance(existing, dict) and existing.get("watched_keys") == list(item.watched_keys)
             )
@@ -1980,7 +1982,7 @@ def run_probe_check(
                 and isinstance(existing, dict)
                 and existing.get("combined_hash") == effective_combined_hash
                 and existing.get("site") == item.site
-                and existing.get("kind") == item.probe_type.value
+                and existing.get("kind") == item.check_type.value
                 and watched_ok
                 and params_ok
             ):
@@ -1995,11 +1997,11 @@ def run_probe_check(
                     )
                 else:
                     cached_reason = "Unchanged since last approved lock entry"
-                discovered_results[idx] = ProbeCheckResult(
-                    probe_id=item.probe_id,
+                discovered_results[idx] = MannersCheckResult(
+                    check_id=item.check_id,
                     file_line=item.file_line,
                     site=item.site,
-                    probe_type=item.probe_type.value,
+                    check_type=item.check_type.value,
                     status="cached",
                     gate="cache",
                     reason=cached_reason,
@@ -2011,7 +2013,7 @@ def run_probe_check(
 
         if len(uncached_tasks) <= 1 or cfg.check.max_workers <= 1:
             for idx, item, eff_hash, fixture in uncached_tasks:
-                res, lock_entry = _evaluate_uncached_probe(
+                res, lock_entry = _evaluate_uncached_check(
                     item,
                     effective_combined_hash=eff_hash,
                     fixture=fixture,
@@ -2022,9 +2024,9 @@ def run_probe_check(
                 )
                 discovered_results[idx] = res
                 if lock_entry is not None:
-                    locked_probes[item.probe_id] = lock_entry
+                    locked_checks[item.check_id] = lock_entry
                 else:
-                    locked_probes.pop(item.probe_id, None)
+                    locked_checks.pop(item.check_id, None)
         else:
             workers = min(cfg.check.max_workers, len(uncached_tasks))
             with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
@@ -2033,7 +2035,7 @@ def run_probe_check(
                         idx,
                         item,
                         pool.submit(
-                            _evaluate_uncached_probe,
+                            _evaluate_uncached_check,
                             item,
                             effective_combined_hash=eff_hash,
                             fixture=fixture,
@@ -2049,9 +2051,9 @@ def run_probe_check(
                     res, lock_entry = fut.result()
                     discovered_results[idx] = res
                     if lock_entry is not None:
-                        locked_probes[item.probe_id] = lock_entry
+                        locked_checks[item.check_id] = lock_entry
                     else:
-                        locked_probes.pop(item.probe_id, None)
+                        locked_checks.pop(item.check_id, None)
 
         results.extend(r for r in discovered_results if r is not None)
     except BackendError as exc:
@@ -2064,20 +2066,20 @@ def run_probe_check(
 
     # Remove stale entries for checked files/dirs and explicitly passed deleted targets (preserving parse errors).
     if full_root_scan:
-        locked_probes = {
-            pid: meta
-            for pid, meta in locked_probes.items()
-            if pid in discovered_ids
+        locked_checks = {
+            cid: meta
+            for cid, meta in locked_checks.items()
+            if cid in discovered_ids
             or (
                 isinstance(meta, dict)
                 and _matches_file_prefixes(str(meta.get("file_line", "")), error_file_prefixes)
             )
         }
     else:
-        locked_probes = {
-            pid: meta
-            for pid, meta in locked_probes.items()
-            if pid in discovered_ids
+        locked_checks = {
+            cid: meta
+            for cid, meta in locked_checks.items()
+            if cid in discovered_ids
             or (
                 isinstance(meta, dict)
                 and (
@@ -2093,7 +2095,7 @@ def run_probe_check(
             )
         }
 
-    lock_data = {"version": 1, "probes": locked_probes}
+    lock_data = {"version": 1, "manners": locked_checks}
     _save_lockfile(lock_path, lock_data)
 
     all_ok = all(r.status in {"passed", "cached"} for r in results)

@@ -1,4 +1,4 @@
-"""Typer CLI for `probe`: check, list, fixture, report, log, runs, clean."""
+"""Typer CLI for `manners`: check, list, fixture, report, log, runs, clean."""
 
 from __future__ import annotations
 
@@ -10,28 +10,28 @@ from typing import Any
 
 import typer
 
-from probe.backends import BackendError
-from probe.check import (
+from manners.backends import BackendError
+from manners.check import (
     _load_lockfile,
     _matches_file_or_dir_prefixes,
     _rel_display_path,
     _scan_files,
     compute_effective_combined_hash,
-    run_probe_check,
-    upsert_probe_fixture,
+    run_manners_check,
+    upsert_manners_fixture,
 )
-from probe.config import load_config
-from probe.store import EventRecord, ProbeStore, RunRecord
+from manners.config import load_config
+from manners.store import EventRecord, MannersStore, RunRecord
 
 _ROOT_OPTION = typer.Option(
     None,
     "--root",
-    help="Project root directory (overrides auto-discovery and PROBE_PROJECT_ROOT).",
+    help="Project root directory (overrides auto-discovery and MANNERS_PROJECT_ROOT).",
 )
 
 app = typer.Typer(
-    name="probe",
-    help="AI runtime checks, pre-run check, and call-ordered behavior logs.",
+    name="manners",
+    help="Plain-English runtime behavioral checks, pre-run calibration, and call-ordered behavior logs.",
     no_args_is_help=True,
     add_completion=False,
 )
@@ -53,11 +53,11 @@ def _load_cli_config(ctx: typer.Context, root: Path | None):
     return load_config(project_root=root or cb_root)
 
 
-def _open_existing_store(runs_dir: Path, *, read_only: bool = True) -> ProbeStore:
+def _open_existing_store(runs_dir: Path, *, read_only: bool = True) -> MannersStore:
     if not runs_dir.is_dir():
-        typer.echo(f"No probe runs found at {runs_dir}. Run with PROBES=1 first.", err=True)
+        typer.echo(f"No manners runs found at {runs_dir}. Run with MANNERS=1 first.", err=True)
         raise typer.Exit(code=1)
-    return ProbeStore(runs_dir, create=not read_only)
+    return MannersStore(runs_dir, create=not read_only)
 
 
 def _run_status_label(run: RunRecord, events: list[EventRecord]) -> str:
@@ -77,9 +77,9 @@ def _event_to_dict(ev: EventRecord, *, include_payload: bool = True) -> dict[str
         "call_seq": ev.call_seq,
         "elapsed_ms": ev.elapsed_ms,
         "started_at": ev.started_at,
-        "probe_id": ev.probe_id,
+        "check_id": ev.check_id,
         "site": ev.site,
-        "probe_type": ev.probe_type,
+        "check_type": ev.check_type,
         "file_line": ev.file_line,
         "verdict": ev.verdict,
         "error_code": ev.error_code,
@@ -107,8 +107,8 @@ def _format_event_text(
     sec = ev.elapsed_ms / 1000.0
     marker = "  <-- HALT TRIGGER" if halt_call_seq == ev.call_seq else ""
     lines = [
-        f"  #{ev.call_seq:03d}  +{sec:.3f}s  [{ev.verdict.upper()}]  {ev.probe_id} "
-        f"({ev.file_line}) [kind={ev.probe_type}]{marker}"
+        f"  #{ev.call_seq:03d}  +{sec:.3f}s  [{ev.verdict.upper()}]  {ev.check_id} "
+        f"({ev.file_line}) [kind={ev.check_type}]{marker}"
     ]
     if ev.error_code:
         lines.append(f"        error: {ev.error_code}")
@@ -117,7 +117,7 @@ def _format_event_text(
         show_all_scores = (
             detailed_pass
             or ev.verdict != "pass"
-            or ev.probe_type == "text"
+            or ev.check_type == "text"
             or len(ev.check_scores) <= 1
         )
         if show_all_scores:
@@ -147,7 +147,7 @@ def _format_report_text(run: RunRecord, events: list[EventRecord], *, show_all: 
     out = [
         f"Run {run.started_at} (id: {run.id}, cmd: {run.cmd}) — {status_label}",
         (
-            f"Probes: {run.active_probes} active | Calls: {total} "
+            f"Checks: {run.active_checks} active | Calls: {total} "
             f"({run.pass_count} pass, {run.fail_count} fail, {run.error_count} error)"
         ),
         "",
@@ -155,11 +155,11 @@ def _format_report_text(run: RunRecord, events: list[EventRecord], *, show_all: 
 
     visible = events if show_all else [e for e in events if e.verdict != "pass"]
     if not events:
-        out.append("No probe calls recorded in this run.")
+        out.append("No check calls recorded in this run.")
         return "\n".join(out)
 
     if not visible:
-        out.append(f"All {total} probe call(s) passed. Run with `--all` to inspect every entry.")
+        out.append(f"All {total} check call(s) passed. Run with `--all` to inspect every entry.")
         return "\n".join(out)
 
     out.append("Chronological Timeline (ordered by call_seq):")
@@ -184,13 +184,13 @@ def _format_report_md(run: RunRecord, events: list[EventRecord], *, show_all: bo
         f"## Run `{run.id}` ({run.started_at}) — **{status_label}**",
         "",
         f"- **Command:** `{run.cmd}`",
-        f"- **Probes:** {run.active_probes} active",
+        f"- **Checks:** {run.active_checks} active",
         f"- **Calls:** {total} ({run.pass_count} pass, {run.fail_count} fail, {run.error_count} error)",
         "",
     ]
     visible = events if show_all else [e for e in events if e.verdict != "pass"]
     if not visible:
-        out.append("All probe calls passed." if events else "No probe calls recorded.")
+        out.append("All check calls passed." if events else "No check calls recorded.")
         return "\n".join(out)
 
     out.append("### Chronological Timeline (`call_seq`)")
@@ -200,7 +200,7 @@ def _format_report_md(run: RunRecord, events: list[EventRecord], *, show_all: bo
         halt_tag = " **(HALT TRIGGER)**" if run.halt_call_seq == ev.call_seq else ""
         out.append(
             f"- `#{ev.call_seq:03d}` `+{sec:.3f}s` **`[{ev.verdict.upper()}]`** "
-            f"`{ev.probe_id}` (`{ev.file_line}`, `kind={ev.probe_type}`){halt_tag}"
+            f"`{ev.check_id}` (`{ev.file_line}`, `kind={ev.check_type}`){halt_tag}"
         )
         if ev.error_code:
             out.append(f"  - error: `{ev.error_code}`")
@@ -243,7 +243,7 @@ def _resolve_cli_scan_paths(
             matched_deleted: Path | None = None
             if lock_path is not None and lock_path.exists():
                 if locked is None:
-                    locked = _load_lockfile(lock_path).get("probes", {})
+                    locked = _load_lockfile(lock_path).get("manners", {})
                 for cand in candidates:
                     rel = _rel_display_path(cand, base_root)
                     if any(
@@ -269,7 +269,7 @@ def check_cmd(
     json_out: bool = typer.Option(False, "--json", help="Emit machine-readable JSON output."),
     root: Path | None = _ROOT_OPTION,
 ) -> None:
-    """Run Gates 1-3 on new or changed probes and update .probes/lock.json."""
+    """Run Gates 1-3 on new or changed checks and update .manners/lock.json."""
     try:
         cfg = _load_cli_config(ctx, root)
         resolved_paths = _resolve_cli_scan_paths(
@@ -277,7 +277,7 @@ def check_cmd(
             lock_path=cfg.resolve_lock_path(),
             project_root=cfg.project_root,
         )
-        ok, results = run_probe_check(resolved_paths, force=force, config=cfg)
+        ok, results = run_manners_check(resolved_paths, force=force, config=cfg)
     except (BackendError, ValueError, OSError) as exc:
         typer.echo(f"Error: {exc}", err=True)
         raise typer.Exit(code=1) from exc
@@ -296,11 +296,11 @@ def check_cmd(
         )
     else:
         if not results:
-            typer.echo("No @probe or probe.here calls found.")
+            typer.echo("No @manners or manners.here calls found.")
         for res in results:
             tag = res.status.upper()
             gate_note = f" ({res.gate})" if res.status == "failed" else ""
-            typer.echo(f"[{tag}{gate_note}] {res.probe_id} ({res.file_line}) — {res.reason}")
+            typer.echo(f"[{tag}{gate_note}] {res.check_id} ({res.file_line}) — {res.reason}")
 
     if not ok:
         raise typer.Exit(code=1)
@@ -313,7 +313,7 @@ def list_cmd(
     json_out: bool = typer.Option(False, "--json", help="Emit JSON output."),
     root: Path | None = _ROOT_OPTION,
 ) -> None:
-    """List statically discovered @probe and probe.here call sites and lock status."""
+    """List statically discovered @manners and manners.here call sites and lock status."""
     try:
         cfg = _load_cli_config(ctx, root)
         resolved_paths = _resolve_cli_scan_paths(paths, project_root=cfg.project_root)
@@ -330,9 +330,9 @@ def list_cmd(
             typer.echo(f"Error parsing {_rel_display_path(pf, base_root)}: {err}", err=True)
         raise typer.Exit(code=1)
 
-    locked = lock_data.get("probes", {})
+    locked = lock_data.get("manners", {})
     fixtures_dir = lock_path.parent / "fixtures"
-    id_counts = Counter(item.probe_id for item in discovered)
+    id_counts = Counter(item.check_id for item in discovered)
 
     rows: list[dict[str, Any]] = []
     for item in discovered:
@@ -342,21 +342,21 @@ def list_cmd(
             pass_threshold=cfg.decision.pass_threshold,
             domain_context=cfg.domain_context,
         )
-        entry = locked.get(item.probe_id)
+        entry = locked.get(item.check_id)
         watched_ok = item.site != "here" or (
             isinstance(entry, dict) and entry.get("watched_keys") == list(item.watched_keys)
         )
         params_ok = item.site != "decorator" or (
             isinstance(entry, dict) and entry.get("param_names") == list(item.param_names)
         )
-        if item.literal_error or id_counts[item.probe_id] > 1 or fixture_error is not None:
+        if item.literal_error or id_counts[item.check_id] > 1 or fixture_error is not None:
             lock_status = "invalid"
         elif not isinstance(entry, dict):
             lock_status = "unlocked"
         elif (
             entry.get("combined_hash") == effective_hash
             and entry.get("site") == item.site
-            and entry.get("kind") == item.probe_type.value
+            and entry.get("kind") == item.check_type.value
             and watched_ok
             and params_ok
         ):
@@ -368,26 +368,26 @@ def list_cmd(
 
         rows.append(
             {
-                "probe_id": item.probe_id,
+                "check_id": item.check_id,
                 "file_line": item.file_line,
                 "site": item.site,
-                "kind": item.probe_type.value,
+                "kind": item.check_type.value,
                 "lock_status": lock_status,
                 "checks": list(item.checks),
             }
         )
 
     if json_out:
-        typer.echo(json.dumps({"probes": rows}, indent=2, ensure_ascii=False))
+        typer.echo(json.dumps({"manners": rows}, indent=2, ensure_ascii=False))
         return
 
     if not rows:
-        typer.echo("No @probe or probe.here calls found.")
+        typer.echo("No @manners or manners.here calls found.")
         return
 
     for row in rows:
         typer.echo(
-            f"{row['probe_id']}  [{row['lock_status']}]  "
+            f"{row['check_id']}  [{row['lock_status']}]  "
             f"({row['file_line']}, site={row['site']}, kind={row['kind']})"
         )
         for chk in row["checks"]:
@@ -398,7 +398,7 @@ def list_cmd(
 def report_cmd(
     ctx: typer.Context,
     run_id: str | None = typer.Option(None, "--run", help="Specific run ULID (defaults to latest run)."),
-    show_all: bool = typer.Option(False, "--all", help="Include passed probe calls in timeline."),
+    show_all: bool = typer.Option(False, "--all", help="Include passed check calls in timeline."),
     fmt: str = typer.Option("text", "--format", help="Output format: text | md | json."),
     check_exit: bool = typer.Option(
         False,
@@ -407,7 +407,7 @@ def report_cmd(
     ),
     root: Path | None = _ROOT_OPTION,
 ) -> None:
-    """Print call-ordered summary of the latest or specified probe run."""
+    """Print call-ordered summary of the latest or specified manners run."""
     try:
         cfg = _load_cli_config(ctx, root)
         runs_dir = cfg.resolve_runs_dir()
@@ -447,15 +447,15 @@ def report_cmd(
 @app.command("log")
 def log_cmd(
     ctx: typer.Context,
-    probe_ids: list[str] = typer.Argument(..., help="One or more probe IDs or glob patterns."),
+    check_ids: list[str] = typer.Argument(..., help="One or more check IDs or glob patterns."),
     run_id: str | None = typer.Option(None, "--run", help="Specific run ULID (defaults to latest run)."),
     payload: bool = typer.Option(False, "--payload", help="Include redacted input/output snapshots."),
     fmt: str = typer.Option("text", "--format", help="Output format: text | md | json."),
     root: Path | None = _ROOT_OPTION,
 ) -> None:
-    """Interleave detailed chronological entries (call_seq ASC) for one or more probe IDs/globs."""
-    if not probe_ids or any(not pat.strip() for pat in probe_ids):
-        typer.echo("Probe ID or glob pattern must not be empty.", err=True)
+    """Interleave detailed chronological entries (call_seq ASC) for one or more check IDs/globs."""
+    if not check_ids or any(not pat.strip() for pat in check_ids):
+        typer.echo("Check ID or glob pattern must not be empty.", err=True)
         raise typer.Exit(code=1)
     try:
         cfg = _load_cli_config(ctx, root)
@@ -466,7 +466,7 @@ def log_cmd(
             if run is None:
                 typer.echo(f"No matching run found in {runs_dir}.", err=True)
                 raise typer.Exit(code=1)
-            events = store.list_events(run.id, probe_patterns=probe_ids)
+            events = store.list_events(run.id, check_patterns=check_ids)
         finally:
             store.close()
     except (BackendError, ValueError, OSError) as exc:
@@ -477,7 +477,7 @@ def log_cmd(
     if fmt_norm == "json":
         out = {
             "run": dataclasses.asdict(run),
-            "patterns": probe_ids,
+            "patterns": check_ids,
             "events": [_event_to_dict(e, include_payload=payload) for e in events],
         }
         typer.echo(json.dumps(out, indent=2, ensure_ascii=False))
@@ -485,7 +485,7 @@ def log_cmd(
 
     if fmt_norm == "md":
         lines = [
-            f"## Probe Log `{run.id}` (`{', '.join(probe_ids)}`)",
+            f"## Manners Log `{run.id}` (`{', '.join(check_ids)}`)",
             "",
         ]
         if not events:
@@ -495,7 +495,7 @@ def log_cmd(
             halt_note = " **(HALT TRIGGER)**" if run.halt_call_seq == ev.call_seq else ""
             lines.append(
                 f"- `#{ev.call_seq:03d}` `+{sec:.3f}s` **`[{ev.verdict.upper()}]`** "
-                f"`{ev.probe_id}` (`{ev.file_line}`) `[kind={ev.probe_type}]`{halt_note}"
+                f"`{ev.check_id}` (`{ev.file_line}`) `[kind={ev.check_type}]`{halt_note}"
             )
             if ev.error_code:
                 lines.append(f"  - error: `{ev.error_code}`")
@@ -520,11 +520,11 @@ def log_cmd(
         raise typer.Exit(code=1)
 
     lines = [
-        f"Run {run.started_at} (id: {run.id}) — log for {', '.join(probe_ids)} ({len(events)} calls)",
+        f"Run {run.started_at} (id: {run.id}) — log for {', '.join(check_ids)} ({len(events)} calls)",
         "",
     ]
     if not events:
-        lines.append("No matching probe events recorded.")
+        lines.append("No matching check events recorded.")
     for idx, ev in enumerate(events):
         if idx > 0:
             lines.append("")
@@ -546,7 +546,7 @@ def runs_cmd(
     json_out: bool = typer.Option(False, "--json", help="Emit JSON output."),
     root: Path | None = _ROOT_OPTION,
 ) -> None:
-    """List recent probe runs with timestamps, verdict counts, and status."""
+    """List recent manners runs with timestamps, verdict counts, and status."""
     try:
         cfg = _load_cli_config(ctx, root)
         store = _open_existing_store(cfg.resolve_runs_dir())
@@ -580,7 +580,7 @@ def clean_cmd(
     keep: int = typer.Option(20, "--keep", min=0, help="Number of newest runs to retain."),
     root: Path | None = _ROOT_OPTION,
 ) -> None:
-    """Prune old run logs from .probes/runs."""
+    """Prune old run logs from .manners/runs."""
     try:
         cfg = _load_cli_config(ctx, root)
         store = _open_existing_store(cfg.resolve_runs_dir(), read_only=False)
@@ -597,19 +597,19 @@ def clean_cmd(
 @app.command("fixture")
 def fixture_cmd(
     ctx: typer.Context,
-    probe_id: str = typer.Argument(..., help="Probe ID to promote recorded snapshots or scaffold."),
+    check_id: str = typer.Argument(..., help="Check ID to promote recorded snapshots or scaffold."),
     run_id: str | None = typer.Option(None, "--run", help="Specific run ULID to extract snapshots from."),
     init_skeleton: bool = typer.Option(
-        False, "--init", help="Scaffold missing pass/fail entries from the probe's AST signature/watched keys."
+        False, "--init", help="Scaffold missing pass/fail entries from the check's AST signature/watched keys."
     ),
     json_out: bool = typer.Option(False, "--json", help="Emit JSON output."),
     root: Path | None = _ROOT_OPTION,
 ) -> None:
-    """Promote recorded pass/fail snapshots into .probes/fixtures/<id>.json or scaffold a starter fixture."""
+    """Promote recorded pass/fail snapshots into .manners/fixtures/<id>.json or scaffold a starter fixture."""
     try:
         cfg = _load_cli_config(ctx, root)
-        fp, pass_count, fail_count = upsert_probe_fixture(
-            probe_id=probe_id,
+        fp, pass_count, fail_count = upsert_manners_fixture(
+            check_id=check_id,
             cfg=cfg,
             run_id=run_id,
             init_skeleton=init_skeleton,
@@ -623,7 +623,7 @@ def fixture_cmd(
         typer.echo(
             json.dumps(
                 {
-                    "probe_id": probe_id,
+                    "check_id": check_id,
                     "path": rel_fp,
                     "pass_count": pass_count,
                     "fail_count": fail_count,
@@ -633,4 +633,4 @@ def fixture_cmd(
             )
         )
     else:
-        typer.echo(f"Saved fixture for '{probe_id}' at {rel_fp} ({pass_count} pass, {fail_count} fail).")
+        typer.echo(f"Saved fixture for '{check_id}' at {rel_fp} ({pass_count} pass, {fail_count} fail).")

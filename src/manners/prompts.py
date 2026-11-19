@@ -34,8 +34,8 @@ _DETAIL_KEY_MAP: dict[str, str] = {
 
 @cache
 def load_prompt_catalog() -> dict[str, PromptEntry]:
-    """Load and validate all entries from bundled probe/prompts.json."""
-    raw = resources.files("probe").joinpath("prompts.json").read_text(encoding="utf-8")
+    """Load and validate all entries from bundled manners/prompts.json."""
+    raw = resources.files("manners").joinpath("prompts.json").read_text(encoding="utf-8")
     data = json.loads(raw)
     if not isinstance(data, dict):
         raise ValueError("prompts.json must contain a top-level JSON object")
@@ -181,13 +181,13 @@ def _format_snapshot_body(snapshot_json: str) -> str:
 
 
 def format_typesafe_state(
-    probe_id: str,
+    check_id: str,
     snapshot_json: str,
     analysis: str = "",
     domain_context: str = "",
 ) -> str:
     """Format the serialized state string sent to TypeSafe Jev /v1/systemone."""
-    parts = [f"Probe: {probe_id}"]
+    parts = [f"Check: {check_id}"]
     ctx = domain_context.strip()
     if ctx:
         parts.append(f"Domain Context:\n<domain_context>\n{_escape_closing_tags(ctx)}\n</domain_context>")
@@ -199,16 +199,16 @@ def format_typesafe_state(
 
 def format_analyze_snapshot_prompts(
     *,
-    probe_id: str,
+    check_id: str,
     checks: Sequence[str],
     snapshot_json: str,
     detail: str = "standard",
     domain_context: str = "",
 ) -> tuple[str, str]:
-    """Return (system, user) prompts for `probe.type.text` snapshot evidence extraction."""
+    """Return (system, user) prompts for `manners.type.text` snapshot evidence extraction."""
     numbered = "\n".join(f"- [{i}] {c}" for i, c in enumerate(checks))
     system = f"{get_prompt('text_analyze_snapshot')}\n{detail_instruction(detail)}"
-    parts = [f"Probe: {probe_id}", f"Checks:\n{numbered}"]
+    parts = [f"Check: {check_id}", f"Checks:\n{numbered}"]
     ctx = domain_context.strip()
     if ctx:
         parts.append(f"<domain_context>\n{_escape_closing_tags(ctx)}\n</domain_context>")
@@ -218,7 +218,7 @@ def format_analyze_snapshot_prompts(
 
 def format_explain_failure_prompts(
     *,
-    probe_id: str,
+    check_id: str,
     failed_lines: Sequence[str],
     snapshot_json: str,
     detail: str = "standard",
@@ -227,7 +227,7 @@ def format_explain_failure_prompts(
     """Return (system, user) prompts for explaining failed decision checks."""
     joined = "\n".join(failed_lines)
     system = f"{get_prompt('text_explain_failure')}\n{detail_instruction(detail)}"
-    parts = [f"Probe: {probe_id}", f"Failed check(s):\n{joined}"]
+    parts = [f"Check: {check_id}", f"Failed check(s):\n{joined}"]
     ctx = domain_context.strip()
     if ctx:
         parts.append(f"<domain_context>\n{_escape_closing_tags(ctx)}\n</domain_context>")
@@ -237,7 +237,7 @@ def format_explain_failure_prompts(
 
 def _format_gate_user_message(
     *,
-    probe_id: str,
+    check_id: str,
     site: str,
     checks: Sequence[str],
     signature: str,
@@ -250,7 +250,7 @@ def _format_gate_user_message(
 ) -> str:
     numbered = "\n".join(f"- [{i}] {c}" for i, c in enumerate(checks))
     lines = [
-        f"Probe: {probe_id}",
+        f"Check: {check_id}",
         f"Site: {site}",
     ]
     if site == "here" and watched_keys:
@@ -278,7 +278,7 @@ def _format_gate_user_message(
 
 def format_gate2_analysis_prompts(
     *,
-    probe_id: str,
+    check_id: str,
     site: str,
     checks: Sequence[str],
     signature: str,
@@ -292,7 +292,7 @@ def format_gate2_analysis_prompts(
     return (
         get_prompt("check_gate2_analysis"),
         _format_gate_user_message(
-            probe_id=probe_id,
+            check_id=check_id,
             site=site,
             checks=checks,
             signature=signature,
@@ -307,7 +307,7 @@ def format_gate2_analysis_prompts(
 
 def format_gate3_fixtures_prompts(
     *,
-    probe_id: str,
+    check_id: str,
     site: str,
     checks: Sequence[str],
     signature: str,
@@ -322,7 +322,7 @@ def format_gate3_fixtures_prompts(
     return (
         get_prompt("check_gate3_fixtures"),
         _format_gate_user_message(
-            probe_id=probe_id,
+            check_id=check_id,
             site=site,
             checks=checks,
             signature=signature,

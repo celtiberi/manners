@@ -14,8 +14,8 @@ from typing import Any
 
 import httpx
 
-from probe.config import DecisionConfig, ModelEndpointConfig, TextConfig
-from probe.prompts import (
+from manners.config import DecisionConfig, ModelEndpointConfig, TextConfig
+from manners.prompts import (
     compose_system_prompt,
     format_analyze_snapshot_prompts,
     format_explain_failure_prompts,
@@ -36,7 +36,7 @@ _LEGACY_JEV_MODELS = frozenset({"", "jev", "typesafe-ai/jev"})
 _RETRY_STATUS_CODES = frozenset({429, 500, 502, 503, 504, 529})
 _MAX_HTTP_ATTEMPTS = 2
 _RETRY_BACKOFF_S = 0.4
-_USER_AGENT = "probe/0.6"
+_USER_AGENT = "manners/0.7"
 
 
 class BackendError(RuntimeError):
@@ -379,7 +379,7 @@ class DecisionBackend:
     def evaluate_checks(
         self,
         *,
-        probe_id: str,
+        check_id: str,
         checks: Sequence[str],
         snapshot_json: str,
         analysis: str = "",
@@ -391,9 +391,9 @@ class DecisionBackend:
 
         provider = self.endpoint.provider.strip().lower()
         if provider == "typesafe_jev":
-            probs = self._eval_typesafe_jev(probe_id, check_list, snapshot_json, analysis)
+            probs = self._eval_typesafe_jev(check_id, check_list, snapshot_json, analysis)
         elif provider == "http_decision":
-            probs = self._eval_http_decision(probe_id, check_list, snapshot_json, analysis)
+            probs = self._eval_http_decision(check_id, check_list, snapshot_json, analysis)
         elif provider == "onnx_nli":
             probs = self._eval_onnx_nli(check_list, snapshot_json, analysis)
         else:
@@ -423,7 +423,7 @@ class DecisionBackend:
 
     def _eval_typesafe_jev(
         self,
-        probe_id: str,
+        check_id: str,
         checks: list[str],
         snapshot_json: str,
         analysis: str,
@@ -437,7 +437,7 @@ class DecisionBackend:
         eff_model = _DEFAULT_TYPESAFE_MODEL if raw_model in _LEGACY_JEV_MODELS else raw_model
 
         state_str = format_typesafe_state(
-            probe_id,
+            check_id,
             snapshot_json,
             analysis,
             domain_context=self.domain_context,
@@ -471,7 +471,7 @@ class DecisionBackend:
 
     def _eval_http_decision(
         self,
-        probe_id: str,
+        check_id: str,
         checks: list[str],
         snapshot_json: str,
         analysis: str,
@@ -481,7 +481,7 @@ class DecisionBackend:
             raise BackendError("http_decision provider requires non-empty `url` in [models.decision]")
         payload: dict[str, Any] = {
             "model": self.endpoint.model,
-            "probe_id": probe_id,
+            "check_id": check_id,
             "checks": checks,
             "snapshot": snapshot_json,
         }
@@ -509,7 +509,7 @@ class DecisionBackend:
                 from tokenizers import Tokenizer
             except ImportError as exc:
                 raise BackendError(
-                    "onnx_nli provider requires optional dependencies: install `probe[onnx]`"
+                    "onnx_nli provider requires optional dependencies: install `manners[onnx]`"
                 ) from exc
 
             if not self.endpoint.onnx_path or not self.endpoint.tokenizer_path:
@@ -695,7 +695,7 @@ def _format_onnx_premise(snapshot_json: str, analysis: str, domain_context: str 
 
 
 class TextBackend:
-    """OpenAI-compatible LLM client for text-probe analysis, failure explanations, and pre-run checks."""
+    """OpenAI-compatible LLM client for text-check analysis, failure explanations, and pre-run checks."""
 
     def __init__(
         self,
@@ -792,10 +792,10 @@ class TextBackend:
             raise BackendError("Text model returned an empty response")
         return cleaned
 
-    def analyze_snapshot(self, *, probe_id: str, checks: Sequence[str], snapshot_json: str) -> str:
-        """Produce factual prose analysis for probe.type.text before decision scoring."""
+    def analyze_snapshot(self, *, check_id: str, checks: Sequence[str], snapshot_json: str) -> str:
+        """Produce factual prose analysis for manners.type.text before decision scoring."""
         system, user = format_analyze_snapshot_prompts(
-            probe_id=probe_id,
+            check_id=check_id,
             checks=checks,
             snapshot_json=snapshot_json,
             detail=self.text_cfg.detail,
@@ -806,7 +806,7 @@ class TextBackend:
     def explain_failure(
         self,
         *,
-        probe_id: str,
+        check_id: str,
         scores: Sequence[CheckScore],
         snapshot_json: str,
     ) -> str:
@@ -814,7 +814,7 @@ class TextBackend:
         failed = [s for s in scores if not s.passed] or list(scores)
         failed_lines = [f"- [FAIL p={s.probability:.2f}] {s.check}" for s in failed]
         system, user = format_explain_failure_prompts(
-            probe_id=probe_id,
+            check_id=check_id,
             failed_lines=failed_lines,
             snapshot_json=snapshot_json,
             detail=self.text_cfg.detail,
@@ -825,7 +825,7 @@ class TextBackend:
     def analyze_checks_gate2(
         self,
         *,
-        probe_id: str,
+        check_id: str,
         site: str,
         checks: Sequence[str],
         signature: str,
@@ -837,7 +837,7 @@ class TextBackend:
     ) -> str:
         """Gate 2 step 1: produce factual analysis of checks before decision noul scoring."""
         system, user = format_gate2_analysis_prompts(
-            probe_id=probe_id,
+            check_id=check_id,
             site=site,
             checks=checks,
             signature=signature,
@@ -857,7 +857,7 @@ class TextBackend:
     def generate_calibration_fixtures_gate3(
         self,
         *,
-        probe_id: str,
+        check_id: str,
         site: str = "decorator",
         checks: Sequence[str],
         signature: str,
@@ -870,7 +870,7 @@ class TextBackend:
     ) -> tuple[str, str]:
         """Gate 3 synthesis: create one valid passing snapshot and one realistic near-miss failing snapshot."""
         system, user = format_gate3_fixtures_prompts(
-            probe_id=probe_id,
+            check_id=check_id,
             site=site,
             checks=checks,
             signature=signature,
@@ -893,7 +893,7 @@ class TextBackend:
         failing = parsed.get("failing_snapshot")
         if passing is None or failing is None:
             raise BackendError(
-                f"Gate 3 synthesis missing passing_snapshot or failing_snapshot for {probe_id}"
+                f"Gate 3 synthesis missing passing_snapshot or failing_snapshot for {check_id}"
             )
         return json.dumps(passing, ensure_ascii=False), json.dumps(failing, ensure_ascii=False)
 

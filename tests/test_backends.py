@@ -10,7 +10,7 @@ from pathlib import Path
 import httpx
 import pytest
 
-from probe.backends import (
+from manners.backends import (
     BackendError,
     CheckScore,
     DecisionBackend,
@@ -23,17 +23,17 @@ from probe.backends import (
     extract_json_object,
     strip_thinking,
 )
-from probe.config import (
+from manners.config import (
     CheckConfig,
     DecisionConfig,
     ModelEndpointConfig,
     TextConfig,
     _merge_endpoint_config,
     clear_env_cache,
-    is_probes_enabled,
+    is_manners_enabled,
     load_config,
 )
-from probe.prompts import (
+from manners.prompts import (
     compose_system_prompt,
     format_analyze_snapshot_prompts,
     format_explain_failure_prompts,
@@ -46,7 +46,7 @@ from probe.prompts import (
     get_prompt,
     load_prompt_catalog,
 )
-from probe.redact import SecretRedactor
+from manners.redact import SecretRedactor
 
 
 def test_strip_thinking_and_extract_json() -> None:
@@ -69,7 +69,7 @@ def test_strip_thinking_and_extract_json() -> None:
 
 
 def test_typesafe_jev_systemone_dialect_and_dotenv_key_resolution(tmp_path: Path, monkeypatch) -> None:
-    monkeypatch.setenv("PROBE_CONFIG", str(tmp_path / "no_user_config.toml"))
+    monkeypatch.setenv("MANNERS_CONFIG", str(tmp_path / "no_user_config.toml"))
     monkeypatch.delenv("TYPESAFE_API_KEY", raising=False)
     monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
     (tmp_path / ".env").write_text(
@@ -120,7 +120,7 @@ def test_typesafe_jev_systemone_dialect_and_dotenv_key_resolution(tmp_path: Path
     )
     try:
         scores = backend.evaluate_checks(
-            probe_id="tutor.opening_turn",
+            check_id="tutor.opening_turn",
             checks=["Opens with Spanish greeting", "Does not give answer away"],
             snapshot_json='{"output": "Hola"}',
         )
@@ -169,7 +169,7 @@ def test_http_decision_provider_and_api_key_header(monkeypatch) -> None:
     )
     try:
         scores = backend.evaluate_checks(
-            probe_id="tutor.opening_turn",
+            check_id="tutor.opening_turn",
             checks=["Opens with Spanish greeting", "Does not give answer away"],
             snapshot_json='{"output": "Hola"}',
         )
@@ -193,7 +193,7 @@ def test_decision_backend_rejects_text_llm_providers() -> None:
         try:
             with pytest.raises(BackendError, match=r"\[models\.decision\] requires a decision model"):
                 bad_backend.evaluate_checks(
-                    probe_id="p.bad",
+                    check_id="p.bad",
                     checks=["Greeting present"],
                     snapshot_json='{"output": "Hola!"}',
                 )
@@ -227,7 +227,7 @@ def test_text_backend_analysis_and_failure_explanation() -> None:
     )
     try:
         analysis = text_backend.explain_failure(
-            probe_id="tutor.opening_turn",
+            check_id="tutor.opening_turn",
             scores=[CheckScore("No spoiler", 0.05, False)],
             snapshot_json='{"output": "Say: Quiero un café"}',
         )
@@ -265,7 +265,7 @@ def test_prompts_json_catalog_and_formatting() -> None:
 def test_load_config_isolates_credentials_and_validates_types_and_bounds(
     tmp_path: Path, monkeypatch
 ) -> None:
-    monkeypatch.setenv("PROBE_CONFIG", str(tmp_path / "no_user_config.toml"))
+    monkeypatch.setenv("MANNERS_CONFIG", str(tmp_path / "no_user_config.toml"))
     monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-deepseek-should-not-leak")
     monkeypatch.setenv("GEMINI_API_KEY", "AIza-gemini-should-not-autoload")
 
@@ -276,12 +276,12 @@ def test_load_config_isolates_credentials_and_validates_types_and_bounds(
                 "[project]",
                 'name = "cfg-test"',
                 "",
-                "[tool.probe.models.text]",
+                "[tool.manners.models.text]",
                 'provider = "openai_compat"',
                 'url = "http://127.0.0.1:11434/v1"',
                 'model = "qwen3.5:9b"',
                 "",
-                "[tool.probe.runtime]",
+                "[tool.manners.runtime]",
                 'strict_api = "false"',
             ]
         )
@@ -296,14 +296,14 @@ def test_load_config_isolates_credentials_and_validates_types_and_bounds(
 
     # Explicit [text].max_tokens parses as int, while <= 0 or bool fails validation.
     (tmp_path / "pyproject.toml").write_text(
-        "[project]\nname = 'cfg-test'\n[tool.probe.text]\nmax_tokens = 2048\n",
+        "[project]\nname = 'cfg-test'\n[tool.manners.text]\nmax_tokens = 2048\n",
         encoding="utf-8",
     )
     cfg_tok = load_config(cwd=tmp_path)
     assert type(cfg_tok.text.max_tokens) is int and cfg_tok.text.max_tokens == 2048
     for bad_tok in ("0", "true"):
         (tmp_path / "pyproject.toml").write_text(
-            f"[project]\nname = 'cfg-test'\n[tool.probe.text]\nmax_tokens = {bad_tok}\n",
+            f"[project]\nname = 'cfg-test'\n[tool.manners.text]\nmax_tokens = {bad_tok}\n",
             encoding="utf-8",
         )
         with pytest.raises(ValueError, match="max_tokens"):
@@ -311,7 +311,7 @@ def test_load_config_isolates_credentials_and_validates_types_and_bounds(
 
     # pass_threshold=1.0 makes p > pass_threshold impossible and must fail validation.
     (tmp_path / "pyproject.toml").write_text(
-        "[project]\nname = 'cfg-test'\n[tool.probe.decision]\npass_threshold = 1.0\n",
+        "[project]\nname = 'cfg-test'\n[tool.manners.decision]\npass_threshold = 1.0\n",
         encoding="utf-8",
     )
     with pytest.raises(ValueError, match="pass_threshold"):
@@ -339,13 +339,13 @@ def test_load_config_isolates_credentials_and_validates_types_and_bounds(
         '[models.text]\nurl = "https://api.openai.com/v1"\nmodel = "gpt-4.1-mini"\napi_key = "sk-user"\n',
         encoding="utf-8",
     )
-    monkeypatch.setenv("PROBE_CONFIG", str(user_cfg))
+    monkeypatch.setenv("MANNERS_CONFIG", str(user_cfg))
     (tmp_path / "pyproject.toml").write_text(
-        "[project]\nname = 'cfg-test'\n[tool.probe.models.text]\n"
+        "[project]\nname = 'cfg-test'\n[tool.manners.models.text]\n"
         'url = "https://attacker.example/v1"\napi_key_env = "OPENAI_API_KEY"\n',
         encoding="utf-8",
     )
-    with pytest.raises(ValueError, match="PROBE_TRUST_PROJECT_ENDPOINTS"):
+    with pytest.raises(ValueError, match="MANNERS_TRUST_PROJECT_ENDPOINTS"):
         load_config(cwd=tmp_path)
 
     outside_env = tmp_path / "outside.env"
@@ -353,9 +353,9 @@ def test_load_config_isolates_credentials_and_validates_types_and_bounds(
     proj_dir = tmp_path / "repo"
     proj_dir.mkdir()
     (proj_dir / "pyproject.toml").write_text(
-        "[project]\nname = 'cfg-inner'\n[tool.probe]\n"
+        "[project]\nname = 'cfg-inner'\n[tool.manners]\n"
         'domain_context = "Spanish audio tags allowed."\n'
-        '[tool.probe.redact]\nenv_files = ["../outside.env"]\n',
+        '[tool.manners.redact]\nenv_files = ["../outside.env"]\n',
         encoding="utf-8",
     )
     cfg_inner = load_config(cwd=proj_dir)
@@ -370,19 +370,19 @@ def test_load_config_isolates_credentials_and_validates_types_and_bounds(
     assert ep_trav.resolve_api_key() is None
 
     (proj_dir / "pyproject.toml").write_text(
-        "[project]\nname = 'cfg-inner'\n[tool.probe.models.text]\nbase_url = 'http://127.0.0.1:11434/v1'\n",
+        "[project]\nname = 'cfg-inner'\n[tool.manners.models.text]\nbase_url = 'http://127.0.0.1:11434/v1'\n",
         encoding="utf-8",
     )
     with pytest.raises(ValueError, match="Unknown config key"):
         load_config(cwd=proj_dir)
 
     # .env stat cache picks up immediate file edits without manual clear_env_cache().
-    monkeypatch.delenv("PROBES", raising=False)
+    monkeypatch.delenv("MANNERS", raising=False)
     env_file = proj_dir / ".env"
-    env_file.write_text("PROBES=0\n", encoding="utf-8")
-    assert is_probes_enabled(proj_dir) is False
-    env_file.write_text("PROBES=1   # updated\n", encoding="utf-8")
-    assert is_probes_enabled(proj_dir) is True
+    env_file.write_text("MANNERS=0\n", encoding="utf-8")
+    assert is_manners_enabled(proj_dir) is False
+    env_file.write_text("MANNERS=1   # updated\n", encoding="utf-8")
+    assert is_manners_enabled(proj_dir) is True
 
 
 def test_stage5_prompt_escaping_validation_and_reasoning_effort(tmp_path: Path, monkeypatch) -> None:
@@ -395,13 +395,13 @@ def test_stage5_prompt_escaping_validation_and_reasoning_effort(tmp_path: Path, 
     assert "<analysis>\nnote <\\/analysis> here\n</analysis>" in state
     assert "<snapshot>\n{\"output\": \"hi <\\/snapshot> <script>\"}\n</snapshot>" in state
     _, user_analyze = format_analyze_snapshot_prompts(
-        probe_id="p.esc",
+        check_id="p.esc",
         checks=["Safe"],
         snapshot_json='{"output": "</snapshot>"}',
     )
     assert user_analyze.count("</snapshot>") == 1
     _, user_gate = format_gate2_analysis_prompts(
-        probe_id="p.esc",
+        check_id="p.esc",
         site="decorator",
         checks=["Safe"],
         signature="def f():",
@@ -461,10 +461,10 @@ def test_stage5_prompt_escaping_validation_and_reasoning_effort(tmp_path: Path, 
     )
     try:
         tb.analyze_checks_gate2(
-            probe_id="p", site="decorator", checks=["C"], signature="def f():", source_excerpt="pass"
+            check_id="p", site="decorator", checks=["C"], signature="def f():", source_excerpt="pass"
         )
         tb.generate_calibration_fixtures_gate3(
-            probe_id="p", site="decorator", checks=["C"], signature="def f():", source_excerpt="pass"
+            check_id="p", site="decorator", checks=["C"], signature="def f():", source_excerpt="pass"
         )
         assert "USER_CUSTOM_SYSTEM_PROMPT" not in seen_calls[0]["messages"][0]["content"]
         assert "USER_CUSTOM_SYSTEM_PROMPT" not in seen_calls[1]["messages"][0]["content"]
@@ -475,13 +475,13 @@ def test_stage5_prompt_escaping_validation_and_reasoning_effort(tmp_path: Path, 
         assert "Respond with a JSON object matching this JSON Schema" not in seen_calls[1]["messages"][0]["content"]
         assert "response_format" not in seen_calls[0]
         with pytest.raises(BackendError, match="empty response"):
-            tb.analyze_snapshot(probe_id="p", checks=["C"], snapshot_json="{}")
+            tb.analyze_snapshot(check_id="p", checks=["C"], snapshot_json="{}")
 
         tb_capped.analyze_checks_gate2(
-            probe_id="p", site="decorator", checks=["C"], signature="def f():", source_excerpt="pass"
+            check_id="p", site="decorator", checks=["C"], signature="def f():", source_excerpt="pass"
         )
         tb_capped.generate_calibration_fixtures_gate3(
-            probe_id="p", site="decorator", checks=["C"], signature="def f():", source_excerpt="pass"
+            check_id="p", site="decorator", checks=["C"], signature="def f():", source_excerpt="pass"
         )
         assert seen_calls[3]["max_tokens"] == 300
         assert seen_calls[4]["max_tokens"] == 300
@@ -675,7 +675,7 @@ def test_stage5_prompt_escaping_validation_and_reasoning_effort(tmp_path: Path, 
         # 3-class using label2id (entailment=2, contradiction=0): [-1, 0, 3] => high entailment.
         recorded["logits"] = [[-1.0, 0.0, 3.0]]
         scores3 = db.evaluate_checks(
-            probe_id="onnx.3",
+            check_id="onnx.3",
             checks=["Helpful output"],
             snapshot_json=json.dumps({"inputs": {"a": 1}, "output": "Hola!"}),
         )
@@ -687,21 +687,21 @@ def test_stage5_prompt_escaping_validation_and_reasoning_effort(tmp_path: Path, 
 
         # 1-logit head uses sigmoid.
         recorded["logits"] = [[2.5]]
-        scores1 = db.evaluate_checks(probe_id="onnx.1", checks=["Positive"], snapshot_json='{"output": "ok"}')
+        scores1 = db.evaluate_checks(check_id="onnx.1", checks=["Positive"], snapshot_json='{"output": "ok"}')
         assert scores1[0].probability > 0.90
         assert scores1[0].passed is True
 
         # 3-class neutral-heavy row scores low (~p_ent); logits summing to 1.0 still get softmax under logits mode.
         recorded["logits"] = [[0.0, 10.0, 0.0]]
         neutral_scores = db.evaluate_checks(
-            probe_id="onnx.neutral", checks=["Helpful"], snapshot_json='{"output": "meh"}'
+            check_id="onnx.neutral", checks=["Helpful"], snapshot_json='{"output": "meh"}'
         )
         assert neutral_scores[0].probability < 0.05
         assert neutral_scores[0].passed is False
 
         recorded["logits"] = [[0.2, 0.2, 0.6]]
         softmax_scores = db.evaluate_checks(
-            probe_id="onnx.logits1", checks=["Helpful"], snapshot_json='{"output": "ok"}'
+            check_id="onnx.logits1", checks=["Helpful"], snapshot_json='{"output": "ok"}'
         )
         # exp(0.6) / (exp(0.2)+exp(0.2)+exp(0.6)) ~= 0.427, NOT raw 0.6!
         assert softmax_scores[0].probability < 0.50
@@ -724,7 +724,7 @@ def test_stage5_prompt_escaping_validation_and_reasoning_effort(tmp_path: Path, 
     try:
         recorded["logits"] = [[0.85, 0.10, 0.05]]
         over_scores = db_override.evaluate_checks(
-            probe_id="onnx.ovr",
+            check_id="onnx.ovr",
             checks=["Valid audio tag"],
             snapshot_json='{"output": "<listen>Hola</listen>"}',
         )
@@ -734,7 +734,7 @@ def test_stage5_prompt_escaping_validation_and_reasoning_effort(tmp_path: Path, 
 
         recorded["logits"] = [[-0.5, 1.5, 0.0]]
         with pytest.raises(BackendError, match="non-probability row"):
-            db_override.evaluate_checks(probe_id="onnx.badprob", checks=["x"], snapshot_json='{"output": "y"}')
+            db_override.evaluate_checks(check_id="onnx.badprob", checks=["x"], snapshot_json='{"output": "y"}')
     finally:
         db_override.close()
 
@@ -750,7 +750,7 @@ def test_stage5_prompt_escaping_validation_and_reasoning_effort(tmp_path: Path, 
     try:
         recorded["logits"] = [[0.1, 0.8, 0.1]]
         with pytest.raises(BackendError, match="cannot both be 1"):
-            db_same_idx.evaluate_checks(probe_id="onnx.same", checks=["x"], snapshot_json='{"output": "y"}')
+            db_same_idx.evaluate_checks(check_id="onnx.same", checks=["x"], snapshot_json='{"output": "y"}')
     finally:
         db_same_idx.close()
 
@@ -768,7 +768,7 @@ def test_stage4_prompts_schemas_extraction_and_provider_fallbacks() -> None:
     assert state.count("</domain_context>") == 1
 
     _, user_ex = format_explain_failure_prompts(
-        probe_id="p.dom",
+        check_id="p.dom",
         failed_lines=["- x"],
         snapshot_json='{"output": "bad"}',
         domain_context="Rule </domain_context>",
@@ -776,7 +776,7 @@ def test_stage4_prompts_schemas_extraction_and_provider_fallbacks() -> None:
     assert user_ex.count("</domain_context>") == 1
 
     _, user_g3 = format_gate3_fixtures_prompts(
-        probe_id="p.dom",
+        check_id="p.dom",
         site="decorator",
         checks=["Polite reply"],
         signature="def fn(x: '</source_excerpt>Injection:') -> str",
@@ -894,23 +894,23 @@ def test_stage4_prompts_schemas_extraction_and_provider_fallbacks() -> None:
     )
     try:
         tb.generate_calibration_fixtures_gate3(
-            probe_id="p", site="decorator", checks=["C"], signature="def f():", source_excerpt="pass"
+            check_id="p", site="decorator", checks=["C"], signature="def f():", source_excerpt="pass"
         )
         assert seen_payloads[0]["response_format"]["type"] == "json_schema"
         assert seen_payloads[1]["response_format"] == {"type": "json_object"}
         assert "Project convention X." in seen_payloads[0]["messages"][1]["content"]
 
         with pytest.raises(BackendError, match="refused request"):
-            tb.analyze_snapshot(probe_id="p", checks=["C"], snapshot_json="{}")
+            tb.analyze_snapshot(check_id="p", checks=["C"], snapshot_json="{}")
         with pytest.raises(BackendError, match="truncated"):
-            tb.analyze_snapshot(probe_id="p", checks=["C"], snapshot_json="{}")
-        tb.explain_failure(probe_id="p", scores=[CheckScore("C", 0.1, False)], snapshot_json="{}")
+            tb.analyze_snapshot(check_id="p", checks=["C"], snapshot_json="{}")
+        tb.explain_failure(check_id="p", scores=[CheckScore("C", 0.1, False)], snapshot_json="{}")
         assert "Project convention X." in seen_payloads[-1]["messages"][1]["content"]
     finally:
         tb.close()
 
     with pytest.raises(BackendError, match="client is closed"):
-        tb.analyze_snapshot(probe_id="p", checks=["C"], snapshot_json="{}")
+        tb.analyze_snapshot(check_id="p", checks=["C"], snapshot_json="{}")
 
     # DecisionBackend http_decision forwards domain_context and catches closed client.
     seen_dec: list[dict] = []
@@ -925,13 +925,13 @@ def test_stage4_prompts_schemas_extraction_and_provider_fallbacks() -> None:
         transport=httpx.MockTransport(dec_handler),
     )
     try:
-        db_http.evaluate_checks(probe_id="p", checks=["C"], snapshot_json='{"output": "ok"}')
+        db_http.evaluate_checks(check_id="p", checks=["C"], snapshot_json='{"output": "ok"}')
         assert seen_dec[0]["domain_context"] == "Spanish cue convention."
     finally:
         db_http.close()
 
     with pytest.raises(BackendError, match="client is closed"):
-        db_http.evaluate_checks(probe_id="p", checks=["C"], snapshot_json='{"output": "ok"}')
+        db_http.evaluate_checks(check_id="p", checks=["C"], snapshot_json='{"output": "ok"}')
 
 
 def test_v04_system1_alignment_prompts_and_config() -> None:
@@ -960,24 +960,24 @@ def test_v04_system1_alignment_prompts_and_config() -> None:
     assert premise.index('"output"') < premise.index('"inputs"')
 
 
-def test_v06_monorepo_env_walk_and_probe_project_root(tmp_path: Path, monkeypatch) -> None:
+def test_v06_monorepo_env_walk_and_manners_project_root(tmp_path: Path, monkeypatch) -> None:
     mono = tmp_path / "monorepo"
     (mono / ".git").mkdir(parents=True)
     sub = mono / "services" / "portfolio"
     sub.mkdir(parents=True)
     (sub / "pyproject.toml").write_text(
-        "[project]\nname = 'portfolio'\n[tool.probe]\ndomain_context = 'Portfolio check context.'\n",
+        "[project]\nname = 'portfolio'\n[tool.manners]\ndomain_context = 'Portfolio check context.'\n",
         encoding="utf-8",
     )
     (tmp_path / "outside_root.env").write_text("TYPESAFE_API_KEY=outside-leak\n", encoding="utf-8")
     (mono / ".env").write_text(
-        "PROBES=1\nTYPESAFE_API_KEY=mono-jev-secret-12345\nDEEPSEEK_API_KEY=mono-ds-secret-12345\n",
+        "MANNERS=1\nTYPESAFE_API_KEY=mono-jev-secret-12345\nDEEPSEEK_API_KEY=mono-ds-secret-12345\n",
         encoding="utf-8",
     )
 
-    for var in ("PROBES", "TYPESAFE_API_KEY", "DEEPSEEK_API_KEY", "PROBE_PROJECT_ROOT"):
+    for var in ("MANNERS", "TYPESAFE_API_KEY", "DEEPSEEK_API_KEY", "MANNERS_PROJECT_ROOT"):
         monkeypatch.delenv(var, raising=False)
-    monkeypatch.setenv("PROBE_CONFIG", str(tmp_path / "missing_config.toml"))
+    monkeypatch.setenv("MANNERS_CONFIG", str(tmp_path / "missing_config.toml"))
     clear_env_cache()
 
     cfg = load_config(cwd=sub)
@@ -985,7 +985,7 @@ def test_v06_monorepo_env_walk_and_probe_project_root(tmp_path: Path, monkeypatc
     assert cfg.domain_context == "Portfolio check context."
     assert cfg.models_decision.resolve_api_key() == "mono-jev-secret-12345"
     assert cfg.models_text.resolve_api_key() == "mono-ds-secret-12345"
-    assert is_probes_enabled(sub) is True
+    assert is_manners_enabled(sub) is True
 
     redactor = SecretRedactor.from_environment(
         cfg.redact,
@@ -1004,28 +1004,28 @@ def test_v06_monorepo_env_walk_and_probe_project_root(tmp_path: Path, monkeypatc
     assert ep_out.resolve_api_key() is None
 
     # Subproject .env takes precedence over monorepo root .env, while missing keys still inherit.
-    (sub / ".env").write_text("PROBES=0\nDEEPSEEK_API_KEY=sub-ds-override\n", encoding="utf-8")
+    (sub / ".env").write_text("MANNERS=0\nDEEPSEEK_API_KEY=sub-ds-override\n", encoding="utf-8")
     clear_env_cache()
     cfg_override = load_config(cwd=sub)
-    assert is_probes_enabled(sub) is False
+    assert is_manners_enabled(sub) is False
     assert cfg_override.models_text.resolve_api_key() == "sub-ds-override"
     assert cfg_override.models_decision.resolve_api_key() == "mono-jev-secret-12345"
 
-    # Running from monorepo root with PROBE_PROJECT_ROOT in root .env or shell keeps artifacts in subproject.
+    # Running from monorepo root with MANNERS_PROJECT_ROOT in root .env or shell keeps artifacts in subproject.
     (sub / ".env").unlink()
     (mono / ".env").write_text(
-        "PROBES=1\nPROBE_PROJECT_ROOT=services/portfolio\nTYPESAFE_API_KEY=mono-jev-secret-12345\n",
+        "MANNERS=1\nMANNERS_PROJECT_ROOT=services/portfolio\nTYPESAFE_API_KEY=mono-jev-secret-12345\n",
         encoding="utf-8",
     )
     clear_env_cache()
     monkeypatch.chdir(mono)
     cfg_root_env = load_config()
     assert cfg_root_env.project_root == sub.resolve()
-    assert cfg_root_env.resolve_lock_path() == (sub / ".probes" / "lock.json").resolve()
+    assert cfg_root_env.resolve_lock_path() == (sub / ".manners" / "lock.json").resolve()
     assert cfg_root_env.domain_context == "Portfolio check context."
-    assert is_probes_enabled() is True
+    assert is_manners_enabled() is True
 
-    monkeypatch.setenv("PROBE_PROJECT_ROOT", str(sub))
+    monkeypatch.setenv("MANNERS_PROJECT_ROOT", str(sub))
     clear_env_cache()
     assert load_config().project_root == sub.resolve()
     assert load_config(project_root=mono).project_root == mono.resolve()
