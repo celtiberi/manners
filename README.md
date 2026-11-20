@@ -82,7 +82,7 @@ uv add manners
 Fallback (from a GitHub Release wheel or git main — useful in containers/CI):
 
 ```sh
-uv add https://github.com/celtiberi/manners/releases/download/v0.7.1/manners-0.7.1-py3-none-any.whl
+uv add https://github.com/celtiberi/manners/releases/download/v0.7.2/manners-0.7.2-py3-none-any.whl
 # uv add git+https://github.com/celtiberi/manners.git
 ```
 
