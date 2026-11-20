@@ -629,12 +629,20 @@ class _MannersAPI:
             rt.close()
         return rt
 
+    @staticmethod
+    def get_active_runtime_stats() -> dict[str, Any] | None:
+        """Return live stats for the currently active MannersRuntime, or None if never initialized."""
+        with _RUNTIME_LOCK:
+            rt = _RUNTIME
+        return rt.summary_stats() if rt is not None else None
+
 
 manners = _MannersAPI()
 here = manners.here
 disabled = manners.disabled
 enabled = manners.enabled
 flush = manners.flush
+get_active_runtime_stats = manners.get_active_runtime_stats
 type = MannersType
 
 __all__ = [
@@ -643,6 +651,7 @@ __all__ = [
     "disabled",
     "enabled",
     "flush",
+    "get_active_runtime_stats",
     "here",
     "manners",
     "reset_for_testing",

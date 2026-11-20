@@ -5,6 +5,14 @@ All notable changes to `manners` will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.1] - 2026-11-20
+
+### Added
+- Legacy environment variable warning in `is_manners_enabled()`: warns once on `stderr` when legacy `PROBES=1` is active while `MANNERS` is unset (preserving pure zero-overhead no-op on import and clean `MANNERS=0` suppression).
+- Positive `[manners] active (<mode>) — run <run_id> -> <rel_path>` startup banner on `stderr` when `MannersRuntime` initializes on the first active call, plus `get_active_runtime_stats()`.
+- `pytest_terminal_summary` hook in `manners.pytest_plugin`: prints `manners: N call(s) (P pass, F fail, E error) — run <run_id>` after active runs, or a yellow `manners: OFF` notice if `@pytest.mark.manners` tests ran with 0 behavioral checks executed.
+- Static-calibration and live-run footer in `manners check` (and `"live_runs"` object in `manners check --json`) showing `.manners/runs/` count and warning when `0` live runs exist or the latest live run predates newer `.manners/fixtures/*.json` edits.
+
 ## [0.7.0] - 2026-11-19
 
 ### Changed

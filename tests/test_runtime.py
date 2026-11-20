@@ -1072,3 +1072,62 @@ def test_v06_decorator_ignore_params_sync_async_and_method(tmp_path: Path, monke
     finally:
         manners.flush_for_testing()
         reset_for_testing()
+
+
+def test_v071_legacy_probes_warning_and_active_banner(tmp_path: Path, monkeypatch, capsys) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("MANNERS", raising=False)
+    monkeypatch.delenv("PROBES", raising=False)
+    clear_env_cache()
+
+    # 1. Pure no-op when neither MANNERS nor PROBES is set.
+    assert is_manners_enabled(tmp_path) is False
+    assert capsys.readouterr().err == ""
+
+    # 2. Legacy PROBES=1 in .env and os.environ with MANNERS unset warns once per process and still returns False.
+    (tmp_path / ".env").write_text("PROBES=1\n", encoding="utf-8")
+    clear_env_cache()
+    assert is_manners_enabled(tmp_path) is False
+    first_err = capsys.readouterr().err
+    assert "legacy PROBES=1 is set while MANNERS is unset" in first_err
+    assert is_manners_enabled(tmp_path) is False
+    assert capsys.readouterr().err == ""
+
+    (tmp_path / ".env").unlink()
+    monkeypatch.setenv("PROBES", "1")
+    clear_env_cache()
+    assert is_manners_enabled(tmp_path) is False
+    assert "legacy PROBES=1 is set while MANNERS is unset" in capsys.readouterr().err
+
+    # 3. Explicit MANNERS=0 suppresses the legacy warning.
+    monkeypatch.setenv("MANNERS", "0")
+    clear_env_cache()
+    assert is_manners_enabled(tmp_path) is False
+    assert capsys.readouterr().err == ""
+
+    # 4. Active MANNERS=1 prints startup banner when runtime opens and updates live stats.
+    monkeypatch.setenv("MANNERS", "1")
+    monkeypatch.setenv("MANNERS_NO_PDB", "1")
+    clear_env_cache()
+    cfg = _make_config(tmp_path, require_check=False)
+    reset_for_testing(
+        config=cfg,
+        transport=httpx.MockTransport(lambda _r: httpx.Response(200, json={"probabilities": [0.95]})),
+    )
+    assert manners.get_active_runtime_stats() is None
+    capsys.readouterr()
+    try:
+        manners.here("Output looks good", id="banner.ok", reply="GOOD")
+        stats = manners.get_active_runtime_stats()
+        assert stats is not None
+        assert stats["calls"] == 1
+        assert stats["passed"] == 1
+        assert stats["failed"] == 0
+        assert stats["errors"] == 0
+        err = capsys.readouterr().err
+        assert "[manners] active (halt-on-fail)" in err
+        assert stats["run_id"] in err
+    finally:
+        manners.flush_for_testing()
+        reset_for_testing()
+        assert manners.get_active_runtime_stats() is None

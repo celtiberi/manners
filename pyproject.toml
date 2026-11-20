@@ -1,6 +1,6 @@
 [project]
 name = "manners"
-version = "0.7.0"
+version = "0.7.1"
 description = "Plain-English runtime behavioral checks, pre-run calibration, and call-ordered behavior logs for Python."
 readme = "README.md"
 license = { file = "LICENSE" }

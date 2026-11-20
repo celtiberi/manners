@@ -5,6 +5,7 @@ from __future__ import annotations
 import http.server
 import importlib.util
 import json
+import os
 import sys
 import textwrap
 import threading
@@ -2112,3 +2113,132 @@ def test_v061_gate3_truncation_retry_max_items_50_and_import_hint(tmp_path: Path
     assert res_bad[0].gate == "gate1"
     assert "from manners import manners" in res_bad[0].reason
     assert "manners.type" in res_bad[0].reason
+
+
+def test_v071_check_reports_static_calibration_and_live_runs_footer(tmp_path: Path, monkeypatch) -> None:
+    class _MockHandler(http.server.BaseHTTPRequestHandler):
+        def log_message(self, format: str, *args: object) -> None:
+            return
+
+        def do_POST(self) -> None:
+            length = int(self.headers.get("Content-Length", "0"))
+            body = json.loads(self.rfile.read(length).decode("utf-8"))
+            if self.path.endswith("/chat/completions"):
+                sys_msg = body["messages"][0]["content"]
+                if "audit @manners" in sys_msg:
+                    resp = {"choices": [{"message": {"content": "Check [0] evaluates reply quality."}}]}
+                else:
+                    snap = {
+                        "notes": "ok",
+                        "passing_snapshot": {"inputs": {"x": "hi"}, "output": "GOOD reply."},
+                        "failing_snapshot": {"inputs": {"x": "hi"}, "output": "BAD reply."},
+                    }
+                    resp = {"choices": [{"message": {"content": json.dumps(snap)}}]}
+            else:
+                if body.get("check_id", "").endswith("#gate2"):
+                    resp = {"probabilities": [0.03, 0.03, 0.03]}
+                else:
+                    ok = "GOOD" in body.get("snapshot", "")
+                    resp = {"probabilities": [0.92 if ok else 0.07]}
+            raw = json.dumps(resp).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(raw)))
+            self.end_headers()
+            self.wfile.write(raw)
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _MockHandler)
+    srv_thread = threading.Thread(target=server.serve_forever, daemon=True)
+    srv_thread.start()
+    try:
+        base_url = f"http://127.0.0.1:{server.server_port}"
+        (tmp_path / ".env").write_text("DEEPSEEK_API_KEY=test-key-123\n", encoding="utf-8")
+        (tmp_path / "pyproject.toml").write_text(
+            textwrap.dedent(
+                f"""
+                [project]
+                name = "cli-live-runs"
+                [tool.manners.models.decision]
+                provider = "http_decision"
+                url = "{base_url}/decision"
+                model = "local-decision"
+                [tool.manners.models.text]
+                provider = "openai_compat"
+                url = "{base_url}/v1"
+                model = "qwen3.5:9b"
+                """
+            ).strip()
+            + "\n",
+            encoding="utf-8",
+        )
+        (tmp_path / "app.py").write_text(
+            textwrap.dedent(
+                """
+                from manners import manners
+
+                @manners("Reply states clear greeting", id="cli.greet")
+                def greet(x: str) -> str:
+                    return f"hi {x}"
+                """
+            ).strip()
+            + "\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("MANNERS_CONFIG", str(tmp_path / "no_user.toml"))
+        monkeypatch.delenv("MANNERS_PROJECT_ROOT", raising=False)
+        monkeypatch.chdir(tmp_path)
+        runner = CliRunner()
+
+        # 1. With 0 live runs, footer explicitly highlights static-only calibration.
+        res_zero = runner.invoke(app, ["check"])
+        assert res_zero.exit_code == 0, res_zero.stdout + res_zero.stderr
+        assert "static fixtures only (0 live runs in .manners/runs/)" in res_zero.stdout
+
+        res_zero_json = runner.invoke(app, ["check", "--json"])
+        assert res_zero_json.exit_code == 0, res_zero_json.stdout
+        assert json.loads(res_zero_json.stdout)["live_runs"]["count"] == 0
+
+        # 2. Record a live run -> footer reports Live runs: 1 and stale_vs_fixtures=False.
+        store = MannersStore(tmp_path / ".manners" / "runs", create=True)
+        try:
+            store.create_run(
+                "01LIVE00000000000000000001",
+                started_at="2026-11-20T12:00:00Z",
+                cmd="pytest live",
+                pid=10,
+                decision_model="d",
+                text_model="t",
+            )
+            store.finish_run("01LIVE00000000000000000001", status="completed", finished_at="2026-11-20T12:00:02Z")
+        finally:
+            store.close()
+
+        res_one = runner.invoke(app, ["check"])
+        assert res_one.exit_code == 0, res_one.stdout + res_one.stderr
+        assert "Live runs in .manners/runs/: 1 (latest: 01LIVE00000000000000000001" in res_one.stdout
+
+        # 3. A fixture newer than the latest live run triggers the stale-run warning.
+        fix_dir = tmp_path / ".manners" / "fixtures"
+        fix_dir.mkdir(parents=True, exist_ok=True)
+        fix_file = fix_dir / "cli.greet.json"
+        fix_file.write_text(
+            json.dumps(
+                {
+                    "pass": {"inputs": {"x": "hi"}, "output": "GOOD"},
+                    "fail": {"inputs": {"x": "hi"}, "output": "BAD"},
+                }
+            ),
+            encoding="utf-8",
+        )
+        run_mtime_ns = (tmp_path / ".manners" / "runs" / "01LIVE00000000000000000001.jsonl").stat().st_mtime_ns
+        os.utime(fix_file, ns=(run_mtime_ns + 5_000_000_000, run_mtime_ns + 5_000_000_000))
+
+        res_stale = runner.invoke(app, ["check"])
+        assert res_stale.exit_code == 0, res_stale.stdout + res_stale.stderr
+        assert "predates your newest fixture edit" in res_stale.stdout
+        res_stale_json = runner.invoke(app, ["check", "--json"])
+        assert res_stale_json.exit_code == 0, res_stale_json.stdout
+        assert json.loads(res_stale_json.stdout)["live_runs"]["stale_vs_fixtures"] is True
+    finally:
+        server.shutdown()
+        server.server_close()
