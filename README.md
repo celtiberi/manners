@@ -82,7 +82,7 @@ uv add manners
 Fallback (from a GitHub Release wheel or git main — useful in containers/CI):
 
 ```sh
-uv add https://github.com/celtiberi/manners/releases/download/v0.7.0/manners-0.7.0-py3-none-any.whl
+uv add https://github.com/celtiberi/manners/releases/download/v0.7.1/manners-0.7.1-py3-none-any.whl
 # uv add git+https://github.com/celtiberi/manners.git
 ```
 
@@ -111,6 +111,7 @@ uv add https://github.com/celtiberi/manners/releases/download/v0.7.0/manners-0.7
    MANNERS=1 MANNERS_NO_PDB=1 pytest
    ```
 
+   - **Active-run & pytest visibility:** The first active check prints `[manners] active (...) — run <id> -> .manners/runs/<id>.jsonl` on `stderr`, and `pytest` prints a summary line (`manners: N call(s)...` when active, or `manners: OFF` when `@pytest.mark.manners` tests run with 0 checks). Leaving a legacy `PROBES=1` variable while `MANNERS` is unset prints a one-time warning on `stderr`.
    - **Skip lockfile during iteration:** Set `MANNERS_SKIP_LOCK=1`. Setting `MANNERS=""` or `MANNERS=0` in the shell overrides `MANNERS=1` in `.env`.
    - **Non-halting soak tests:** Set `MANNERS_NO_HALT=1` (or `[runtime].halt_on_fail = false`) to log all failures across multi-turn runs via a bounded background pool (`[runtime].max_workers = 4`) and exit `1` via `manners report --check` at the end (`manners.flush()` or process/pytest teardown drains pending evaluations).
    - **Controlling `pytest` runs when `MANNERS=1` is in `.env`:**

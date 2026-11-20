@@ -316,3 +316,114 @@ def test_pytest_plugin_markers_flags_and_daemon_thread_halt(tmp_path: Path) -> N
     finally:
         server.shutdown()
         server.server_close()
+
+
+def test_v071_pytest_terminal_summary_active_vs_off(tmp_path: Path) -> None:
+    class _DecisionHandler(http.server.BaseHTTPRequestHandler):
+        def log_message(self, format: str, *args: object) -> None:
+            return
+
+        def do_POST(self) -> None:
+            length = int(self.headers.get("Content-Length", "0"))
+            body = json.loads(self.rfile.read(length).decode("utf-8"))
+            probs = [0.95 for _ in body.get("checks", [])]
+            payload = json.dumps({"probabilities": probs}).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _DecisionHandler)
+    port = server.server_address[1]
+    srv_thread = threading.Thread(target=server.serve_forever, daemon=True)
+    srv_thread.start()
+    try:
+        proj = tmp_path / "proj"
+        proj.mkdir()
+        (proj / ".env").write_text("PROBES=1\nMANNERS_NO_PDB=1\n", encoding="utf-8")
+        (proj / "pyproject.toml").write_text(
+            textwrap.dedent(
+                f"""
+                [project]
+                name = "summary-subproc"
+                version = "0.1.0"
+
+                [tool.pytest.ini_options]
+                addopts = "--no-manners"
+
+                [tool.manners.models.decision]
+                provider = "http_decision"
+                url = "http://127.0.0.1:{port}/decision"
+                model = "jev"
+
+                [tool.manners.text]
+                explain_decision_failures = false
+
+                [tool.manners.check]
+                require_check = false
+                """
+            ).strip()
+            + "\n",
+            encoding="utf-8",
+        )
+        (proj / "test_summary.py").write_text(
+            textwrap.dedent(
+                """
+                import pytest
+                from manners import manners
+
+                def test_plain_unit():
+                    manners.here("Output is GOOD", id="sum.unit", reply="GOOD")
+
+                @pytest.mark.manners
+                def test_marked_live():
+                    manners.here("Output is GOOD", id="sum.live", reply="GOOD")
+                """
+            ).strip()
+            + "\n",
+            encoding="utf-8",
+        )
+
+        env_base = {k: v for k, v in os.environ.items() if k not in ("MANNERS", "PROBES")}
+
+        # 1. Plain unmarked offline test under --no-manners prints no manners summary line.
+        res_plain = subprocess.run(
+            [sys.executable, "-m", "pytest", "-k", "test_plain_unit", "-q"],
+            cwd=proj,
+            env=env_base,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert res_plain.returncode == 0, res_plain.stdout + res_plain.stderr
+        assert "manners:" not in res_plain.stdout
+
+        # 2. @pytest.mark.manners with legacy PROBES=1 and MANNERS unset warns in pytest summary and prints OFF.
+        res_off = subprocess.run(
+            [sys.executable, "-m", "pytest", "-k", "test_marked_live", "-q"],
+            cwd=proj,
+            env=env_base,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert res_off.returncode == 0, res_off.stdout + res_off.stderr
+        assert "manners: OFF — 1 @pytest.mark.manners test(s) ran with 0 behavioral checks" in res_off.stdout
+        assert "legacy PROBES=1 is set while MANNERS is unset" in res_off.stdout
+
+        # 3. With MANNERS=1 (-s uncaptured), active banner prints on stderr and call counts print in pytest summary.
+        res_on = subprocess.run(
+            [sys.executable, "-m", "pytest", "-k", "test_marked_live", "-q", "-s"],
+            cwd=proj,
+            env={**env_base, "MANNERS": "1"},
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert res_on.returncode == 0, res_on.stdout + res_on.stderr
+        assert "manners: 1 call(s) (1 pass, 0 fail, 0 error) — run " in res_on.stdout
+        assert "[manners] active" in res_on.stderr
+    finally:
+        server.shutdown()
+        server.server_close()

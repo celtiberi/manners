@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 import os
 import re
+import sys
 import threading
 import time
 import tomllib
@@ -25,6 +26,8 @@ _EXPORT_PREFIX_RE = re.compile(r"^export\s+")
 _OVERRIDE_CTX: ContextVar[bool | None] = ContextVar("manners_override", default=None)
 _DISABLED_LOCK = threading.Lock()
 _PROCESS_OVERRIDES: list[tuple[object, bool]] = []
+_LEGACY_PROBES_WARNED_LOCK = threading.Lock()
+_LEGACY_PROBES_WARNED = False
 _TRUSTED_DEFAULT_HOSTS = frozenset(
     {
         "api.typesafe.ai",
@@ -198,17 +201,22 @@ def pop_process_override(token: object) -> None:
 
 def reset_config_locks_after_fork() -> None:
     """Reinitialize module locks in a forked child process to prevent deadlocks."""
-    global _ULID_LOCK, _ENV_FLAG_CACHE_LOCK, _DISABLED_LOCK
+    global _ULID_LOCK, _ENV_FLAG_CACHE_LOCK, _DISABLED_LOCK, _LEGACY_PROBES_WARNED_LOCK, _LEGACY_PROBES_WARNED
     _ULID_LOCK = threading.Lock()
     _ENV_FLAG_CACHE_LOCK = threading.Lock()
     _DISABLED_LOCK = threading.Lock()
+    _LEGACY_PROBES_WARNED_LOCK = threading.Lock()
+    _LEGACY_PROBES_WARNED = False
     _PROCESS_OVERRIDES.clear()
 
 
 def clear_env_cache() -> None:
     """Clear cached .env flag lookups (used after environment or directory changes in tests)."""
+    global _LEGACY_PROBES_WARNED
     with _ENV_FLAG_CACHE_LOCK:
         _ENV_FLAG_CACHE.clear()
+    with _LEGACY_PROBES_WARNED_LOCK:
+        _LEGACY_PROBES_WARNED = False
 
 
 def _read_dotenv_cached(env_path: Path, var_name: str) -> str | None:
@@ -243,15 +251,39 @@ def _read_env_flag(var_name: str, cwd: Path | None = None) -> str:
     return ""
 
 
+def has_legacy_probes_without_manners(cwd: Path | None = None) -> bool:
+    """Return True when legacy PROBES is truthy in env/.env while MANNERS is unset."""
+    if _read_env_flag("MANNERS", cwd):
+        return False
+    return _read_env_flag("PROBES", cwd).lower() in _TRUE_VALUES
+
+
 def is_manners_enabled(cwd: Path | None = None) -> bool:
     """Return True when MANNERS is enabled in os.environ or project .env (unless overridden)."""
+    global _LEGACY_PROBES_WARNED
     ctx_val = _OVERRIDE_CTX.get()
     if ctx_val is not None:
         return ctx_val
     with _DISABLED_LOCK:
         if _PROCESS_OVERRIDES:
             return _PROCESS_OVERRIDES[-1][1]
-    return _read_env_flag("MANNERS", cwd).lower() in _TRUE_VALUES
+    manners_val = _read_env_flag("MANNERS", cwd).lower()
+    if manners_val in _TRUE_VALUES:
+        return True
+    if not manners_val and has_legacy_probes_without_manners(cwd):
+        should_warn = False
+        with _LEGACY_PROBES_WARNED_LOCK:
+            if not _LEGACY_PROBES_WARNED:
+                _LEGACY_PROBES_WARNED = True
+                should_warn = True
+        if should_warn:
+            print(
+                "[manners] WARNING: legacy PROBES=1 is set while MANNERS is unset; "
+                "checks are OFF. Rename PROBES=1 to MANNERS=1 (v0.7.0 rebrand).",
+                file=sys.stderr,
+                flush=True,
+            )
+    return False
 
 
 def is_skip_lock(cwd: Path | None = None) -> bool:

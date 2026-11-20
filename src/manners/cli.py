@@ -20,7 +20,7 @@ from manners.check import (
     run_manners_check,
     upsert_manners_fixture,
 )
-from manners.config import load_config
+from manners.config import MannersConfig, load_config
 from manners.store import EventRecord, MannersStore, RunRecord
 
 _ROOT_OPTION = typer.Option(
@@ -261,6 +261,53 @@ def _resolve_cli_scan_paths(
     return resolved_paths
 
 
+def _live_run_summary(cfg: MannersConfig) -> dict[str, Any]:
+    """Summarize live MANNERS=1 runs on disk and whether any predate newer fixtures."""
+    runs_dir = cfg.resolve_runs_dir()
+    count = 0
+    latest_run_id: str | None = None
+    latest_started_at: str | None = None
+    latest_run_mtime_ns: int | None = None
+
+    if runs_dir.is_dir():
+        store = MannersStore(runs_dir, create=False)
+        try:
+            valid, _ = store._ordered_run_files()
+        finally:
+            store.close()
+        count = len(valid)
+        if valid:
+            latest_started_at, latest_run_id, latest_fp = valid[0]
+            try:
+                latest_run_mtime_ns = latest_fp.stat().st_mtime_ns
+            except OSError:
+                latest_run_mtime_ns = None
+
+    fixtures_dir = cfg.project_root / ".manners" / "fixtures"
+    latest_fixture_mtime_ns: int | None = None
+    if fixtures_dir.is_dir():
+        mtimes: list[int] = []
+        for fp in fixtures_dir.glob("*.json"):
+            try:
+                mtimes.append(fp.stat().st_mtime_ns)
+            except OSError:
+                continue
+        if mtimes:
+            latest_fixture_mtime_ns = max(mtimes)
+
+    stale_vs_fixtures = bool(
+        latest_run_mtime_ns is not None
+        and latest_fixture_mtime_ns is not None
+        and latest_fixture_mtime_ns > latest_run_mtime_ns
+    )
+    return {
+        "count": count,
+        "latest_run_id": latest_run_id,
+        "latest_started_at": latest_started_at,
+        "stale_vs_fixtures": stale_vs_fixtures,
+    }
+
+
 @app.command("check")
 def check_cmd(
     ctx: typer.Context,
@@ -278,6 +325,7 @@ def check_cmd(
             project_root=cfg.project_root,
         )
         ok, results = run_manners_check(resolved_paths, force=force, config=cfg)
+        live_runs = _live_run_summary(cfg)
     except (BackendError, ValueError, OSError) as exc:
         typer.echo(f"Error: {exc}", err=True)
         raise typer.Exit(code=1) from exc
@@ -289,6 +337,7 @@ def check_cmd(
                     "ok": ok,
                     "count": len(results),
                     "results": [r.to_dict() for r in results],
+                    "live_runs": live_runs,
                 },
                 indent=2,
                 ensure_ascii=False,
@@ -301,6 +350,25 @@ def check_cmd(
             tag = res.status.upper()
             gate_note = f" ({res.gate})" if res.status == "failed" else ""
             typer.echo(f"[{tag}{gate_note}] {res.check_id} ({res.file_line}) — {res.reason}")
+        if results:
+            if live_runs["count"] == 0:
+                typer.echo(
+                    "Note: manners check calibrates rules against static fixtures only "
+                    "(0 live runs in .manners/runs/). Run your app or evals with MANNERS=1 "
+                    "to check real model output."
+                )
+            elif live_runs["stale_vs_fixtures"]:
+                typer.echo(
+                    "Note: manners check calibrates rules against static fixtures only. "
+                    f"Latest live run ({live_runs['latest_run_id']}, {live_runs['latest_started_at']}) "
+                    "predates your newest fixture edit — run with MANNERS=1 to verify real model output."
+                )
+            else:
+                typer.echo(
+                    "Note: manners check calibrates rules against static fixtures only. "
+                    f"Live runs in .manners/runs/: {live_runs['count']} "
+                    f"(latest: {live_runs['latest_run_id']}, {live_runs['latest_started_at']})."
+                )
 
     if not ok:
         raise typer.Exit(code=1)

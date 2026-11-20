@@ -328,6 +328,9 @@ class MannersRuntime:
         self._state_lock = threading.Lock()
         self._tripped = False
         self._had_failure = False
+        self._pass_count = 0
+        self._fail_count = 0
+        self._error_count = 0
         self._halt_reason = ""
         self._halted_thread: threading.Thread | None = None
         self._unhandled_thread_halt: str | None = None
@@ -340,6 +343,18 @@ class MannersRuntime:
         self._soak_lock = threading.Lock()
         self._soak_executor: concurrent.futures.ThreadPoolExecutor | None = None
         self._soak_slots = threading.BoundedSemaphore(max(1, self.config.runtime.max_workers * 8))
+
+        run_file = self.store.run_path(self.run_id)
+        try:
+            rel_run = str(run_file.relative_to(self.cwd))
+        except ValueError:
+            rel_run = str(run_file)
+        mode_note = "no-halt" if not self.should_halt_on_fail() else "halt-on-fail"
+        print(
+            f"[manners] active ({mode_note}) — run {self.run_id} -> {rel_run}",
+            file=sys.stderr,
+            flush=True,
+        )
 
     def should_halt_on_fail(self) -> bool:
         """Return False when MANNERS_NO_HALT=1 or [runtime].halt_on_fail=false runs in audit mode."""
@@ -354,6 +369,21 @@ class MannersRuntime:
     def halted_thread(self) -> threading.Thread | None:
         with self._state_lock:
             return self._halted_thread
+
+    def summary_stats(self) -> dict[str, Any]:
+        """Return live run metadata and evaluated call verdict counts."""
+        with self._state_lock:
+            passed = self._pass_count
+            failed = self._fail_count
+            errors = self._error_count
+        return {
+            "run_id": self.run_id,
+            "run_path": str(self.store.run_path(self.run_id)),
+            "calls": passed + failed + errors,
+            "passed": passed,
+            "failed": failed,
+            "errors": errors,
+        }
 
     def record_unhandled_thread_halt(self, message: str) -> None:
         """Record an uncaught MannersHaltError from a background thread so flush() can fail main."""
@@ -551,6 +581,7 @@ class MannersRuntime:
                 return entered, True
             with self._state_lock:
                 self._had_failure = True
+                self._error_count += 1
             self.store.insert_event(
                 run_id=self.run_id,
                 call_seq=call_seq,
@@ -597,6 +628,7 @@ class MannersRuntime:
     ) -> bool:
         with self._state_lock:
             self._had_failure = True
+            self._error_count += 1
         self.store.insert_event(
             run_id=self.run_id,
             call_seq=call_seq,
@@ -652,6 +684,8 @@ class MannersRuntime:
         )
         summary = _scrub_and_truncate(f"{type(exception).__name__}: {exception}", self.redactor, caps.max_str_bytes)
         clean_tb = _scrub_and_truncate(exc_traceback.strip(), self.redactor, max(caps.max_str_bytes, 16384))
+        with self._state_lock:
+            self._error_count += 1
         self.store.insert_event(
             run_id=self.run_id,
             call_seq=call_seq,
@@ -796,8 +830,14 @@ class MannersRuntime:
             latency_ms=graded.latency_ms,
         )
 
-        if graded.verdict in {"fail", "error"}:
-            with self._state_lock:
+        with self._state_lock:
+            if graded.verdict == "pass":
+                self._pass_count += 1
+            elif graded.verdict == "fail":
+                self._fail_count += 1
+                self._had_failure = True
+            else:
+                self._error_count += 1
                 self._had_failure = True
 
         would_halt = (
