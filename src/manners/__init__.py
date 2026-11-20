@@ -50,6 +50,27 @@ _RUNTIME_LOCK = threading.Lock()
 _RUNTIME: MannersRuntime | None = None
 _TEST_CONFIG: MannersConfig | None = None
 _TEST_TRANSPORT: httpx.BaseTransport | None = None
+_COMPLETED_CALLS = 0
+_COMPLETED_PASSED = 0
+_COMPLETED_FAILED = 0
+_COMPLETED_ERRORS = 0
+_COMPLETED_RUNS = 0
+_LAST_RUN_ID: str | None = None
+
+
+def _archive_runtime_stats(rt: MannersRuntime) -> None:
+    """Fold closed run stats into process-wide counters so pytest_terminal_summary survives resets."""
+    global _COMPLETED_CALLS, _COMPLETED_PASSED, _COMPLETED_FAILED, _COMPLETED_ERRORS, _COMPLETED_RUNS, _LAST_RUN_ID
+    stats = rt.summary_stats()
+    if int(stats.get("calls", 0)) <= 0:
+        return
+    with _RUNTIME_LOCK:
+        _COMPLETED_CALLS += int(stats["calls"])
+        _COMPLETED_PASSED += int(stats["passed"])
+        _COMPLETED_FAILED += int(stats["failed"])
+        _COMPLETED_ERRORS += int(stats["errors"])
+        _COMPLETED_RUNS += 1
+        _LAST_RUN_ID = str(stats["run_id"])
 
 
 def _get_runtime() -> MannersRuntime:
@@ -81,13 +102,21 @@ def reset_for_testing(
     clear_env_cache()
     if old is not None:
         old.close()
+        _archive_runtime_stats(old)
     return None
 
 
 def _reset_child_runtime() -> None:
     global _RUNTIME, _RUNTIME_LOCK
+    global _COMPLETED_CALLS, _COMPLETED_PASSED, _COMPLETED_FAILED, _COMPLETED_ERRORS, _COMPLETED_RUNS, _LAST_RUN_ID
     _RUNTIME = None
     _RUNTIME_LOCK = threading.Lock()
+    _COMPLETED_CALLS = 0
+    _COMPLETED_PASSED = 0
+    _COMPLETED_FAILED = 0
+    _COMPLETED_ERRORS = 0
+    _COMPLETED_RUNS = 0
+    _LAST_RUN_ID = None
     reset_config_locks_after_fork()
 
 
@@ -627,6 +656,7 @@ class _MannersAPI:
             _RUNTIME = None
         if rt is not None:
             rt.close()
+            _archive_runtime_stats(rt)
         return rt
 
     @staticmethod
@@ -636,6 +666,35 @@ class _MannersAPI:
             rt = _RUNTIME
         return rt.summary_stats() if rt is not None else None
 
+    @staticmethod
+    def get_session_runtime_stats() -> dict[str, Any]:
+        """Return cumulative stats across archived resets plus any currently active MannersRuntime."""
+        with _RUNTIME_LOCK:
+            calls = _COMPLETED_CALLS
+            passed = _COMPLETED_PASSED
+            failed = _COMPLETED_FAILED
+            errors = _COMPLETED_ERRORS
+            runs = _COMPLETED_RUNS
+            last_run_id = _LAST_RUN_ID
+            rt = _RUNTIME
+        if rt is not None:
+            live = rt.summary_stats()
+            if int(live["calls"]) > 0:
+                calls += int(live["calls"])
+                passed += int(live["passed"])
+                failed += int(live["failed"])
+                errors += int(live["errors"])
+                runs += 1
+                last_run_id = str(live["run_id"])
+        return {
+            "calls": calls,
+            "passed": passed,
+            "failed": failed,
+            "errors": errors,
+            "runs": runs,
+            "last_run_id": last_run_id,
+        }
+
 
 manners = _MannersAPI()
 here = manners.here
@@ -643,6 +702,7 @@ disabled = manners.disabled
 enabled = manners.enabled
 flush = manners.flush
 get_active_runtime_stats = manners.get_active_runtime_stats
+get_session_runtime_stats = manners.get_session_runtime_stats
 type = MannersType
 
 __all__ = [
@@ -652,6 +712,7 @@ __all__ = [
     "enabled",
     "flush",
     "get_active_runtime_stats",
+    "get_session_runtime_stats",
     "here",
     "manners",
     "reset_for_testing",

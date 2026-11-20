@@ -51,14 +51,14 @@ def pytest_configure(config: pytest.Config) -> None:
     prev_hook = threading.excepthook
     config.add_cleanup(lambda: setattr(threading, "excepthook", prev_hook))
     threading.excepthook = lambda args: handle_thread_excepthook(args, prev_hook, suppress_forward=True)
-    baseline = manners.get_active_runtime_stats()
+    baseline = manners.get_session_runtime_stats()
     config._manners_plugin_state = {  # type: ignore[attr-defined]
         "marked_tests": 0,
-        "baseline_run_id": baseline["run_id"] if baseline else None,
-        "baseline_calls": baseline["calls"] if baseline else 0,
-        "baseline_passed": baseline["passed"] if baseline else 0,
-        "baseline_failed": baseline["failed"] if baseline else 0,
-        "baseline_errors": baseline["errors"] if baseline else 0,
+        "baseline_calls": baseline["calls"],
+        "baseline_passed": baseline["passed"],
+        "baseline_failed": baseline["failed"],
+        "baseline_errors": baseline["errors"],
+        "baseline_runs": baseline["runs"],
     }
 
 
@@ -108,20 +108,25 @@ def pytest_terminal_summary(terminalreporter: Any, exitstatus: int, config: pyte
     del exitstatus
     state = getattr(config, "_manners_plugin_state", None) or {}
     marked = int(state.get("marked_tests", 0))
-    stats = manners.get_active_runtime_stats()
+    cur = manners.get_session_runtime_stats()
 
-    calls = passed = failed = errors = 0
-    if stats is not None:
-        same_run = stats["run_id"] == state.get("baseline_run_id")
-        calls = stats["calls"] - (int(state.get("baseline_calls", 0)) if same_run else 0)
-        passed = stats["passed"] - (int(state.get("baseline_passed", 0)) if same_run else 0)
-        failed = stats["failed"] - (int(state.get("baseline_failed", 0)) if same_run else 0)
-        errors = stats["errors"] - (int(state.get("baseline_errors", 0)) if same_run else 0)
+    calls = int(cur["calls"]) - int(state.get("baseline_calls", 0))
+    passed = int(cur["passed"]) - int(state.get("baseline_passed", 0))
+    failed = int(cur["failed"]) - int(state.get("baseline_failed", 0))
+    errors = int(cur["errors"]) - int(state.get("baseline_errors", 0))
+    runs = int(cur["runs"]) - int(state.get("baseline_runs", 0))
 
-    if calls > 0 and stats is not None:
-        terminalreporter.write_line(
-            f"manners: {calls} call(s) ({passed} pass, {failed} fail, {errors} error) — run {stats['run_id']}"
-        )
+    if calls > 0:
+        last_id = cur["last_run_id"] or "unknown"
+        if runs > 1:
+            terminalreporter.write_line(
+                f"manners: {calls} call(s) ({passed} pass, {failed} fail, {errors} error) "
+                f"across {runs} runs — latest {last_id}"
+            )
+        else:
+            terminalreporter.write_line(
+                f"manners: {calls} call(s) ({passed} pass, {failed} fail, {errors} error) — run {last_id}"
+            )
     elif marked > 0:
         terminalreporter.write_line(
             f"manners: OFF — {marked} @pytest.mark.manners test(s) ran with 0 behavioral checks "

@@ -427,3 +427,93 @@ def test_v071_pytest_terminal_summary_active_vs_off(tmp_path: Path) -> None:
     finally:
         server.shutdown()
         server.server_close()
+
+
+def test_v072_pytest_summary_survives_reset_for_testing(tmp_path: Path) -> None:
+    class _DecisionHandler(http.server.BaseHTTPRequestHandler):
+        def log_message(self, format: str, *args: object) -> None:
+            return
+
+        def do_POST(self) -> None:
+            length = int(self.headers.get("Content-Length", "0"))
+            body = json.loads(self.rfile.read(length).decode("utf-8"))
+            probs = [0.95 for _ in body.get("checks", [])]
+            payload = json.dumps({"probabilities": probs}).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _DecisionHandler)
+    port = server.server_address[1]
+    srv_thread = threading.Thread(target=server.serve_forever, daemon=True)
+    srv_thread.start()
+    try:
+        proj = tmp_path / "proj"
+        proj.mkdir()
+        (proj / "pyproject.toml").write_text(
+            textwrap.dedent(
+                f"""
+                [project]
+                name = "reset-summary-subproc"
+                version = "0.1.0"
+
+                [tool.pytest.ini_options]
+                addopts = "--no-manners"
+
+                [tool.manners.models.decision]
+                provider = "http_decision"
+                url = "http://127.0.0.1:{port}/decision"
+                model = "jev"
+
+                [tool.manners.text]
+                explain_decision_failures = false
+
+                [tool.manners.check]
+                require_check = false
+                """
+            ).strip()
+            + "\n",
+            encoding="utf-8",
+        )
+        (proj / "test_resets.py").write_text(
+            textwrap.dedent(
+                """
+                import pytest
+                import manners
+
+                @pytest.mark.manners(force=True)
+                def test_one():
+                    try:
+                        manners.here("Output is GOOD", id="rst.one", reply="GOOD")
+                    finally:
+                        manners.reset_for_testing()
+
+                @pytest.mark.manners(force=True)
+                def test_two():
+                    try:
+                        manners.here("Output is GOOD", id="rst.two", reply="GOOD")
+                    finally:
+                        manners.reset_for_testing()
+                """
+            ).strip()
+            + "\n",
+            encoding="utf-8",
+        )
+
+        env_ci = {k: v for k, v in os.environ.items() if k not in ("MANNERS", "PROBES")}
+        res = subprocess.run(
+            [sys.executable, "-m", "pytest", "-q"],
+            cwd=proj,
+            env=env_ci,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert res.returncode == 0, res.stdout + res.stderr
+        assert "manners: 2 call(s) (2 pass, 0 fail, 0 error) across 2 runs — latest " in res.stdout
+        assert "manners: OFF" not in res.stdout
+    finally:
+        server.shutdown()
+        server.server_close()
